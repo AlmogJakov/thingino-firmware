@@ -1,0 +1,97 @@
+name: prudynt-binary
+# Builds the firmware for the Sonoff PT2 (T23 / sc2336p) board with the
+# daynight-stats + forced-mode patch applied, and uploads ONLY the resulting
+# prudynt binary as a downloadable artifact (you copy it to /usr/bin/prudynt;
+# no flashing, no firmware image needed).
+#
+# Run it: Actions tab -> "prudynt-binary" -> Run workflow -> pick your branch.
+# Download: the finished run -> Artifacts -> "prudynt-<board>".
+#
+# It uses the exact two build commands thingino's own CI uses (make source +
+# make), so prudynt is compiled with our patch as part of the normal build.
+# First run can take ~1-2 h (toolchain + packages). Free GitHub runners.
+
+on:
+  workflow_dispatch:
+    inputs:
+      board:
+        description: 'Camera/board config name'
+        required: true
+        default: 'sonoff_pt2_t23n_sc2336p_atbm6012bx'
+
+env:
+  FORCE_UNSAFE_CONFIGURE: 1
+  TERM: linux
+  TZ: UTC
+
+jobs:
+  build-prudynt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    container:
+      image: debian:trixie
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends --no-install-suggests \
+            autoconf build-essential bc ca-certificates cmake cpio curl file \
+            gawk git jq lzop m4 make p7zip-full perl procps python3 rsync \
+            tzdata u-boot-tools unzip wget
+
+      - name: Set timezone
+        run: ln -sf /usr/share/zoneinfo/UTC /etc/localtime && echo UTC > /etc/timezone
+
+      - name: Checkout firmware (this branch, with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: 'true'
+          fetch-depth: '0'
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Show the prudynt patch that will be applied
+        run: |
+          echo "Patches present for prudynt-t:"
+          ls -l package/prudynt-t/patches/ \
+            || { echo "::error::no patch in package/prudynt-t/patches/ — aborting"; exit 1; }
+
+      - name: Download sources
+        run: BOARD=${{ github.event.inputs.board }} make source WORKFLOW=1
+
+      - name: Build firmware (compiles prudynt with the patch)
+        # `make fast` is the parallel full build thingino's own CI uses.
+        run: BOARD=${{ github.event.inputs.board }} make fast WORKFLOW=1
+
+      - name: Confirm the patch actually applied
+        run: |
+          SRC=$(find output -type d -name 'prudynt-t-*' 2>/dev/null | grep -v '/host/' | head -1)
+          echo "prudynt source dir: $SRC"
+          if [ -n "$SRC" ] && grep -q "force_mode_cfg" "$SRC/src/Config.hpp" 2>/dev/null; then
+            echo "PATCH APPLIED: force_mode_cfg present in $SRC/src/Config.hpp"
+          else
+            echo "::error::patch did NOT apply (force_mode_cfg missing) — see build log"
+            exit 1
+          fi
+
+      - name: Locate the built MIPS prudynt binary
+        id: find
+        run: |
+          # prefer the binary staged into the target rootfs
+          BIN=$(find output -type f -path '*/target/usr/bin/prudynt' 2>/dev/null | head -1)
+          # fall back to the package build dir
+          [ -z "$BIN" ] && BIN=$(find output -type f -path '*prudynt-t-*' -name prudynt 2>/dev/null | grep -v '/host/' | head -1)
+          echo "Found: $BIN"
+          file "$BIN"
+          echo "bin=$BIN" >> "$GITHUB_OUTPUT"
+
+      - name: Upload prudynt binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: prudynt-${{ github.event.inputs.board }}
+          path: ${{ steps.find.outputs.bin }}
+          if-no-files-found: error
