@@ -55,10 +55,12 @@ jobs:
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Show the prudynt patch that will be applied
+        # thingino uses a GLOBAL patch dir: BR2_GLOBAL_PATCH_DIR=package/all-patches,
+        # so package patches live in package/all-patches/<pkg>/ (NOT package/<pkg>/patches/).
         run: |
           echo "Patches present for prudynt-t:"
-          ls -l package/prudynt-t/patches/ \
-            || { echo "::error::no patch in package/prudynt-t/patches/ — aborting"; exit 1; }
+          ls -l package/all-patches/prudynt-t/ \
+            || { echo "::error::no patch in package/all-patches/prudynt-t/ — aborting"; exit 1; }
 
       - name: Download sources
         run: BOARD=${{ github.event.inputs.board }} make source WORKFLOW=1
