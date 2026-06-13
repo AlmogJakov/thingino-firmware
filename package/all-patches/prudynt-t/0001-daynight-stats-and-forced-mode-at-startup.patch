@@ -1,24 +1,35 @@
-Subject: [PATCH v2] daynight: always-start stats worker; persist force_mode; RECORD (not re-apply) forced mode at worker startup
+Subject: [PATCH] daynight: always-start stats worker; persist + record forced mode; derive boot running_mode from it
 Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (branch stable)
 
-Fixes two issues on T23 / isp_bypass=true builds:
+Fixes, on T23 / isp_bypass=true builds, three problems with forced day/night:
  (A) AE/day-night telemetry (total_gain, ev, ae_luma, brightness_percent) read
-     -1 for the whole process life when daynight.enabled=false at startup, because
-     the DayNightWorker -- the sole writer of those values -- was only started
-     when enabled. Fix: always start the worker; automatic switching stays gated
-     on daynight.enabled inside the loop.
- (B) daynight.force_mode did not survive a reboot: it was not a persisted config
-     key, and the ISP was hard-forced to Day at the end of IMPSystem::init(). Fix:
-     register daynight.force_mode as a persisted string key and apply the
-     configured/forced running mode once in IMPSystem::init() (before the encoder
-     pipeline exists), instead of hardcoded Day.
+     -1 for the whole process life when daynight.enabled=false, because the
+     DayNightWorker -- the sole writer of those values -- was only started when
+     enabled. Fix: always start the worker; automatic switching stays gated on
+     daynight.enabled inside the loop.
+ (B) A forced mode did not survive reboot, and the live mode was misreported.
+     daynight.force_mode was not a persisted config key; the worker never tagged
+     the live mode for a forced camera (it reported "unknown"); and the ISP was
+     hard-forced to Day at the end of IMPSystem::init(). Fix: register
+     daynight.force_mode as a persisted string key; have the worker RECORD it
+     (current + live_mode "day"/"night", and suppress auto-inference) without
+     applying it on the live pipeline.
+ (C) A forced color/mono mode did not take at boot. On this sensor a
+     set_running_mode at the END of init does NOT stick, while the one applied
+     early in init (right after the hflip/vflip block) does. Fix: derive
+     image.running_mode from daynight.force_mode BEFORE that early
+     set_running_mode, so a forced mode lands where it actually takes effect; the
+     end-of-init call becomes a harmless re-assert (no longer hardcoded Day).
 
-Crucial detail (v2): at startup the worker only RECORDS the persisted force_mode
-(sets current + live_mode, suppresses auto-inference); it must NOT call
-apply_mode(). apply_mode() does set_running_mode() + system("/sbin/daynight ...")
-which, on a freshly-built isp_bypass=true cold-boot encoder during AE settling,
-tears the video stream down ~2-3s after boot. Runtime JSON-API force-mode requests
-are unaffected and still apply_mode() normally (the stream is up by then).
+Design -- daynight.force_mode is the SINGLE source of truth. From it:
+  * color/mono (ISP running_mode) is derived in IMPSystem::init() (this patch);
+  * the live/reported mode is set by the worker (this patch);
+  * the IR-CUT filter + IR LED are set by the boot IR-CUT init (S56ircut, a
+    companion rootfs change) which reads the same daynight.force_mode.
+The worker is RECORD-ONLY at startup: it never calls apply_mode() for a persisted
+mode, so there is no apply() on a settling cold-boot encoder (which tore the
+stream down) and no boot-time day->night flip. Runtime JSON-API force-mode
+requests are unaffected and still apply_mode() immediately.
 
 Verified to apply cleanly to the pinned commit (git apply -p1 and patch -p1).
 
@@ -41,39 +52,44 @@ index 1314d29..cd53e4b 100644
         validateCharDummy},
        {"daynight.schedule.stop_at", daynight.schedule.stop_at, "",
 diff --git a/src/Config.hpp b/src/Config.hpp
-index 581c7b8..292d5de 100644
+index 581c7b8..f2600a9 100644
 --- a/src/Config.hpp
 +++ b/src/Config.hpp
-@@ -156,6 +156,11 @@ struct _daynight {
+@@ -156,6 +156,14 @@ struct _daynight {
    // Manual mode override (set by user via JSON API)
    std::atomic<const char *> force_mode{nullptr};
  
-+  // Persisted startup override ("", "day" or "night"); seeded into the
-+  // force_mode mailbox once when the worker thread starts so a forced mode
-+  // survives restarts/reboots.
++  // Persisted startup override ("", "day" or "night") so a forced mode survives
++  // restarts/reboots. The worker RECORDS it at startup (sets current/live_mode,
++  // suppresses auto-inference) but does not apply it on the live pipeline; the
++  // ISP running mode is set from it in IMPSystem::init() before the pipeline
++  // exists, and the IR-CUT/IR-LED optics by the boot IR-CUT init. The force_mode
++  // atomic above remains the live runtime path.
 +  const char *force_mode_cfg{nullptr};
 +
    // Live telemetry populated by the worker - RAW ISP sensor data
    std::atomic<int> live_brightness_percent{-1};
    std::atomic<int> live_ev{-1};
 diff --git a/src/DayNightWorker.cpp b/src/DayNightWorker.cpp
-index 793b812..3c1d50c 100644
+index 793b812..230d7af 100644
 --- a/src/DayNightWorker.cpp
 +++ b/src/DayNightWorker.cpp
-@@ -649,6 +649,30 @@ void *thread_entry(void *arg) {
+@@ -649,6 +649,32 @@ void *thread_entry(void *arg) {
    int anti_flap_cooldown = 0;
    const int anti_flap_iterations = 30; // ~30 seconds minimum between switches
  
-+  // Record a persisted startup force_mode (daynight.force_mode in the config
-+  // file) WITHOUT re-applying it on the live pipeline. IMPSystem::init() has
-+  // already set the boot ISP running_mode; seeding the force_mode atomic here
-+  // would make the first loop iteration call apply_mode(), which does
-+  // set_running_mode + system("/sbin/daynight ...") on the freshly-built,
-+  // isp_bypass=true encoder during AE settling and tears the stream down ~2-3s
-+  // after a cold boot. So we only prime current/live_mode and suppress
-+  // auto-inference; we do NOT touch the force_mode atomic (that mailbox stays
-+  // for runtime JSON-API requests, which should still apply_mode once the
-+  // stream is up).
++  // Persisted startup force_mode (daynight.force_mode): RECORD it only — set
++  // current/live_mode and suppress auto-inference (initial_mode_applied), but do
++  // NOT apply_mode() on the live pipeline. The forced mode is realised entirely
++  // outside this loop, BEFORE any frame is shown, so there is never a day->night
++  // flip and never an apply() on a settling cold-boot encoder:
++  //   * ISP running mode (color vs mono) is set in IMPSystem::init() from
++  //     force_mode_cfg, before the encoder pipeline is built.
++  //   * IR-CUT filter + IR LED GPIO are set by the boot IR-CUT init (S56ircut),
++  //     which finishes its calibration in the persisted mode.
++  // History: apply_mode() here (v1) tore the stream down on cold boot; a
++  // deferred apply (v3) reintroduced a visible boot-time flip. Record-only
++  // avoids both. The force_mode atomic remains the live runtime path.
 +  if (cfg->daynight.force_mode_cfg && *cfg->daynight.force_mode_cfg) {
 +    if (std::strcmp(cfg->daynight.force_mode_cfg, "night") == 0) {
 +      current = DayNightAlgo::Mode::Night;
@@ -91,7 +107,7 @@ index 793b812..3c1d50c 100644
    while (!global_shutdown_requested.load(std::memory_order_relaxed)) {
      refresh_daynight_log_level();
  
-@@ -724,7 +748,7 @@ void *thread_entry(void *arg) {
+@@ -724,7 +750,7 @@ void *thread_entry(void *arg) {
      // Apply initial mode if not set - infer from current sensor readings
      // IMPORTANT: This happens regardless of schedule to ensure camera starts in
      // correct mode
@@ -100,7 +116,7 @@ index 793b812..3c1d50c 100644
        DayNightAlgo::Mode initial = DayNightAlgo::Mode::Unknown;
  
        // Infer initial mode from sensor readings to avoid black screen on boot
-@@ -843,7 +867,9 @@ void *thread_entry(void *arg) {
+@@ -843,7 +869,9 @@ void *thread_entry(void *arg) {
      }
  
      const char *mode_str =
@@ -112,29 +128,46 @@ index 793b812..3c1d50c 100644
      export_brightness_value(bright_pct, mode_str);
  
 diff --git a/src/IMPSystem.cpp b/src/IMPSystem.cpp
-index 769ba91..d9a8268 100644
+index 769ba91..19fc955 100644
 --- a/src/IMPSystem.cpp
 +++ b/src/IMPSystem.cpp
-@@ -596,9 +596,22 @@ int IMPSystem::init() {
+@@ -430,6 +430,20 @@ int IMPSystem::init() {
+   ret = hal::isp::set_vflip(cfg->image.vflip);
+   LOG_DEBUG_OR_ERROR(ret, "hal::isp::set_vflip(" << cfg->image.vflip << ")");
+ 
++  // Single source of truth for the boot color/mono mode: derive
++  // image.running_mode from the persisted forced day/night mode
++  // (daynight.force_mode), then apply it HERE — early in init — where it
++  // reliably takes effect on this sensor. A late set_running_mode (end of init)
++  // does NOT stick on sc2336p, which is why a forced mode must land at this early
++  // point. Auto / unset (empty force_mode) keeps the configured image.running_mode
++  // and lets the daynight worker decide at runtime. This makes daynight.force_mode
++  // the one setting that drives color/mono — no separate persisted running_mode.
++  if (cfg->daynight.force_mode_cfg && cfg->daynight.force_mode_cfg[0]) {
++    if (strcmp(cfg->daynight.force_mode_cfg, "night") == 0)
++      cfg->image.running_mode = static_cast<int>(hal::isp::RunningMode::Night);
++    else if (strcmp(cfg->daynight.force_mode_cfg, "day") == 0)
++      cfg->image.running_mode = static_cast<int>(hal::isp::RunningMode::Day);
++  }
+   ret = hal::isp::set_running_mode(
+       static_cast<hal::isp::RunningMode>(cfg->image.running_mode));
+   LOG_DEBUG_OR_ERROR(ret, "hal::isp::set_running_mode("
+@@ -596,9 +610,18 @@ int IMPSystem::init() {
                                         << fps_num << ", " << fps_den << ")");
  #endif
  
 -  // Set the ISP to DAY on launch
 -  ret = hal::isp::set_running_mode(hal::isp::RunningMode::Day);
 -  LOG_DEBUG_OR_ERROR_AND_EXIT(ret, "hal::isp::set_running_mode(Day)");
-+  // Apply the configured/forced mode at launch (was: hardcoded Day, which
-+  // clobbered cfg->image.running_mode applied earlier in this function and
-+  // made forced-night boots flash day). Non-fatal: the daynight worker
-+  // re-applies a forced mode on its first iteration anyway.
++  // Re-assert the running mode at end of init. This replaces the old hardcoded
++  // set_running_mode(Day), which used to clobber a forced-night boot. The
++  // authoritative apply is the EARLY one above (the only one that sticks on this
++  // sensor); this end-of-init call is a harmless re-assert of the same value.
++  // Clamp to Day/Night (image.running_mode validates 0/1/2). Non-fatal.
 +  {
-+    hal::isp::RunningMode boot_mode =
-+        static_cast<hal::isp::RunningMode>(cfg->image.running_mode);
-+    const char *fm_cfg = cfg->daynight.force_mode_cfg;
-+    if (fm_cfg && strcmp(fm_cfg, "night") == 0) {
-+      boot_mode = hal::isp::RunningMode::Night;
-+    } else if (fm_cfg && strcmp(fm_cfg, "day") == 0) {
-+      boot_mode = hal::isp::RunningMode::Day;
-+    }
++    hal::isp::RunningMode boot_mode = (cfg->image.running_mode == 1)
++                                          ? hal::isp::RunningMode::Night
++                                          : hal::isp::RunningMode::Day;
 +    int rm_ret = hal::isp::set_running_mode(boot_mode);
 +    LOG_DEBUG_OR_ERROR(rm_ret, "hal::isp::set_running_mode(launch)");
 +  }
