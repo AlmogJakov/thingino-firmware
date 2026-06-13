@@ -1,24 +1,26 @@
-Subject: [PATCH] daynight: always start stats worker; persist & apply force_mode at startup
+Subject: [PATCH v2] daynight: always-start stats worker; persist force_mode; RECORD (not re-apply) forced mode at worker startup
 Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (branch stable)
 
-Root causes on T23 / isp_bypass=true builds:
- (A) The DayNightWorker — the sole writer of the daynight.live_* AE telemetry —
-     is spawned only when daynight.enabled=true at startup, so forced/manual
-     modes leave every daynight.status field at its -1 default for the whole
-     process lifetime, and a runtime enable cannot start it. Fix: always start
-     the worker; keep automatic switching gated on daynight.enabled inside the
-     loop, and gate the initial-mode inference so a disabled engine never
-     auto-applies a mode.
- (B) daynight.force_mode was runtime-only (not a persisted config key) and the
-     ISP was hard-forced to Day at the end of IMPSystem::init, so a forced mode
-     never survived a restart/reboot. Fix: register daynight.force_mode as a
-     persisted string key, seed it into the existing one-shot mailbox when the
-     worker starts, and apply the configured/forced running mode at launch
-     instead of hardcoded Day.
+Fixes two issues on T23 / isp_bypass=true builds:
+ (A) AE/day-night telemetry (total_gain, ev, ae_luma, brightness_percent) read
+     -1 for the whole process life when daynight.enabled=false at startup, because
+     the DayNightWorker -- the sole writer of those values -- was only started
+     when enabled. Fix: always start the worker; automatic switching stays gated
+     on daynight.enabled inside the loop.
+ (B) daynight.force_mode did not survive a reboot: it was not a persisted config
+     key, and the ISP was hard-forced to Day at the end of IMPSystem::init(). Fix:
+     register daynight.force_mode as a persisted string key and apply the
+     configured/forced running mode once in IMPSystem::init() (before the encoder
+     pipeline exists), instead of hardcoded Day.
 
-This buys: real AE/gain telemetry in every mode and on every boot; forced
-day/night that survives reboots; auto unchanged. Verified to apply cleanly to
-the pinned commit (git apply + patch -p1); compiled by CI, not yet bench-built.
+Crucial detail (v2): at startup the worker only RECORDS the persisted force_mode
+(sets current + live_mode, suppresses auto-inference); it must NOT call
+apply_mode(). apply_mode() does set_running_mode() + system("/sbin/daynight ...")
+which, on a freshly-built isp_bypass=true cold-boot encoder during AE settling,
+tears the video stream down ~2-3s after boot. Runtime JSON-API force-mode requests
+are unaffected and still apply_mode() normally (the stream is up by then).
+
+Verified to apply cleanly to the pinned commit (git apply -p1 and patch -p1).
 
 diff --git a/src/Config.cpp b/src/Config.cpp
 index 1314d29..cd53e4b 100644
@@ -55,28 +57,41 @@ index 581c7b8..292d5de 100644
    std::atomic<int> live_brightness_percent{-1};
    std::atomic<int> live_ev{-1};
 diff --git a/src/DayNightWorker.cpp b/src/DayNightWorker.cpp
-index 793b812..0ee1440 100644
+index 793b812..3c1d50c 100644
 --- a/src/DayNightWorker.cpp
 +++ b/src/DayNightWorker.cpp
-@@ -649,6 +649,17 @@ void *thread_entry(void *arg) {
+@@ -649,6 +649,30 @@ void *thread_entry(void *arg) {
    int anti_flap_cooldown = 0;
    const int anti_flap_iterations = 30; // ~30 seconds minimum between switches
  
-+  // Seed a persisted startup force_mode (daynight.force_mode in the config
-+  // file) into the one-shot mailbox; the first loop iteration applies it via
-+  // the existing handler below (apply_mode + initial_mode_applied = true,
-+  // which also suppresses auto-inference). CAS so a runtime JSON-API request
-+  // that raced ahead of us is not clobbered.
++  // Record a persisted startup force_mode (daynight.force_mode in the config
++  // file) WITHOUT re-applying it on the live pipeline. IMPSystem::init() has
++  // already set the boot ISP running_mode; seeding the force_mode atomic here
++  // would make the first loop iteration call apply_mode(), which does
++  // set_running_mode + system("/sbin/daynight ...") on the freshly-built,
++  // isp_bypass=true encoder during AE settling and tears the stream down ~2-3s
++  // after a cold boot. So we only prime current/live_mode and suppress
++  // auto-inference; we do NOT touch the force_mode atomic (that mailbox stays
++  // for runtime JSON-API requests, which should still apply_mode once the
++  // stream is up).
 +  if (cfg->daynight.force_mode_cfg && *cfg->daynight.force_mode_cfg) {
-+    const char *expected = nullptr;
-+    cfg->daynight.force_mode.compare_exchange_strong(
-+        expected, strdup(cfg->daynight.force_mode_cfg));
++    if (std::strcmp(cfg->daynight.force_mode_cfg, "night") == 0) {
++      current = DayNightAlgo::Mode::Night;
++      simple_state.is_night = true;
++      cfg->daynight.live_mode.store("night", std::memory_order_relaxed);
++      initial_mode_applied = true;
++    } else if (std::strcmp(cfg->daynight.force_mode_cfg, "day") == 0) {
++      current = DayNightAlgo::Mode::Day;
++      simple_state.is_night = false;
++      cfg->daynight.live_mode.store("day", std::memory_order_relaxed);
++      initial_mode_applied = true;
++    }
 +  }
 +
    while (!global_shutdown_requested.load(std::memory_order_relaxed)) {
      refresh_daynight_log_level();
  
-@@ -724,7 +735,7 @@ void *thread_entry(void *arg) {
+@@ -724,7 +748,7 @@ void *thread_entry(void *arg) {
      // Apply initial mode if not set - infer from current sensor readings
      // IMPORTANT: This happens regardless of schedule to ensure camera starts in
      // correct mode
@@ -85,7 +100,7 @@ index 793b812..0ee1440 100644
        DayNightAlgo::Mode initial = DayNightAlgo::Mode::Unknown;
  
        // Infer initial mode from sensor readings to avoid black screen on boot
-@@ -843,7 +854,9 @@ void *thread_entry(void *arg) {
+@@ -843,7 +867,9 @@ void *thread_entry(void *arg) {
      }
  
      const char *mode_str =
