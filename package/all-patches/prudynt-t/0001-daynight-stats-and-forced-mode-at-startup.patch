@@ -135,7 +135,7 @@ index 793b812..d50eb22 100644
      export_brightness_value(bright_pct, mode_str);
  
 diff --git a/src/IMPSystem.cpp b/src/IMPSystem.cpp
-index 769ba91..19fc955 100644
+index 769ba91..e89342b 100644
 --- a/src/IMPSystem.cpp
 +++ b/src/IMPSystem.cpp
 @@ -430,6 +430,20 @@ int IMPSystem::init() {
@@ -159,25 +159,21 @@ index 769ba91..19fc955 100644
    ret = hal::isp::set_running_mode(
        static_cast<hal::isp::RunningMode>(cfg->image.running_mode));
    LOG_DEBUG_OR_ERROR(ret, "hal::isp::set_running_mode("
-@@ -596,9 +610,18 @@ int IMPSystem::init() {
+@@ -596,9 +610,14 @@ int IMPSystem::init() {
                                         << fps_num << ", " << fps_den << ")");
  #endif
  
 -  // Set the ISP to DAY on launch
 -  ret = hal::isp::set_running_mode(hal::isp::RunningMode::Day);
 -  LOG_DEBUG_OR_ERROR_AND_EXIT(ret, "hal::isp::set_running_mode(Day)");
-+  // Re-assert the running mode at end of init. This replaces the old hardcoded
-+  // set_running_mode(Day), which used to clobber a forced-night boot. The
-+  // authoritative apply is the EARLY one above (the only one that sticks on this
-+  // sensor); this end-of-init call is a harmless re-assert of the same value.
-+  // Clamp to Day/Night (image.running_mode validates 0/1/2). Non-fatal.
-+  {
-+    hal::isp::RunningMode boot_mode = (cfg->image.running_mode == 1)
-+                                          ? hal::isp::RunningMode::Night
-+                                          : hal::isp::RunningMode::Day;
-+    int rm_ret = hal::isp::set_running_mode(boot_mode);
-+    LOG_DEBUG_OR_ERROR(rm_ret, "hal::isp::set_running_mode(launch)");
-+  }
++  // NB: the boot running mode is set ONCE, early in init (the force_mode-derived
++  // set_running_mode right after the hflip/vflip block) — that is the call that
++  // actually sticks on this sensor. The stock code re-asserted
++  // set_running_mode(Day) HERE at end of init; we deliberately do NOT re-assert,
++  // because (a) a late set is a no-op on this sensor anyway and (b) re-issuing a
++  // Night sensor-mode switch this close to the encoder pipeline build
++  // intermittently stalls the cold-boot stream (~2-5s in). The early set is
++  // authoritative; nothing more is needed at launch.
  #endif // #if !defined(NO_TUNINGS)
  
    return ret;
