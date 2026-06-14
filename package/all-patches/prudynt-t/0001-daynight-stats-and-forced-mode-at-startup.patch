@@ -71,10 +71,10 @@ index 581c7b8..f2600a9 100644
    std::atomic<int> live_brightness_percent{-1};
    std::atomic<int> live_ev{-1};
 diff --git a/src/DayNightWorker.cpp b/src/DayNightWorker.cpp
-index 793b812..230d7af 100644
+index 793b812..d50eb22 100644
 --- a/src/DayNightWorker.cpp
 +++ b/src/DayNightWorker.cpp
-@@ -649,6 +649,32 @@ void *thread_entry(void *arg) {
+@@ -649,6 +649,39 @@ void *thread_entry(void *arg) {
    int anti_flap_cooldown = 0;
    const int anti_flap_iterations = 30; // ~30 seconds minimum between switches
  
@@ -102,12 +102,19 @@ index 793b812..230d7af 100644
 +      cfg->daynight.live_mode.store("day", std::memory_order_relaxed);
 +      initial_mode_applied = true;
 +    }
++    // Observable marker: proves this record block is in the running binary
++    // (strings) and fired at boot with which value (logread). If this line never
++    // appears at boot but daynight.force_mode is set, force_mode_cfg failed to load.
++    LOG_INFO("DayNight: recorded persisted startup force_mode="
++             << cfg->daynight.force_mode_cfg << " (record-only, no apply)");
++  } else {
++    LOG_INFO("DayNight: no persisted startup force_mode (force_mode_cfg empty)");
 +  }
 +
    while (!global_shutdown_requested.load(std::memory_order_relaxed)) {
      refresh_daynight_log_level();
  
-@@ -724,7 +750,7 @@ void *thread_entry(void *arg) {
+@@ -724,7 +757,7 @@ void *thread_entry(void *arg) {
      // Apply initial mode if not set - infer from current sensor readings
      // IMPORTANT: This happens regardless of schedule to ensure camera starts in
      // correct mode
@@ -116,7 +123,7 @@ index 793b812..230d7af 100644
        DayNightAlgo::Mode initial = DayNightAlgo::Mode::Unknown;
  
        // Infer initial mode from sensor readings to avoid black screen on boot
-@@ -843,7 +869,9 @@ void *thread_entry(void *arg) {
+@@ -843,7 +876,9 @@ void *thread_entry(void *arg) {
      }
  
      const char *mode_str =
