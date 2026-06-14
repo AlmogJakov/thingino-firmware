@@ -69,16 +69,27 @@ jobs:
         # `make fast` is the parallel full build thingino's own CI uses.
         run: BOARD=${{ github.event.inputs.board }} make fast WORKFLOW=1
 
-      - name: Confirm the patch actually applied
+      - name: Confirm the FINAL patch actually applied
         run: |
           SRC=$(find output -type d -name 'prudynt-t-*' 2>/dev/null | grep -v '/host/' | head -1)
           echo "prudynt source dir: $SRC"
-          if [ -n "$SRC" ] && grep -q "force_mode_cfg" "$SRC/src/Config.hpp" 2>/dev/null; then
-            echo "PATCH APPLIED: force_mode_cfg present in $SRC/src/Config.hpp"
-          else
-            echo "::error::patch did NOT apply (force_mode_cfg missing) — see build log"
-            exit 1
+          [ -n "$SRC" ] || { echo "::error::prudynt source dir not found"; exit 1; }
+          ok=1
+          # 1) config key (all versions)
+          grep -qF "force_mode_cfg" "$SRC/src/Config.hpp" \
+            || { echo "::error::Config.hpp: force_mode_cfg missing — patch did not apply"; ok=0; }
+          # 2) IMPSystem EARLY-DERIVE of running_mode from force_mode (final patch only;
+          #    a stale patch sets a local boot_mode at end-of-init instead)
+          grep -qF "image.running_mode = static_cast<int>(hal::isp::RunningMode::" "$SRC/src/IMPSystem.cpp" \
+            || { echo "::error::IMPSystem.cpp: early-derive missing — STALE patch, not the final single-source version"; ok=0; }
+          # 3) worker RECORD block (final patch references force_mode_cfg in the worker)
+          grep -qF "force_mode_cfg" "$SRC/src/DayNightWorker.cpp" \
+            || { echo "::error::DayNightWorker.cpp: record block missing — STALE patch"; ok=0; }
+          # 4) must NOT be the rejected v3 deferred-apply variant
+          if grep -qF "pending_force_apply" "$SRC/src/DayNightWorker.cpp"; then
+            echo "::error::DayNightWorker.cpp: contains pending_force_apply — this is the rejected v3 deferred patch"; ok=0
           fi
+          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (config key + early-derive + record block, no v3)" || exit 1
 
       - name: Locate the built MIPS prudynt binary
         id: find
