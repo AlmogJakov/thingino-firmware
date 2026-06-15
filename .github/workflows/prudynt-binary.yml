@@ -89,12 +89,11 @@ jobs:
           if grep -qF "pending_force_apply" "$SRC/src/DayNightWorker.cpp"; then
             echo "::error::DayNightWorker.cpp: contains pending_force_apply — this is the rejected v3 deferred patch"; ok=0
           fi
-          # 5) config-reload restart fix (Part 2): reload_and_diff + ConfigWatcher trigger
-          grep -qF "reload_and_diff" "$SRC/src/Config.cpp" \
-            || { echo "::error::Config.cpp: reload_and_diff missing — config-restart fix (Part 2) not applied"; ok=0; }
-          grep -qF "trigger_reload" "$SRC/src/ConfigWatcher.cpp" \
-            || { echo "::error::ConfigWatcher.cpp: trigger_reload missing — config-restart fix (Part 2) not applied"; ok=0; }
-          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (Part 1: config key + early-derive + record block, no v3; Part 2: reload_and_diff + trigger_reload)" || exit 1
+          # 5) encoder config-change restart fix (Part 2): JsonAPI handle_stream
+          #    rebuilds the pipeline when a numeric encoder field changes.
+          grep -qF "rtsp_too" "$SRC/src/JsonAPI.cpp" \
+            || { echo "::error::JsonAPI.cpp: rtsp_too missing — encoder config-change restart fix (Part 2) not applied"; ok=0; }
+          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (Part 1: config key + early-derive + record block, no v3; Part 2: JsonAPI encoder restart)" || exit 1
 
       - name: Locate the built MIPS prudynt binary
         id: find
