@@ -1,40 +1,55 @@
-Subject: [PATCH] daynight: always-start stats worker; persist + record forced mode; derive boot running_mode from it
+Subject: [PATCH] daynight: always-start stats worker + persist/record forced mode + derive boot running_mode; configwatcher: clean pipeline restart on encoder config change
 Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (branch stable)
 
-Fixes, on T23 / isp_bypass=true builds, three problems with forced day/night:
+This patch fixes two independent reliability problems on T23 / isp_bypass=true.
+
+==== Part 1: day/night stats + forced mode (Config/DayNightWorker/IMPSystem/main) ====
  (A) AE/day-night telemetry (total_gain, ev, ae_luma, brightness_percent) read
      -1 for the whole process life when daynight.enabled=false, because the
      DayNightWorker -- the sole writer of those values -- was only started when
      enabled. Fix: always start the worker; automatic switching stays gated on
      daynight.enabled inside the loop.
- (B) A forced mode did not survive reboot, and the live mode was misreported.
+ (B) A forced mode did not survive reboot and the live mode was misreported.
      daynight.force_mode was not a persisted config key; the worker never tagged
-     the live mode for a forced camera (it reported "unknown"); and the ISP was
+     the live mode for a forced camera (reported "unknown"); and the ISP was
      hard-forced to Day at the end of IMPSystem::init(). Fix: register
-     daynight.force_mode as a persisted string key; have the worker RECORD it
-     (current + live_mode "day"/"night", and suppress auto-inference) without
-     applying it on the live pipeline.
+     daynight.force_mode as a persisted string key; the worker RECORDS it at
+     startup (current + live_mode, suppress auto-inference) WITHOUT apply_mode()
+     on the live pipeline (apply_mode at startup tears down the cold-boot
+     encoder, and a deferred apply causes a visible boot-time flip).
  (C) A forced color/mono mode did not take at boot. On this sensor a
-     set_running_mode at the END of init does NOT stick, while the one applied
-     early in init (right after the hflip/vflip block) does. Fix: derive
-     image.running_mode from daynight.force_mode BEFORE that early
-     set_running_mode, so a forced mode lands where it actually takes effect; the
-     end-of-init call becomes a harmless re-assert (no longer hardcoded Day).
+     set_running_mode at the END of init does NOT stick, only the EARLY one does.
+     Fix: derive image.running_mode from daynight.force_mode BEFORE the early
+     set_running_mode; drop the late re-assert (it was a no-op that also added a
+     redundant Night sensor switch which intermittently stalled the cold boot).
+ The IR-CUT filter + IR LED at boot are handled by the rootfs boot init
+ (S56ircut) reading the same daynight.force_mode -- single source of truth.
 
-Design -- daynight.force_mode is the SINGLE source of truth. From it:
-  * color/mono (ISP running_mode) is derived in IMPSystem::init() (this patch);
-  * the live/reported mode is set by the worker (this patch);
-  * the IR-CUT filter + IR LED are set by the boot IR-CUT init (S56ircut, a
-    companion rootfs change) which reads the same daynight.force_mode.
-The worker is RECORD-ONLY at startup: it never calls apply_mode() for a persisted
-mode, so there is no apply() on a settling cold-boot encoder (which tore the
-stream down) and no boot-time day->night flip. Runtime JSON-API force-mode
-requests are unaffected and still apply_mode() immediately.
+==== Part 2: config-file changes apply cleanly, no freeze (ConfigWatcher/Config) ====
+ Changing an encoder setting (bitrate, resolution, fps, stream format/mode) by
+ editing /etc/prudynt.json froze the stream until a process restart. ConfigWatcher
+ called cfg->load() (repopulates members) but never rebuilt the encoder, while
+ VideoWorker reads cfg->streamN fields live every frame -> worker/encoder mismatch
+ -> permanent freeze. The JSON API path avoids this by setting global_restart_*
+ and notifying the main loop, which cleanly tears down + rebuilds the affected
+ threads.
+ Fix: CFG::reload_and_diff() reparses under a single configMutex hold and diffs
+ the encoder-/pipeline-defining fields (per-stream geometry+RC, JPEG, sensor dims,
+ OSD-enable / RTP-sink format+resolution / audio reconfig) before vs after, and
+ ConfigWatcher fires ONLY the needed global_restart_video/rtsp/audio flag(s) under
+ mutex_main + notifies the same proven main-loop restart machinery. Benign edits
+ (image ISP tuning, OSD content, daynight incl. force_mode, motion params, rtsp
+ network knobs) set no flag -> zero stream disruption. load() is split into a
+ lock-held load_locked() core so reload_and_diff() reuses it without recursive
+ locking; configMutex and mutex_main are never nested (no lock-order inversion).
+ Adversarially reviewed: deadlock-free, no stuck joins (every torn-down worker
+ honors its restart flag), no torn-state crash (const char* members are strdup'd,
+ never freed on reload), selective (no needless restarts).
 
 Verified to apply cleanly to the pinned commit (git apply -p1 and patch -p1).
 
 diff --git a/src/Config.cpp b/src/Config.cpp
-index 1314d29..cd53e4b 100644
+index 1314d29..0f969b2 100644
 --- a/src/Config.cpp
 +++ b/src/Config.cpp
 @@ -425,6 +425,13 @@ std::vector<ConfigItem<const char *>> CFG::getCharItems() {
@@ -51,8 +66,124 @@ index 1314d29..cd53e4b 100644
        {"daynight.schedule.start_at", daynight.schedule.start_at, "",
         validateCharDummy},
        {"daynight.schedule.stop_at", daynight.schedule.stop_at, "",
+@@ -1318,6 +1325,12 @@ CFG::CFG() {
+ 
+ void CFG::load() {
+   std::lock_guard<std::mutex> lock(configMutex);
++  load_locked();
++}
++
++void CFG::load_locked() {
++  // NOTE: caller MUST already hold configMutex (load() above, or
++  // reload_and_diff()). Keeps configMutex non-recursive.
+   LOG_DEBUG("CFG::load() - Starting configuration load");
+   boolItems = getBoolItems();
+   LOG_DEBUG("CFG::load() - Got bool items");
+@@ -1391,6 +1404,102 @@ void CFG::load() {
+   */
+ }
+ 
++namespace {
++// Encoder/framesource-defining fields of one video stream (+ OSD enable, which
++// gates the OSD thread's lifecycle in the video-restart block). Cosmetic OSD
++// content/position and live stats are intentionally excluded.
++void fp_video_stream(std::ostringstream &os, const _stream &s) {
++  const char *mode = s.mode ? s.mode : "";
++  const char *fmt = s.format ? s.format : "";
++  os << '|' << s.enabled << ',' << s.video_enabled << ',' << fmt << ',' << mode
++     << ',' << s.width << ',' << s.height << ',' << s.fps << ',' << s.bitrate
++     << ',' << s.gop << ',' << s.max_gop << ',' << s.profile << ',' << s.buffers
++     << ',' << s.rotation << ',' << s.scale_enabled << ',' << s.scale_width
++     << ',' << s.scale_height << ',' << s.qp_init << ',' << s.qp_min << ','
++     << s.qp_max << ',' << s.ip_delta << ',' << s.pb_delta << ','
++     << s.max_bitrate << ',' << s.osd.enabled;
++}
++// JPEG-stream channel-creation fields.
++void fp_jpeg_stream(std::ostringstream &os, const _stream &s) {
++  os << '|' << s.enabled << ',' << s.width << ',' << s.height << ','
++     << s.jpeg_quality << ',' << s.jpeg_channel;
++}
++// RTP-sink-defining fields (codec from format, and resolution) of one stream.
++void fp_rtsp_stream(std::ostringstream &os, const _stream &s) {
++  const char *fmt = s.format ? s.format : "";
++  os << '|' << fmt << ',' << s.width << ',' << s.height << ',' << s.enabled
++     << ',' << s.video_enabled;
++}
++} // namespace
++
++CFG::EncoderFingerprint CFG::fingerprint_locked() const {
++  // NOTE: caller MUST already hold configMutex. Reads only C++ members (never
++  // the raw jsonConfig pointer), so it adds no new unsynchronised jsonConfig
++  // access. String CONTENT comparison (not pointer identity), so a same-value
++  // reparse yields an equal fingerprint and no spurious restart.
++  EncoderFingerprint fp;
++  {
++    std::ostringstream os;
++    // sensor dims/fps feed every framesource + all encoder geometry
++    os << "s:" << sensor.fps << ',' << sensor.width << ',' << sensor.height;
++    fp_video_stream(os, stream0);
++    fp_video_stream(os, stream1);
++    fp_jpeg_stream(os, stream2);
++    fp_jpeg_stream(os, stream3);
++    fp.video = os.str();
++  }
++  {
++    std::ostringstream os;
++    os << sensor.width << ',' << sensor.height; // resolution also hits RTP sink
++    fp_rtsp_stream(os, stream0);
++    fp_rtsp_stream(os, stream1);
++#if defined(LIB_AUDIO_PROCESSING)
++    os << "|spk:" << audio.output_enabled; // spk toggle rebuilds RTSP backchannel
++#endif
++    fp.rtsp = os.str();
++  }
++  {
++    std::ostringstream os;
++    const char *infmt = audio.input_format ? audio.input_format : "";
++    os << audio.input_enabled << ',' << infmt << ',' << audio.input_bitrate
++       << ',' << audio.input_sample_rate
++#if defined(LIB_AUDIO_PROCESSING)
++       << ',' << audio.input_noise_suppression << ',' << audio.input_agc_enabled
++       << ',' << audio.input_agc_target_level_dbfs << ','
++       << audio.input_agc_compression_gain_db << ',' << audio.force_stereo << ','
++       << audio.output_enabled << ',' << audio.output_sample_rate
++#endif
++        ;
++    fp.audio = os.str();
++  }
++  return fp;
++}
++
++ConfigChange CFG::reload_and_diff() {
++  // Snapshot encoder-defining state, reload, re-snapshot, diff — all under a
++  // single configMutex hold so detection is atomic with the reparse. No second
++  // lock acquisition another writer could interleave; configMutex is fully
++  // released before the caller takes mutex_main (the two are never nested).
++  std::lock_guard<std::mutex> lock(configMutex);
++
++  EncoderFingerprint before = fingerprint_locked();
++  bool motion_before = motion.enabled;
++
++  load_locked();
++
++  EncoderFingerprint after = fingerprint_locked();
++  bool motion_after = motion.enabled;
++
++  ConfigChange chg;
++  if (before.video != after.video || motion_before != motion_after)
++    chg.video = true;
++  if (before.rtsp != after.rtsp)
++    chg.rtsp = true;
++  if (before.audio != after.audio)
++    chg.audio = true;
++  return chg;
++}
++
+ bool CFG::saveIntValues(
+     const std::vector<std::pair<std::string, int>> &values) {
+   if (values.empty())
 diff --git a/src/Config.hpp b/src/Config.hpp
-index 581c7b8..f2600a9 100644
+index 581c7b8..efefb5c 100644
 --- a/src/Config.hpp
 +++ b/src/Config.hpp
 @@ -156,6 +156,14 @@ struct _daynight {
@@ -70,11 +201,141 @@ index 581c7b8..f2600a9 100644
    // Live telemetry populated by the worker - RAW ISP sensor data
    std::atomic<int> live_brightness_percent{-1};
    std::atomic<int> live_ev{-1};
+@@ -373,6 +381,18 @@ struct _websocket {
+ };
+ #endif
+ 
++// Result of a config-file reload diff: which worker subsystems must restart
++// because an encoder-/pipeline-defining field actually changed. any()==false
++// means the edit was benign (image ISP tuning, OSD content, daynight incl.
++// force_mode, motion params, rtsp network knobs) and the live stream is NOT
++// disturbed.
++struct ConfigChange {
++  bool video = false; // encoder/framesource geometry+RC, JPEG, sensor dims, OSD enable
++  bool rtsp = false;  // RTP-sink-defining: video format or resolution, or spk toggle
++  bool audio = false; // audio capture/playback reconfig
++  bool any() const { return video || rtsp || audio; }
++};
++
+ class CFG {
+ public:
+   // Destructor to clean up JSON object
+@@ -390,6 +410,11 @@ public:
+ 
+   CFG();
+   void load();
++  // Reparse the config file like load(), but atomically (under one configMutex
++  // hold) diff the encoder-/pipeline-defining fields before vs after and report
++  // which subsystems changed, so the caller (ConfigWatcher) can trigger a
++  // precise, minimal pipeline restart. Never touches mutex_main.
++  ConfigChange reload_and_diff();
+   static CFG *createNew();
+   bool readConfig();
+   bool updateConfig();
+@@ -469,6 +494,20 @@ public:
+   }
+ 
+ private:
++  // Core reload logic. MUST be called with configMutex already held. Both
++  // load() (which takes the lock) and reload_and_diff() (which already holds it)
++  // delegate here, so configMutex is never acquired recursively.
++  void load_locked();
++  // Compact fingerprint of all encoder-/pipeline-defining fields, built from the
++  // current C++ members. MUST be called with configMutex held. Diffed before vs
++  // after a reload so a change maps to the minimal restart flag set.
++  struct EncoderFingerprint {
++    std::string video; // per-stream encoder/framesource geometry+RC + sensor dims + OSD-enable
++    std::string rtsp;  // fields that force an RTP-sink rebuild (format + resolution + spk)
++    std::string audio; // audio capture/playback reconfig fields
++  };
++  EncoderFingerprint fingerprint_locked() const;
++
+   std::vector<ConfigItem<bool>> boolItems{};
+   std::vector<ConfigItem<const char *>> charItems{};
+   std::vector<ConfigItem<int>> intItems{};
+diff --git a/src/ConfigWatcher.cpp b/src/ConfigWatcher.cpp
+index de07c8e..fe25022 100644
+--- a/src/ConfigWatcher.cpp
++++ b/src/ConfigWatcher.cpp
+@@ -88,9 +88,7 @@ void ConfigWatcher::watch_using_notify() {
+       struct inotify_event *event = (struct inotify_event *)&buffer[i];
+ 
+       if (event->mask & IN_MODIFY) {
+-        cfg->load();
+-        LOG_INFO("Config file changed, the config is reloaded from: "
+-                 << cfg->filePath);
++        trigger_reload();
+       }
+ 
+       i += EVENT_SIZE + event->len;
+@@ -112,12 +110,45 @@ void ConfigWatcher::watch_using_poll() {
+         lastModifiedTime = fileInfo.st_mtime;
+       } else if (fileInfo.st_mtime != lastModifiedTime) {
+         lastModifiedTime = fileInfo.st_mtime;
+-        cfg->load();
+-        LOG_INFO("Config file changed, the config is reloaded from: "
+-                 << cfg->filePath);
++        trigger_reload();
+       }
+     }
+ 
+     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+   }
+ }
++
++void ConfigWatcher::trigger_reload() {
++  // Reload + diff under configMutex (inside reload_and_diff), then trigger ONLY
++  // the restart(s) for the subsystem whose encoder-defining config changed.
++  // Benign edits (image ISP tuning, OSD content, daynight incl. force_mode,
++  // motion params, rtsp network knobs) set no flag -> zero stream disruption.
++  ConfigChange chg = cfg->reload_and_diff();
++
++  if (!chg.any()) {
++    // File was reparsed but no encoder-/pipeline-defining field changed (live
++    // ISP tuning, OSD content, day/night, motion params, rtsp network knobs).
++    LOG_DEBUG("Config file reloaded from " << cfg->filePath
++              << " (benign change; no worker restart).");
++    return;
++  }
++
++  {
++    // Set flags under mutex_main — the lock the main loop holds while waiting on
++    // the cv and while re-arming the flags — so we never clobber an in-flight
++    // reset. Flags are OR-ed/sticky; the main loop is the sole resetter.
++    // configMutex is already released (the two locks are never nested).
++    std::lock_guard<std::mutex> lock(mutex_main);
++    if (chg.video)
++      global_restart_video = true;
++    if (chg.rtsp)
++      global_restart_rtsp = true;
++    if (chg.audio)
++      global_restart_audio = true;
++  }
++  global_cv_worker_restart.notify_one();
++
++  LOG_INFO("Config file reloaded from " << cfg->filePath
++           << " -> pipeline restart (video=" << chg.video << " rtsp="
++           << chg.rtsp << " audio=" << chg.audio << ")");
++}
+diff --git a/src/ConfigWatcher.hpp b/src/ConfigWatcher.hpp
+index 696ec38..946c6c8 100644
+--- a/src/ConfigWatcher.hpp
++++ b/src/ConfigWatcher.hpp
+@@ -12,6 +12,9 @@ private:
+   void run();
+   void watch_using_notify();
+   void watch_using_poll();
++  // Reload + diff the config file, then fire the minimal pipeline-restart
++  // flag(s) for whichever subsystem's encoder-defining config actually changed.
++  void trigger_reload();
+ };
+ 
+ #endif // CONFIG_WATCHER_HPP
 diff --git a/src/DayNightWorker.cpp b/src/DayNightWorker.cpp
-index 793b812..d50eb22 100644
+index 793b812..87b89fc 100644
 --- a/src/DayNightWorker.cpp
 +++ b/src/DayNightWorker.cpp
-@@ -649,6 +649,39 @@ void *thread_entry(void *arg) {
+@@ -649,6 +649,40 @@ void *thread_entry(void *arg) {
    int anti_flap_cooldown = 0;
    const int anti_flap_iterations = 30; // ~30 seconds minimum between switches
  
@@ -102,19 +363,20 @@ index 793b812..d50eb22 100644
 +      cfg->daynight.live_mode.store("day", std::memory_order_relaxed);
 +      initial_mode_applied = true;
 +    }
-+    // Observable marker: proves this record block is in the running binary
-+    // (strings) and fired at boot with which value (logread). If this line never
-+    // appears at boot but daynight.force_mode is set, force_mode_cfg failed to load.
-+    LOG_INFO("DayNight: recorded persisted startup force_mode="
-+             << cfg->daynight.force_mode_cfg << " (record-only, no apply)");
-+  } else {
-+    LOG_INFO("DayNight: no persisted startup force_mode (force_mode_cfg empty)");
++    // DEBUG-only marker. The string stays in the binary (so `strings` still
++    // confirms the record block is present), but it logs at most once per boot
++    // and only when daynight loglevel=DEBUG — no INFO-level / repeated writes.
++    if (daynight_should_log(Logger::DEBUG))
++      LOG_DEBUG("DayNight: recorded persisted startup force_mode="
++                << cfg->daynight.force_mode_cfg << " (record-only, no apply)");
++  } else if (daynight_should_log(Logger::DEBUG)) {
++    LOG_DEBUG("DayNight: no persisted startup force_mode (force_mode_cfg empty)");
 +  }
 +
    while (!global_shutdown_requested.load(std::memory_order_relaxed)) {
      refresh_daynight_log_level();
  
-@@ -724,7 +757,7 @@ void *thread_entry(void *arg) {
+@@ -724,7 +758,7 @@ void *thread_entry(void *arg) {
      // Apply initial mode if not set - infer from current sensor readings
      // IMPORTANT: This happens regardless of schedule to ensure camera starts in
      // correct mode
@@ -123,7 +385,7 @@ index 793b812..d50eb22 100644
        DayNightAlgo::Mode initial = DayNightAlgo::Mode::Unknown;
  
        // Infer initial mode from sensor readings to avoid black screen on boot
-@@ -843,7 +876,9 @@ void *thread_entry(void *arg) {
+@@ -843,7 +877,9 @@ void *thread_entry(void *arg) {
      }
  
      const char *mode_str =
