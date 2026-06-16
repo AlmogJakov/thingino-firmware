@@ -1,0 +1,55 @@
+Subject: [PATCH] VideoWorker: fix T23 VPU teardown order on in-process rebuild
+Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (branch stable)
+
+On Ingenic T23 (isp_bypass=true), an in-process video rebuild (global_restart_video,
+triggered by a stream-config change such as stream mode / bitrate / fps) froze the
+stream and wedged the VPU until a full reboot.
+
+Root cause: the worker teardown disabled the framesource (IMP_FrameSource_DisableChn)
+while it was still IMP_System_Bind-ed to the just-stopped encoder. DisableChn then
+blocks ~6s waiting for a downstream consumer that cannot drain, and leaves the VPU
+faulted (hwicodec: vpu channel run failed / i264e_slice_write failed). The old prudynt
+(3c8e835) used the same teardown code, but its runtime/buffer state let DisableChn
+drain quickly; f4b3228's changes exposed the latent ordering bug.
+
+Fix: tear down in SDK-correct reverse-of-create order -- deinit() (which unbinds
+fs->osd->enc and destroys the encoder channel) and delete the encoder FIRST, then
+disable the now-unbound framesource. With no consumer to wait for, DisableChn returns
+immediately and the rebuild completes cleanly. Encoder and framesource are checked
+independently (each is created independently). No behaviour change on non-T23
+platforms -- this is the correct teardown order everywhere.
+
+diff --git a/src/VideoWorker.cpp b/src/VideoWorker.cpp
+--- a/src/VideoWorker.cpp
++++ b/src/VideoWorker.cpp
+@@ -830,15 +830,21 @@
+   ret = IMP_Encoder_StopRecvPic(encChn);
+   LOG_DEBUG_OR_ERROR(ret, "IMP_Encoder_StopRecvPic(" << encChn << ")");
+
+-  if (global_video[encChn]->imp_framesource) {
+-    global_video[encChn]->imp_framesource->disable();
+-
+-    if (global_video[encChn]->imp_encoder) {
+-      global_video[encChn]->imp_encoder->deinit();
+-      delete global_video[encChn]->imp_encoder;
+-      global_video[encChn]->imp_encoder = nullptr;
+-    }
+-  }
++  // T23/VPU teardown order: detach + destroy the encoder BEFORE disabling the
++  // framesource. IMP_FrameSource_DisableChn on a framesource still bound (via
++  // IMP_System_Bind) to a stopped encoder blocks ~6s waiting for a consumer that
++  // cannot drain, wedging the T23 VPU on an in-process rebuild
++  // (global_restart_video). deinit() unbinds fs->osd->enc and destroys the
++  // channel; only then is the framesource free to disable cleanly.
++  if (global_video[encChn]->imp_encoder) {
++    global_video[encChn]->imp_encoder->deinit();
++    delete global_video[encChn]->imp_encoder;
++    global_video[encChn]->imp_encoder = nullptr;
++  }
++
++  if (global_video[encChn]->imp_framesource) {
++    global_video[encChn]->imp_framesource->disable();
++  }
+
+   {
+     std::lock_guard<std::mutex> lock(global_video[encChn]->privacy_mutex);
