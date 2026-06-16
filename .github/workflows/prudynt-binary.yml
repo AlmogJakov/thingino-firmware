@@ -93,7 +93,11 @@ jobs:
           #    rebuilds the pipeline when a numeric encoder field changes.
           grep -qF "rtsp_too" "$SRC/src/JsonAPI.cpp" \
             || { echo "::error::JsonAPI.cpp: rtsp_too missing — encoder config-change restart fix (Part 2) not applied"; ok=0; }
-          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (Part 1: config key + early-derive + record block, no v3; Part 2: JsonAPI encoder restart)" || exit 1
+          # 6) VideoWorker T23 teardown reorder (0002): encoder is deinit'd before
+          #    the framesource is disabled, so the in-process rebuild doesn't wedge the VPU.
+          grep -qF "T23/VPU teardown order" "$SRC/src/VideoWorker.cpp" \
+            || { echo "::error::VideoWorker.cpp: teardown reorder (0002) not applied"; ok=0; }
+          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (Part 1: config key + early-derive + record block, no v3; Part 2: JsonAPI encoder restart; 0002: VideoWorker teardown order)" || exit 1
 
       - name: Locate the built MIPS prudynt binary
         id: find
