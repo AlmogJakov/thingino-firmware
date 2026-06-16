@@ -97,7 +97,11 @@ jobs:
           #    the framesource is disabled, so the in-process rebuild doesn't wedge the VPU.
           grep -qF "T23/VPU teardown order" "$SRC/src/VideoWorker.cpp" \
             || { echo "::error::VideoWorker.cpp: teardown reorder (0002) not applied"; ok=0; }
-          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (Part 1: config key + early-derive + record block, no v3; Part 2: JsonAPI encoder restart; 0002: VideoWorker teardown order)" || exit 1
+          # 7) main.cpp quiesce (0003): StopRecvPic on all encoders before the
+          #    in-process rebuild tears down any channel (prevents the T23 VPU fault).
+          grep -qF "T23 VPU quiesce" "$SRC/src/main.cpp" \
+            || { echo "::error::main.cpp: encoder quiesce (0003) not applied"; ok=0; }
+          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (Part 1: config key + early-derive + record block, no v3; Part 2: JsonAPI encoder restart; 0002: VideoWorker teardown order; 0003: main.cpp encoder quiesce)" || exit 1
 
       - name: Locate the built MIPS prudynt binary
         id: find
