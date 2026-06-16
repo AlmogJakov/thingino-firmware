@@ -1,0 +1,40 @@
+Subject: [PATCH] main: quiesce all encoders before in-process video rebuild (T23 VPU)
+Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (branch stable)
+
+On Ingenic T23 (isp_bypass=true), an in-process video rebuild (global_restart_video,
+triggered by a stream-config change such as stream mode / bitrate / fps) froze the
+stream and wedged the VPU until a full reboot.
+
+The rebuild tears down the JPEG channels (2,3) before the video channels (0,1) -- but
+the video H264 encoders are still actively encoding when the first
+IMP_Encoder_DestroyChn runs, and on T23 destroying any encoder channel while another
+is mid-encode faults the shared VPU (hwicodec: vpu channel run failed / i264e:
+icodec_enc failed / i264e_slice_write failed). Confirmed in a foreground rebuild log:
+DestroyChn(2) is immediately followed by the running video encoder faulting. The old
+prudynt (3c8e835) does the identical teardown and tolerates it; a later change made
+the T23 VPU intolerant of a channel destroy during a live encode.
+
+Fix: at the start of the global_restart_video teardown, call IMP_Encoder_StopRecvPic
+on every encoder channel BEFORE any channel is destroyed in the per-worker joins
+below. With nothing mid-encode, the subsequent DestroyChn calls no longer fault the
+VPU. StopRecvPic on an absent/already-stopped channel returns an ignored error (same
+defensive style as the existing T23 pre-clean); the per-worker teardowns still call
+StopRecvPic on their own channel, and a second call is a harmless no-op.
+
+diff --git a/src/main.cpp b/src/main.cpp
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -804,4 +804,13 @@
+     if (global_restart_video) {
++      // T23 VPU quiesce: stop ALL encoders receiving pictures before any channel
++      // is torn down below. On T23, destroying one encoder channel (e.g. JPEG)
++      // while another (video H264) is still encoding faults the shared VPU
++      // (hwicodec: vpu channel run failed / i264e_slice_write failed) and wedges
++      // it until reboot. Stop every channel first so nothing is mid-encode when
++      // the per-worker DestroyChn runs during the joins below.
++      for (int qc = 0; qc < 4; ++qc)
++        (void)IMP_Encoder_StopRecvPic(qc);
++
+       // stop motion thread
+       if (global_motion_thread_signal) {
+         global_motion_thread_signal = false;
