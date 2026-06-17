@@ -121,7 +121,31 @@ jobs:
           # 12) day/night IDR (0004): apply_mode requests a keyframe after the cut.
           grep -qF "Force a clean keyframe" "$SRC/src/DayNightWorker.cpp" \
             || { echo "::error::DayNightWorker.cpp: day/night IDR (0004) not applied"; ok=0; }
-          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (Part 1: config key + early-derive + record block, no v3; Part 2: JsonAPI encoder restart; 0002: VideoWorker teardown order; 0003: main.cpp encoder quiesce; 0004: live reconfig + day/night IDR)" || exit 1
+          # 13) H1 (0005): prudyntctl IPC socket is bounded (cannot hang the worker).
+          grep -qF "SO_RCVTIMEO" "$SRC/src/prudyntctl.cpp" \
+            || { echo "::error::prudyntctl.cpp: IPC socket timeout (0005 H1) not applied"; ok=0; }
+          # 14) H2 (0005): VideoWorker escalates a persistent encoder stall to a rebuild.
+          grep -qF "request_restart_if_stalled" "$SRC/src/VideoWorker.cpp" \
+            || { echo "::error::VideoWorker.cpp: stall recovery (0005 H2) not applied"; ok=0; }
+          # 15) M5 (0005): apply_mode honours the optics-switch result (returns bool).
+          grep -qF "static bool apply_mode" "$SRC/src/DayNightWorker.cpp" \
+            || { echo "::error::DayNightWorker.cpp: apply_mode result-honouring (0005 M5) not applied"; ok=0; }
+          # 16) M4 (0005): forced day/night mode is mirrored into the persisted member.
+          grep -qF "force_mode_cfg = strdup" "$SRC/src/JsonAPI.cpp" \
+            || { echo "::error::JsonAPI.cpp: forced-mode persistence (0005 M4) not applied"; ok=0; }
+          # 17) M1 (0006): motion.enabled (add_boolk_m) rebuilds only on a real change.
+          grep -qF "Rebuild ONLY on a real change" "$SRC/src/JsonAPI.cpp" \
+            || { echo "::error::JsonAPI.cpp: motion change-guard (0006 M1) not applied"; ok=0; }
+          # 18) H1 (0006): setLive* no longer force a per-change keyframe.
+          grep -qF "No forced keyframe" "$SRC/src/IMPEncoder.cpp" \
+            || { echo "::error::IMPEncoder.cpp: per-change IDR removal (0006 H1) not applied"; ok=0; }
+          # 19) H1b (0006): day/night keyframe gated to a genuine colour<->mono cut.
+          grep -qF "color_cut" "$SRC/src/DayNightWorker.cpp" \
+            || { echo "::error::DayNightWorker.cpp: gated day/night keyframe (0006 H1b) not applied"; ok=0; }
+          # 20) M8 (0006): force_mode is a leak-free int enum (no per-command strdup).
+          grep -qF "std::atomic<int> force_mode" "$SRC/src/Config.hpp" \
+            || { echo "::error::Config.hpp: leak-free force_mode int enum (0006 M8) not applied"; ok=0; }
+          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (0001-0003 base; 0004 live reconfig + IDR; 0005 fault-tolerance; 0006 high-freq seamlessness: motion change-guard + no per-change keyframe + gated day/night keyframe + leak-free force_mode)" || exit 1
 
       - name: Locate the built MIPS prudynt binary
         id: find
