@@ -1,28 +1,31 @@
-Subject: [PATCH] VideoWorker: fix T23 VPU teardown order on in-process rebuild
+Subject: [PATCH] VideoWorker: free framesource VB pool on teardown (+ correct order) — fixes T23 rebuild leak
 Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (branch stable)
 
 On Ingenic T23 (isp_bypass=true), an in-process video rebuild (global_restart_video,
-triggered by a stream-config change such as stream mode / bitrate / fps) froze the
-stream and wedged the VPU until a full reboot.
+e.g. a stream-config change) worked the first 1-2 times and then faulted the VPU
+(hwicodec: vpu channel run failed / i264e_slice_write failed / ijpege_icodec_enc
+failed), sometimes ending in a segfault, freezing the stream until reboot.
 
-Root cause: the worker teardown disabled the framesource (IMP_FrameSource_DisableChn)
-while it was still IMP_System_Bind-ed to the just-stopped encoder. DisableChn then
-blocks ~6s waiting for a downstream consumer that cannot drain, and leaves the VPU
-faulted (hwicodec: vpu channel run failed / i264e_slice_write failed). The old prudynt
-(3c8e835) used the same teardown code, but its runtime/buffer state let DisableChn
-drain quickly; f4b3228's changes exposed the latent ordering bug.
+Root cause: the worker teardown only DISABLED the framesource
+(IMP_FrameSource_DisableChn) and never destroyed it. IMP_FrameSource_DestroyChn is
+only reachable via ~IMPFramesource -> destroy(), and the IMPFramesource object was
+never deleted on the rebuild path (the pointer was overwritten by the next
+createNew). So the video-buffer (VB) pool that IMP_FrameSource_CreateChn allocates
+(nrVBs frames in rmem, tens of MB/channel) was re-allocated every rebuild and never
+freed -> the rmem/VB pool was exhausted after 1-2 rebuilds. The old prudynt leaked
+far less per rebuild (1 small VB vs the new auto-buffer count of 2-3 large VBs per
+channel), so it stayed under the pool ceiling and appeared to work indefinitely.
 
-Fix: tear down in SDK-correct reverse-of-create order -- deinit() (which unbinds
-fs->osd->enc and destroys the encoder channel) and delete the encoder FIRST, then
-disable the now-unbound framesource. With no consumer to wait for, DisableChn returns
-immediately and the rebuild completes cleanly. Encoder and framesource are checked
-independently (each is created independently). No behaviour change on non-T23
-platforms -- this is the correct teardown order everywhere.
+Fix: in the worker teardown, tear the encoder down first (it is IMP_System_Bind-ed to
+the framesource), then DISABLE and DELETE the framesource. delete runs
+~IMPFramesource -> destroy() -> IMP_FrameSource_DestroyChn, which frees the VB pool,
+so the next rebuild's CreateChn starts clean and rebuilds can repeat indefinitely.
+The encoder path already deletes correctly; this makes the framesource path match it.
 
 diff --git a/src/VideoWorker.cpp b/src/VideoWorker.cpp
 --- a/src/VideoWorker.cpp
 +++ b/src/VideoWorker.cpp
-@@ -830,15 +830,21 @@
+@@ -830,15 +830,23 @@
    ret = IMP_Encoder_StopRecvPic(encChn);
    LOG_DEBUG_OR_ERROR(ret, "IMP_Encoder_StopRecvPic(" << encChn << ")");
 
@@ -35,12 +38,12 @@ diff --git a/src/VideoWorker.cpp b/src/VideoWorker.cpp
 -      global_video[encChn]->imp_encoder = nullptr;
 -    }
 -  }
-+  // T23/VPU teardown order: detach + destroy the encoder BEFORE disabling the
-+  // framesource. IMP_FrameSource_DisableChn on a framesource still bound (via
-+  // IMP_System_Bind) to a stopped encoder blocks ~6s waiting for a consumer that
-+  // cannot drain, wedging the T23 VPU on an in-process rebuild
-+  // (global_restart_video). deinit() unbinds fs->osd->enc and destroys the
-+  // channel; only then is the framesource free to disable cleanly.
++  // T23 rebuild fix: destroy the encoder first (it is IMP_System_Bind-ed to the
++  // framesource), then DISABLE *and* DELETE the framesource. Teardown previously
++  // only DisableChn'd it, so the VB pool IMP_FrameSource_CreateChn allocates
++  // leaked every in-process rebuild and exhausted rmem after 1-2 rebuilds
++  // (hwicodec: vpu channel run failed / segfault). delete -> ~IMPFramesource ->
++  // destroy() -> IMP_FrameSource_DestroyChn frees the pool; next CreateChn is clean.
 +  if (global_video[encChn]->imp_encoder) {
 +    global_video[encChn]->imp_encoder->deinit();
 +    delete global_video[encChn]->imp_encoder;
@@ -49,6 +52,8 @@ diff --git a/src/VideoWorker.cpp b/src/VideoWorker.cpp
 +
 +  if (global_video[encChn]->imp_framesource) {
 +    global_video[encChn]->imp_framesource->disable();
++    delete global_video[encChn]->imp_framesource;
++    global_video[encChn]->imp_framesource = nullptr;
 +  }
 
    {
