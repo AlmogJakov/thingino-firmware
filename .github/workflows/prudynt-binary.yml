@@ -93,10 +93,10 @@ jobs:
           #    rebuilds the pipeline when a numeric encoder field changes.
           grep -qF "rtsp_too" "$SRC/src/JsonAPI.cpp" \
             || { echo "::error::JsonAPI.cpp: rtsp_too missing — encoder config-change restart fix (Part 2) not applied"; ok=0; }
-          # 6) VideoWorker T23 teardown reorder (0002): encoder is deinit'd before
-          #    the framesource is disabled, so the in-process rebuild doesn't wedge the VPU.
-          grep -qF "T23/VPU teardown order" "$SRC/src/VideoWorker.cpp" \
-            || { echo "::error::VideoWorker.cpp: teardown reorder (0002) not applied"; ok=0; }
+          # 6) VideoWorker teardown (0002): framesource is DELETED (not just disabled),
+          #    which frees the VB pool that leaked on every in-process rebuild.
+          grep -qF "delete global_video[encChn]->imp_framesource" "$SRC/src/VideoWorker.cpp" \
+            || { echo "::error::VideoWorker.cpp: framesource-free fix (0002) not applied"; ok=0; }
           # 7) main.cpp quiesce (0003): StopRecvPic on all encoders before the
           #    in-process rebuild tears down any channel (prevents the T23 VPU fault).
           grep -qF "T23 VPU quiesce" "$SRC/src/main.cpp" \
