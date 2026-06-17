@@ -113,6 +113,11 @@ jobs:
           # 11) live reconfig (0004): JsonAPI no longer rebuilds for live fields.
           grep -qF "do_rebuild" "$SRC/src/JsonAPI.cpp" \
             || { echo "::error::JsonAPI.cpp: live-field no-rebuild logic (0004) not applied"; ok=0; }
+          # 11b) live reconfig (0004 FIXED): queue a live reconfig ONLY on a real
+          #      numeric set, never on a null read-query — otherwise every HA/agent
+          #      state poll reconfigures the live encoder and stalls the RTSP feed.
+          grep -qF "is_num_set" "$SRC/src/JsonAPI.cpp" \
+            || { echo "::error::JsonAPI.cpp: read-query guard (is_num_set) missing — STALE/buggy 0004 that reconfigs on every poll"; ok=0; }
           # 12) day/night IDR (0004): apply_mode requests a keyframe after the cut.
           grep -qF "Force a clean keyframe" "$SRC/src/DayNightWorker.cpp" \
             || { echo "::error::DayNightWorker.cpp: day/night IDR (0004) not applied"; ok=0; }
