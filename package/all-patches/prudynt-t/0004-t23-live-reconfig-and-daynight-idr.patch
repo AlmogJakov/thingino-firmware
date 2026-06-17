@@ -1,0 +1,411 @@
+Subject: [PATCH] T23: live (no-teardown) encoder reconfig + day/night keyframe
+Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (branch stable)
+Stacks on: 0001 (daynight+JsonAPI Part-2), 0002 (VideoWorker teardown), 0003 (quiesce).
+Applies cleanly with git apply -p1 / patch -p1 AFTER 0001-0003 (verified).
+
+==== Why ====
+On Ingenic T23 every encoder teardown/rebuild path is unreliable: an in-process
+rebuild wedges the VPU after a few cycles (reboot-only), and 0001 Part-2 forces
+exactly such a rebuild on every bitrate/fps/gop/qp change. The reliable way to
+change those runtime knobs is to reconfigure the RUNNING encoder live, with no
+teardown, using the T23 libimp setters confirmed present on this camera and
+verified against include/T23/1.3.0/zh/imp/imp_encoder.h:
+  bitrate/QP  -> IMP_Encoder_Get/SetChnAttrRcMode (+ RequestIDR)
+  fps         -> IMP_Encoder_SetChnFrmRate
+  gop         -> IMP_Encoder_SetGOPSize
+
+==== What ====
+1) IMPEncoder gains T23-only setLiveBitrate/setLiveFps/setLiveGop/setLiveQp.
+   Get->modify-only-the-active-rcMode-field->Set->RequestIDR. No teardown.
+2) video_stream gains req_bitrate/fps/gop/qp_min/qp_max + reconfig atomics
+   (mirrors the existing jpeg_stream req_*/reconfig idiom).
+3) JsonAPI handle_stream: on T23 the live fields (bitrate/fps/gop/qp_min/qp_max)
+   are marked live=true so add_int does NOT set global_restart_video (i.e. it
+   no longer rebuilds for them — supersedes 0001 Part-2 for these fields), and
+   their new values are queued on global_video[idx]. "mode" no longer rebuilds
+   on T23 (the SoC forces CBR, so it is cosmetic). Structural fields
+   (enabled/width/height/format/profile/buffers) keep 0001's rebuild path —
+   they have no live setter on T23.
+4) VideoWorker applies the queued reconfig at the top of its run loop — on the
+   SAME thread that owns IMP_Encoder_GetStream, so the SDK setters are never
+   concurrent with GetStream and need no lock; never tears anything down.
+5) DayNightWorker::apply_mode sets idr_fix=1 on both video channels after the
+   colour<->mono switch, so the worker emits a keyframe and the day/night
+   transition no longer shows colour/mono corruption (issue 3).
+
+Everything new is guarded by PLATFORM_T23; non-T23 builds are byte-identical to
+the 0001-0003 stack.
+
+diff --git a/src/DayNightWorker.cpp b/src/DayNightWorker.cpp
+index 87b89fc..3ef7634 100644
+--- a/src/DayNightWorker.cpp
++++ b/src/DayNightWorker.cpp
+@@ -345,6 +345,19 @@ static void apply_mode(DayNightAlgo::Mode m) {
+     std::string cmd = std::string(script) + " night";
+     (void)std::system(cmd.c_str());
+   }
++
++  // Force a clean keyframe on the active video channels right after the
++  // colour<->mono cut. Without it the decoder keeps predicting from pre-switch
++  // reference frames across the colourspace change, which shows as colour/mono
++  // corruption until the next scheduled IDR. Use the existing idr_fix flag so
++  // the VideoWorker thread (not this DayNightWorker thread) issues
++  // IMP_Encoder_RequestIDR — matching prudynt's own cross-thread IDR idiom
++  // (JsonAPI request_idr -> idr_fix -> VideoWorker).
++  for (int i = 0; i < NUM_VIDEO_CHANNELS; ++i) {
++    if (global_video[i]) {
++      global_video[i]->idr_fix = 1;
++    }
++  }
+ }
+ 
+ /* LEGACY - not used by simple algorithm
+diff --git a/src/IMPEncoder.cpp b/src/IMPEncoder.cpp
+index 8c1c2bc..6f1c2a8 100644
+--- a/src/IMPEncoder.cpp
++++ b/src/IMPEncoder.cpp
+@@ -61,6 +61,145 @@ void IMPEncoder::flush(int encChn) {
+   IMP_Encoder_RequestIDR(encChn);
+ }
+ 
++#if defined(PLATFORM_T23)
++// ---------------------------------------------------------------------------
++// Live (no-teardown) encoder reconfiguration — T23 / PLATFORM_OLD_SDK path.
++//
++// Called ONLY from the VideoWorker thread (the owner of IMP_Encoder_GetStream),
++// at the top of its loop between frames, so these SDK calls are never
++// concurrent with GetStream and require no locking. They read the current
++// rate-control attributes back, mutate only the requested field for whatever
++// rcMode is actually active, write them back, and request a keyframe so the
++// change is visible immediately. No channel is torn down, so the T23 VPU
++// teardown/rebuild hazard is avoided entirely. JPEG channels have no rate
++// controller and are skipped.
++//
++// Struct paths verified against include/T23/1.3.0/zh/imp/imp_encoder.h and
++// this file's own initProfile(): CBR bitrate = attrH264Cbr.outBitRate,
++// VBR/Smart = attrH264{Vbr,Smart}.maxBitRate, QP = .maxQp/.minQp; GOP cfg
++// field = gopsize; on T23 H264 RC is forced to CBR (see initProfile).
++// ---------------------------------------------------------------------------
++int IMPEncoder::setLiveBitrate(int kbps) {
++  if (is_jpeg_stream || kbps <= 0) {
++    return -1;
++  }
++
++  IMPEncoderAttrRcMode rc{};
++  int ret = IMP_Encoder_GetChnAttrRcMode(encChn, &rc);
++  if (ret != 0) {
++    LOG_ERROR("setLiveBitrate: GetChnAttrRcMode(" << encChn << ") ret=" << ret);
++    return ret;
++  }
++  switch (rc.rcMode) {
++  case ENC_RC_MODE_CBR:
++    rc.attrH264Cbr.outBitRate = static_cast<uint32_t>(kbps);
++    break;
++  case ENC_RC_MODE_VBR:
++    rc.attrH264Vbr.maxBitRate = static_cast<uint32_t>(kbps);
++    break;
++  case ENC_RC_MODE_SMART:
++    rc.attrH264Smart.maxBitRate = static_cast<uint32_t>(kbps);
++    break;
++  default: // FIXQP / unsupported: no bitrate field
++    LOG_DEBUG("setLiveBitrate: rcMode " << static_cast<int>(rc.rcMode)
++                                        << " has no bitrate field, skipping");
++    return 0;
++  }
++  ret = IMP_Encoder_SetChnAttrRcMode(encChn, &rc);
++  if (ret != 0) {
++    LOG_ERROR("setLiveBitrate: SetChnAttrRcMode(" << encChn << ") ret=" << ret);
++    return ret;
++  }
++  IMP_Encoder_RequestIDR(encChn);
++  LOG_INFO("setLiveBitrate(" << encChn << "): " << kbps << " kbps (rcMode "
++                             << static_cast<int>(rc.rcMode) << ")");
++  return 0;
++}
++
++int IMPEncoder::setLiveFps(int frmRateNum, int frmRateDen) {
++  if (is_jpeg_stream || frmRateNum <= 0 || frmRateDen <= 0) {
++    return -1;
++  }
++
++  IMPEncoderFrmRate frmRate{};
++  frmRate.frmRateNum = static_cast<uint32_t>(frmRateNum);
++  frmRate.frmRateDen = static_cast<uint32_t>(frmRateDen);
++  int ret = IMP_Encoder_SetChnFrmRate(encChn, &frmRate);
++  if (ret != 0) {
++    LOG_ERROR("setLiveFps: SetChnFrmRate(" << encChn << ") ret=" << ret);
++    return ret;
++  }
++  LOG_INFO("setLiveFps(" << encChn << "): " << frmRateNum << "/" << frmRateDen
++                         << " (effective next GOP)");
++  return 0;
++}
++
++int IMPEncoder::setLiveGop(int gop) {
++  if (is_jpeg_stream || gop <= 0) {
++    return -1;
++  }
++
++  IMPEncoderGOPSizeCfg gopCfg{};
++  gopCfg.gopsize = gop;
++  int ret = IMP_Encoder_SetGOPSize(encChn, &gopCfg);
++  if (ret != 0) {
++    LOG_ERROR("setLiveGop: SetGOPSize(" << encChn << ") ret=" << ret);
++    return ret;
++  }
++  LOG_INFO("setLiveGop(" << encChn << "): " << gop);
++  return 0;
++}
++
++int IMPEncoder::setLiveQp(int qpMin, int qpMax) {
++  if (is_jpeg_stream) {
++    return -1;
++  }
++  if (qpMin < 0 && qpMax < 0) {
++    return 0; // nothing to change (-1 sentinel == leave as-is)
++  }
++
++  IMPEncoderAttrRcMode rc{};
++  int ret = IMP_Encoder_GetChnAttrRcMode(encChn, &rc);
++  if (ret != 0) {
++    LOG_ERROR("setLiveQp: GetChnAttrRcMode(" << encChn << ") ret=" << ret);
++    return ret;
++  }
++  switch (rc.rcMode) {
++  case ENC_RC_MODE_CBR:
++    if (qpMin >= 0)
++      rc.attrH264Cbr.minQp = static_cast<uint32_t>(qpMin);
++    if (qpMax >= 0)
++      rc.attrH264Cbr.maxQp = static_cast<uint32_t>(qpMax);
++    break;
++  case ENC_RC_MODE_VBR:
++    if (qpMin >= 0)
++      rc.attrH264Vbr.minQp = static_cast<uint32_t>(qpMin);
++    if (qpMax >= 0)
++      rc.attrH264Vbr.maxQp = static_cast<uint32_t>(qpMax);
++    break;
++  case ENC_RC_MODE_SMART:
++    if (qpMin >= 0)
++      rc.attrH264Smart.minQp = static_cast<uint32_t>(qpMin);
++    if (qpMax >= 0)
++      rc.attrH264Smart.maxQp = static_cast<uint32_t>(qpMax);
++    break;
++  default:
++    LOG_DEBUG("setLiveQp: rcMode " << static_cast<int>(rc.rcMode)
++                                   << " has no QP fields, skipping");
++    return 0;
++  }
++  ret = IMP_Encoder_SetChnAttrRcMode(encChn, &rc);
++  if (ret != 0) {
++    LOG_ERROR("setLiveQp: SetChnAttrRcMode(" << encChn << ") ret=" << ret);
++    return ret;
++  }
++  IMP_Encoder_RequestIDR(encChn);
++  LOG_INFO("setLiveQp(" << encChn << "): min=" << qpMin << " max=" << qpMax
++                        << " (rcMode " << static_cast<int>(rc.rcMode) << ")");
++  return 0;
++}
++#endif // PLATFORM_T23
++
+ void MakeTables(int q, uint8_t *lqt, uint8_t *cqt) {
+   // Ensure q is within the expected range
+   q = std::max(1, std::min(q, 99));
+diff --git a/src/IMPEncoder.hpp b/src/IMPEncoder.hpp
+index 9384291..e67644b 100644
+--- a/src/IMPEncoder.hpp
++++ b/src/IMPEncoder.hpp
+@@ -42,6 +42,17 @@ public:
+   int destroy();
+   static void flush(int encChn);
+ 
++#if defined(PLATFORM_T23)
++  // Live (no-teardown) reconfiguration of the running encoder channel — see
++  // IMPEncoder.cpp. Call ONLY from the VideoWorker thread (between frames), so
++  // these never run concurrently with IMP_Encoder_GetStream and need no lock.
++  // Each returns 0 on success, <0 on error.
++  int setLiveBitrate(int kbps);
++  int setLiveFps(int frmRateNum, int frmRateDen);
++  int setLiveGop(int gop);
++  int setLiveQp(int qpMin, int qpMax);
++#endif
++
+   OSD *osd = nullptr;
+ 
+ private:
+diff --git a/src/JsonAPI.cpp b/src/JsonAPI.cpp
+index e851ca1..0485588 100644
+--- a/src/JsonAPI.cpp
++++ b/src/JsonAPI.cpp
+@@ -168,15 +168,28 @@ void handle_stream(JsonValue *obj, int idx, std::string &out, bool &sep) {
+   // main loop once after all handlers run. Flags are set only on a real change,
+   // so re-sending an unchanged value does not disturb the stream.
+   auto add_int = [&](const char *key, const std::string &path,
+-                     bool rtsp_too = false) {
++                     bool rtsp_too = false, bool live = false) {
+     if (JsonValue *v = obj_get(obj, key)) {
+       if (v->type == JSON_NUMBER) {
+         int newv = (int)v->value.number.integer;
+         if (cfg->get<int>(path) != newv) {
+           cfg->set<int>(path, newv);
+-          global_restart_video = true;
+-          if (rtsp_too)
+-            global_restart_rtsp = true;
++          bool do_rebuild = true;
++#if defined(PLATFORM_T23)
++          // T23: the "live" runtime knobs (bitrate/fps/gop/qp) are applied
++          // WITHOUT a teardown by VideoWorker (see the req_*/reconfig queue
++          // after the field list), so they must NOT trigger the freeze-prone
++          // rebuild. Only genuinely structural fields fall through.
++          if (live)
++            do_rebuild = false;
++#else
++          (void)live;
++#endif
++          if (do_rebuild) {
++            global_restart_video = true;
++            if (rtsp_too)
++              global_restart_rtsp = true;
++          }
+         }
+       }
+       add_key(sect, s2, key);
+@@ -213,8 +226,14 @@ void handle_stream(JsonValue *obj, int idx, std::string &out, bool &sep) {
+         const char *cur = cfg->get<const char *>(path);
+         bool changed = !cur || val != cur;
+         cfg->set<const char *>(path, strdup(val.c_str()));
++#if !defined(PLATFORM_T23)
+         if (upper) // "mode" (preserve existing behaviour)
+           global_restart_video = true;
++#endif
++        // T23: "mode" (SMART/CBR) is cosmetic — the SoC forces H264 RC to CBR
++        // (see IMPEncoder::initProfile) — so a mode change must NOT rebuild the
++        // encoder (that is the T23 VPU teardown hazard). "format"/codec below
++        // still rebuilds because the codec/RTP sink genuinely changes.
+         if (rtsp_too && changed) { // "format"/codec change -> encoder + RTP sink
+           global_restart_video = true;
+           global_restart_rtsp = true;
+@@ -245,13 +264,14 @@ void handle_stream(JsonValue *obj, int idx, std::string &out, bool &sep) {
+   add_strk("format", std::string(root) + ".format", false, true);
+   add_strk("mode", std::string(root) + ".mode", true);
+ 
+-  add_int("gop", std::string(root) + ".gop");
++  add_int("gop", std::string(root) + ".gop", /*rtsp_too=*/false, /*live=*/true);
+   add_int("max_gop", std::string(root) + ".max_gop");
+-  add_int("fps", std::string(root) + ".fps");
++  add_int("fps", std::string(root) + ".fps", /*rtsp_too=*/false, /*live=*/true);
+   add_int("buffers", std::string(root) + ".buffers");
+   add_int("width", std::string(root) + ".width", true);
+   add_int("height", std::string(root) + ".height", true);
+-  add_int("bitrate", std::string(root) + ".bitrate");
++  add_int("bitrate", std::string(root) + ".bitrate", /*rtsp_too=*/false,
++          /*live=*/true);
+   add_int("rotation", std::string(root) + ".rotation");
+   add_int("scale_width", std::string(root) + ".scale_width");
+   add_int("scale_height", std::string(root) + ".scale_height");
+@@ -259,12 +279,46 @@ void handle_stream(JsonValue *obj, int idx, std::string &out, bool &sep) {
+ 
+   // RC params
+   add_int("qp_init", std::string(root) + ".qp_init");
+-  add_int("qp_min", std::string(root) + ".qp_min");
+-  add_int("qp_max", std::string(root) + ".qp_max");
++  add_int("qp_min", std::string(root) + ".qp_min", /*rtsp_too=*/false,
++          /*live=*/true);
++  add_int("qp_max", std::string(root) + ".qp_max", /*rtsp_too=*/false,
++          /*live=*/true);
+   add_int("ip_delta", std::string(root) + ".ip_delta");
+   add_int("pb_delta", std::string(root) + ".pb_delta");
+   add_int("max_bitrate", std::string(root) + ".max_bitrate");
+ 
++#if defined(PLATFORM_T23)
++  // T23 live reconfiguration: the fields marked live above updated the config
++  // without triggering a rebuild; queue the new values for the VideoWorker
++  // thread to apply on the running encoder between frames (no teardown — see
++  // VideoWorker::run and IMPEncoder::setLive*). Only video channels 0/1 have a
++  // live H264 encoder. Resolution / format / profile / buffers are NOT live
++  // (no T23 setter) and still go through the rebuild path above.
++  if (idx >= 0 && idx < NUM_VIDEO_CHANNELS && global_video[idx]) {
++    auto *s = global_video[idx].get();
++    bool any = false;
++    if (obj_get(obj, "bitrate")) {
++      s->req_bitrate = cfg->get<int>(std::string(root) + ".bitrate");
++      any = true;
++    }
++    if (obj_get(obj, "fps")) {
++      s->req_fps = cfg->get<int>(std::string(root) + ".fps");
++      any = true;
++    }
++    if (obj_get(obj, "gop")) {
++      s->req_gop = cfg->get<int>(std::string(root) + ".gop");
++      any = true;
++    }
++    if (obj_get(obj, "qp_min") || obj_get(obj, "qp_max")) {
++      s->req_qp_min = cfg->get<int>(std::string(root) + ".qp_min");
++      s->req_qp_max = cfg->get<int>(std::string(root) + ".qp_max");
++      any = true;
++    }
++    if (any)
++      s->reconfig = true;
++  }
++#endif
++
+   // Actions / stats
+   if (JsonValue *stats = obj_get(obj, "stats");
+       stats && stats->type == JSON_NULL) {
+diff --git a/src/VideoWorker.cpp b/src/VideoWorker.cpp
+index 97f3dfe..59d5fb3 100644
+--- a/src/VideoWorker.cpp
++++ b/src/VideoWorker.cpp
+@@ -299,6 +299,31 @@ void VideoWorker::run() {
+     }
+     had_video_clients = video_clients_active;
+ 
++#if defined(PLATFORM_T23)
++    // Apply any pending live encoder reconfiguration requested by the API/WS
++    // thread (JsonAPI::handle_stream). This runs on THIS worker thread — the
++    // owner of IMP_Encoder_GetStream — at the top of the loop, so the SDK
++    // setters are never concurrent with GetStream and need no lock. No channel
++    // is torn down, so the T23 VPU rebuild hazard is avoided entirely. If the
++    // encoder is mid-(re)create (imp_encoder == nullptr) the request stays
++    // pending (reconfig not consumed) and is applied on a later iteration.
++    if (global_video[encChn] && global_video[encChn]->imp_encoder &&
++        global_video[encChn]->reconfig.exchange(false)) {
++      IMPEncoder *enc = global_video[encChn]->imp_encoder;
++      int v;
++      if ((v = global_video[encChn]->req_bitrate.exchange(-1)) >= 0)
++        enc->setLiveBitrate(v);
++      if ((v = global_video[encChn]->req_fps.exchange(-1)) >= 0)
++        enc->setLiveFps(v, 1);
++      if ((v = global_video[encChn]->req_gop.exchange(-1)) >= 0)
++        enc->setLiveGop(v);
++      int qmin = global_video[encChn]->req_qp_min.exchange(-1);
++      int qmax = global_video[encChn]->req_qp_max.exchange(-1);
++      if (qmin >= 0 || qmax >= 0)
++        enc->setLiveQp(qmin, qmax);
++    }
++#endif
++
+     /* now we need to verify that
+      * 1. a client is connected (hasDataCallback)
+      * 2. a jpeg is requested
+diff --git a/src/globals.hpp b/src/globals.hpp
+index 29ab8ca..3e38d11 100644
+--- a/src/globals.hpp
++++ b/src/globals.hpp
+@@ -218,6 +218,17 @@ struct video_stream {
+   pthread_t thread;
+   bool idr;
+   int idr_fix;
++#if defined(PLATFORM_T23)
++  // Live encoder-reconfig requests from the API/WS thread, applied by
++  // VideoWorker between frames (no encoder teardown, no cross-thread SDK
++  // calls). -1 = no pending change. Mirrors jpeg_stream's req_*/reconfig idiom.
++  std::atomic<int> req_bitrate{-1};
++  std::atomic<int> req_fps{-1};
++  std::atomic<int> req_gop{-1};
++  std::atomic<int> req_qp_min{-1};
++  std::atomic<int> req_qp_max{-1};
++  std::atomic<bool> reconfig{false};
++#endif
+   bool active{false};
+   IMPEncoder *imp_encoder;
+   IMPFramesource *imp_framesource;
