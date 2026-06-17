@@ -8,8 +8,8 @@ On Ingenic T23 every encoder teardown/rebuild path is unreliable: an in-process
 rebuild wedges the VPU after a few cycles (reboot-only), and 0001 Part-2 forces
 exactly such a rebuild on every bitrate/fps/gop/qp change. The reliable way to
 change those runtime knobs is to reconfigure the RUNNING encoder live, with no
-teardown, using the T23 libimp setters confirmed present on this camera and
-verified against include/T23/1.3.0/zh/imp/imp_encoder.h:
+teardown, using the T23 libimp setters verified against
+include/T23/1.3.0/zh/imp/imp_encoder.h:
   bitrate/QP  -> IMP_Encoder_Get/SetChnAttrRcMode (+ RequestIDR)
   fps         -> IMP_Encoder_SetChnFrmRate
   gop         -> IMP_Encoder_SetGOPSize
@@ -19,21 +19,20 @@ verified against include/T23/1.3.0/zh/imp/imp_encoder.h:
    Get->modify-only-the-active-rcMode-field->Set->RequestIDR. No teardown.
 2) video_stream gains req_bitrate/fps/gop/qp_min/qp_max + reconfig atomics
    (mirrors the existing jpeg_stream req_*/reconfig idiom).
-3) JsonAPI handle_stream: on T23 the live fields (bitrate/fps/gop/qp_min/qp_max)
-   are marked live=true so add_int does NOT set global_restart_video (i.e. it
-   no longer rebuilds for them — supersedes 0001 Part-2 for these fields), and
-   their new values are queued on global_video[idx]. "mode" no longer rebuilds
-   on T23 (the SoC forces CBR, so it is cosmetic). Structural fields
-   (enabled/width/height/format/profile/buffers) keep 0001's rebuild path —
-   they have no live setter on T23.
-4) VideoWorker applies the queued reconfig at the top of its run loop — on the
-   SAME thread that owns IMP_Encoder_GetStream, so the SDK setters are never
-   concurrent with GetStream and need no lock; never tears anything down.
+3) JsonAPI handle_stream: on T23 the live fields are applied live (add_int
+   live=true, no global_restart_video) and queued on global_video[idx]; "mode"
+   no longer rebuilds on T23. Structural fields keep 0001's rebuild path.
+   IMPORTANT: the queue triggers ONLY on a real numeric SET (v->type ==
+   JSON_NUMBER, via is_num_set), NEVER on a read-query like {"fps":null} that
+   the agent/HA use to READ state — otherwise every state poll would reconfigure
+   the live T23 encoder and stall the RTSP feed (go2rtc i/o timeouts).
+4) VideoWorker applies the queued reconfig at the top of its run loop, on the
+   thread that owns IMP_Encoder_GetStream — never concurrent, no lock, no
+   teardown.
 5) DayNightWorker::apply_mode sets idr_fix=1 on both video channels after the
-   colour<->mono switch, so the worker emits a keyframe and the day/night
-   transition no longer shows colour/mono corruption (issue 3).
+   colour<->mono switch (issue 3 keyframe).
 
-Everything new is guarded by PLATFORM_T23; non-T23 builds are byte-identical to
+All new code is guarded by PLATFORM_T23; non-T23 builds are byte-identical to
 the 0001-0003 stack.
 
 diff --git a/src/DayNightWorker.cpp b/src/DayNightWorker.cpp
@@ -233,7 +232,7 @@ index 9384291..e67644b 100644
  
  private:
 diff --git a/src/JsonAPI.cpp b/src/JsonAPI.cpp
-index e851ca1..0485588 100644
+index e851ca1..d252a39 100644
 --- a/src/JsonAPI.cpp
 +++ b/src/JsonAPI.cpp
 @@ -168,15 +168,28 @@ void handle_stream(JsonValue *obj, int idx, std::string &out, bool &sep) {
@@ -302,7 +301,7 @@ index e851ca1..0485588 100644
    add_int("rotation", std::string(root) + ".rotation");
    add_int("scale_width", std::string(root) + ".scale_width");
    add_int("scale_height", std::string(root) + ".scale_height");
-@@ -259,12 +279,46 @@ void handle_stream(JsonValue *obj, int idx, std::string &out, bool &sep) {
+@@ -259,12 +279,57 @@ void handle_stream(JsonValue *obj, int idx, std::string &out, bool &sep) {
  
    // RC params
    add_int("qp_init", std::string(root) + ".qp_init");
@@ -323,22 +322,33 @@ index e851ca1..0485588 100644
 +  // VideoWorker::run and IMPEncoder::setLive*). Only video channels 0/1 have a
 +  // live H264 encoder. Resolution / format / profile / buffers are NOT live
 +  // (no T23 setter) and still go through the rebuild path above.
++  // CRITICAL: queue a live reconfig ONLY for a real numeric SET, never for a
++  // read-query. The thingino agent / HA poll these fields with a null value
++  // (e.g. {"stream0":{"fps":null}}) to READ them for the UI; obj_get() returns
++  // non-null for such a key even though no value is being set. Reconfiguring
++  // the live T23 encoder on every state poll perturbs the stream and stalls the
++  // RTSP feed (go2rtc i/o timeouts). So require v->type == JSON_NUMBER, exactly
++  // like add_int's own set condition above.
++  auto is_num_set = [&](const char *key) -> bool {
++    JsonValue *v = obj_get(obj, key);
++    return v && v->type == JSON_NUMBER;
++  };
 +  if (idx >= 0 && idx < NUM_VIDEO_CHANNELS && global_video[idx]) {
 +    auto *s = global_video[idx].get();
 +    bool any = false;
-+    if (obj_get(obj, "bitrate")) {
++    if (is_num_set("bitrate")) {
 +      s->req_bitrate = cfg->get<int>(std::string(root) + ".bitrate");
 +      any = true;
 +    }
-+    if (obj_get(obj, "fps")) {
++    if (is_num_set("fps")) {
 +      s->req_fps = cfg->get<int>(std::string(root) + ".fps");
 +      any = true;
 +    }
-+    if (obj_get(obj, "gop")) {
++    if (is_num_set("gop")) {
 +      s->req_gop = cfg->get<int>(std::string(root) + ".gop");
 +      any = true;
 +    }
-+    if (obj_get(obj, "qp_min") || obj_get(obj, "qp_max")) {
++    if (is_num_set("qp_min") || is_num_set("qp_max")) {
 +      s->req_qp_min = cfg->get<int>(std::string(root) + ".qp_min");
 +      s->req_qp_max = cfg->get<int>(std::string(root) + ".qp_max");
 +      any = true;
