@@ -101,7 +101,22 @@ jobs:
           #    in-process rebuild tears down any channel (prevents the T23 VPU fault).
           grep -qF "T23 VPU quiesce" "$SRC/src/main.cpp" \
             || { echo "::error::main.cpp: encoder quiesce (0003) not applied"; ok=0; }
-          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (Part 1: config key + early-derive + record block, no v3; Part 2: JsonAPI encoder restart; 0002: VideoWorker teardown order; 0003: main.cpp encoder quiesce)" || exit 1
+          # 8) live reconfig (0004): IMPEncoder live setters exist.
+          grep -qF "setLiveBitrate" "$SRC/src/IMPEncoder.cpp" \
+            || { echo "::error::IMPEncoder.cpp: live setters (0004) not applied"; ok=0; }
+          # 9) live reconfig (0004): video_stream reconfig request fields exist.
+          grep -qF "req_bitrate" "$SRC/src/globals.hpp" \
+            || { echo "::error::globals.hpp: live req_* fields (0004) not applied"; ok=0; }
+          # 10) live reconfig (0004): VideoWorker drains the reconfig queue.
+          grep -qF "reconfig.exchange" "$SRC/src/VideoWorker.cpp" \
+            || { echo "::error::VideoWorker.cpp: live reconfig drain (0004) not applied"; ok=0; }
+          # 11) live reconfig (0004): JsonAPI no longer rebuilds for live fields.
+          grep -qF "do_rebuild" "$SRC/src/JsonAPI.cpp" \
+            || { echo "::error::JsonAPI.cpp: live-field no-rebuild logic (0004) not applied"; ok=0; }
+          # 12) day/night IDR (0004): apply_mode requests a keyframe after the cut.
+          grep -qF "Force a clean keyframe" "$SRC/src/DayNightWorker.cpp" \
+            || { echo "::error::DayNightWorker.cpp: day/night IDR (0004) not applied"; ok=0; }
+          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (Part 1: config key + early-derive + record block, no v3; Part 2: JsonAPI encoder restart; 0002: VideoWorker teardown order; 0003: main.cpp encoder quiesce; 0004: live reconfig + day/night IDR)" || exit 1
 
       - name: Locate the built MIPS prudynt binary
         id: find
