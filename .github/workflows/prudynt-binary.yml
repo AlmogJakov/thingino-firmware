@@ -118,9 +118,11 @@ jobs:
           #      state poll reconfigures the live encoder and stalls the RTSP feed.
           grep -qF "is_num_set" "$SRC/src/JsonAPI.cpp" \
             || { echo "::error::JsonAPI.cpp: read-query guard (is_num_set) missing — STALE/buggy 0004 that reconfigs on every poll"; ok=0; }
-          # 12) day/night IDR (0004): apply_mode requests a keyframe after the cut.
-          grep -qF "Force a clean keyframe" "$SRC/src/DayNightWorker.cpp" \
-            || { echo "::error::DayNightWorker.cpp: day/night IDR (0004) not applied"; ok=0; }
+          # 12) day/night keyframe (0004, gated by 0006): apply_mode flags a
+          #     keyframe (idr_fix) after a genuine colour<->mono cut. Match the
+          #     stable code marker, NOT a comment string (0006 reworded it).
+          grep -qF "idr_fix = 1" "$SRC/src/DayNightWorker.cpp" \
+            || { echo "::error::DayNightWorker.cpp: day/night keyframe (0004/0006) not applied"; ok=0; }
           # 13) H1 (0005): prudyntctl IPC socket is bounded (cannot hang the worker).
           grep -qF "SO_RCVTIMEO" "$SRC/src/prudyntctl.cpp" \
             || { echo "::error::prudyntctl.cpp: IPC socket timeout (0005 H1) not applied"; ok=0; }
