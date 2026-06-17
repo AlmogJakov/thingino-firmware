@@ -1,0 +1,329 @@
+Subject: [PATCH] T23 life-guard fault-tolerance: bounded IPC, encoder stall recovery, verified+honoured day/night switch, persisted forced mode
+Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (branch stable).
+Stacks on: 0001-0004. Applies with git apply -p1 / patch -p1 AFTER them (verified).
+
+Addresses the QA review's High/Medium fault-tolerance gaps for 24/7 unattended use:
+
+H1 (prudyntctl.cpp) — bound the IPC socket: connect_sock() sets SO_RCVTIMEO/
+   SO_SNDTIMEO (5s). The single DayNightWorker thread shells out to
+   /sbin/daynight -> color -> prudyntctl; an unbounded read on a wedged IPC
+   server would otherwise freeze ALL future day/night switches. Now bounded.
+
+H2 (VideoWorker.cpp) — bounded stall recovery: stock prudynt incremented
+   error_count on every GetStream failure / PollingStream timeout but NEVER
+   acted on it, so a wedged encoder = a silent permanent black live view. Now,
+   if no encoded frame is produced for kStallRestartMs (8s), request the proven
+   pipeline rebuild (global_restart_video + cv notify, under mutex_main). Reset
+   on every delivered frame and on subscriber (re)connect so an idle, viewer-
+   less stream never trips it.
+
+M5 (DayNightWorker.cpp + /sbin/daynight) — honour the optics-switch result:
+   apply_mode() now returns bool (the /sbin/daynight exit status), and all four
+   live callers advance current/live_mode ONLY on success — a failed actuation
+   (stuck IR-cut, dead IR LED, hung/timed-out script) no longer reports a mode
+   the camera did not physically reach; it holds the prior mode and retries on
+   the next tick. The forced-mode request is consumed only on success.
+
+M4 (JsonAPI.cpp) — persist a pinned mode: the force_mode API handler now mirrors
+   the runtime atomic into the persisted force_mode_cfg member (bound to the
+   "daynight.force_mode" config key), so an operator's pinned day/night survives
+   a reboot instead of silently reverting to auto.
+
+All changes are platform-agnostic C++ (no T23-only guards needed); they only add
+fault-handling around existing behaviour.
+
+diff --git a/src/DayNightWorker.cpp b/src/DayNightWorker.cpp
+index 3ef7634..0646b34 100644
+--- a/src/DayNightWorker.cpp
++++ b/src/DayNightWorker.cpp
+@@ -277,12 +277,13 @@ static int read_awb(int &out_gr, int &out_gb) {
+   return hal::isp::get_awb_weighted_gains(out_gr, out_gb);
+ }
+ 
+-static void apply_mode(DayNightAlgo::Mode m) {
++static bool apply_mode(DayNightAlgo::Mode m) {
+   const char *script_cfg = cfg->get<const char *>("daynight.script_path");
+   const char *script = (script_cfg && std::strlen(script_cfg) > 0)
+                            ? script_cfg
+                            : "/sbin/daynight";
+ 
++  int sysret = -1; // exit status of the /sbin/daynight actuation
+   if (m == DayNightAlgo::Mode::Day) {
+     // Switch to day bin if configured and enabled
+     if (cfg->daynight.controls.binswitch) {
+@@ -314,7 +315,7 @@ static void apply_mode(DayNightAlgo::Mode m) {
+       }
+     }
+     std::string cmd = std::string(script) + " day";
+-    (void)std::system(cmd.c_str());
++    sysret = std::system(cmd.c_str());
+   } else if (m == DayNightAlgo::Mode::Night) {
+     // Switch to night bin if configured and enabled
+     if (cfg->daynight.controls.binswitch) {
+@@ -343,21 +344,36 @@ static void apply_mode(DayNightAlgo::Mode m) {
+       }
+     }
+     std::string cmd = std::string(script) + " night";
+-    (void)std::system(cmd.c_str());
++    sysret = std::system(cmd.c_str());
++  } else {
++    return false; // unknown mode
++  }
++
++  // The shell script now propagates a non-zero exit if an actuator (IR-cut /
++  // IR LED) physically failed, and prudyntctl's IPC is bounded, so a hung or
++  // failed switch surfaces here instead of being silently reported as success.
++  // On failure do NOT advance the reported mode — the caller leaves `current`
++  // unchanged and retries on the next tick (self-healing on a transient fault).
++  if (sysret != 0) {
++    if (daynight_should_log(Logger::WARN))
++      LOG_WARN("DayNight: optics switch to "
++               << (m == DayNightAlgo::Mode::Day ? "day" : "night")
++               << " failed (rc=" << sysret << "); holding reported mode");
++    return false;
+   }
+ 
+-  // Force a clean keyframe on the active video channels right after the
+-  // colour<->mono cut. Without it the decoder keeps predicting from pre-switch
+-  // reference frames across the colourspace change, which shows as colour/mono
+-  // corruption until the next scheduled IDR. Use the existing idr_fix flag so
++  // Success — force a clean keyframe on the active video channels right after
++  // the colour<->mono cut. Without it the decoder keeps predicting from
++  // pre-switch reference frames across the colourspace change (colour/mono
++  // corruption until the next scheduled IDR). Use the existing idr_fix flag so
+   // the VideoWorker thread (not this DayNightWorker thread) issues
+-  // IMP_Encoder_RequestIDR — matching prudynt's own cross-thread IDR idiom
+-  // (JsonAPI request_idr -> idr_fix -> VideoWorker).
++  // IMP_Encoder_RequestIDR — matching prudynt's own cross-thread IDR idiom.
+   for (int i = 0; i < NUM_VIDEO_CHANNELS; ++i) {
+     if (global_video[i]) {
+       global_video[i]->idr_fix = 1;
+     }
+   }
++  return true;
+ }
+ 
+ /* LEGACY - not used by simple algorithm
+@@ -710,19 +726,24 @@ void *thread_entry(void *arg) {
+         forced_mode = DayNightAlgo::Mode::Night;
+       }
+ 
++      bool consume = true; // clear the request unless the switch failed
+       if (forced_mode != DayNightAlgo::Mode::Unknown &&
+           forced_mode != current) {
+         if (daynight_should_log(Logger::INFO)) {
+           LOG_INFO("DayNight: applying forced mode " << force_mode_str);
+         }
+-        apply_mode(forced_mode);
+-        current = forced_mode;
+-        simple_state.is_night = (current == DayNightAlgo::Mode::Night);
+-        cfg->daynight.live_mode.store(force_mode_str,
+-                                      std::memory_order_relaxed);
+-        initial_mode_applied = true;
++        if (apply_mode(forced_mode)) {
++          current = forced_mode;
++          simple_state.is_night = (current == DayNightAlgo::Mode::Night);
++          cfg->daynight.live_mode.store(force_mode_str,
++                                        std::memory_order_relaxed);
++          initial_mode_applied = true;
++        } else {
++          consume = false; // failed actuation: keep the request, retry next tick
++        }
+       }
+-      cfg->daynight.force_mode.store(nullptr, std::memory_order_relaxed);
++      if (consume)
++        cfg->daynight.force_mode.store(nullptr, std::memory_order_relaxed);
+     }
+ 
+     // Read ISP sensor values
+@@ -808,35 +829,40 @@ void *thread_entry(void *arg) {
+       }
+ 
+       if (commit) {
+-        apply_mode(initial);
+-        current = initial;
+-        simple_state.is_night = (current == DayNightAlgo::Mode::Night);
+-        cfg->daynight.live_mode.store(
+-            current == DayNightAlgo::Mode::Day ? "day" : "night",
+-            std::memory_order_relaxed);
+-        // Protect initial Night from an immediate bright-burst flip (TC-8b):
+-        // the anti_flap path only fires on counter-triggered switches, so set
+-        // it explicitly here when starting in Night.
+-        if (current == DayNightAlgo::Mode::Night)
+-          anti_flap_cooldown = anti_flap_iterations / 2;
+-        initial_mode_applied = true;
+-        if (daynight_should_log(Logger::INFO)) {
+-          LOG_INFO(
+-              "DayNight: applied initial mode "
+-              << (current == DayNightAlgo::Mode::Day ? "day" : "night")
+-              << " (total_gain=" << total_gain << ", ev=" << ev << ", confirm="
+-              << (current == DayNightAlgo::Mode::Night ? initial_night_confirm
+-                                                       : initial_day_confirm)
+-              << ", "
+-              << (within_schedule ? "within schedule" : "outside schedule")
+-              << ")");
++        // Advance/report the initial mode only if the optics actually switched.
++        // Guarded inline (not folded into the `if`) so a failed commit does NOT
++        // fall through to the Night fallback below — it just retries next tick.
++        if (apply_mode(initial)) {
++          current = initial;
++          simple_state.is_night = (current == DayNightAlgo::Mode::Night);
++          cfg->daynight.live_mode.store(
++              current == DayNightAlgo::Mode::Day ? "day" : "night",
++              std::memory_order_relaxed);
++          // Protect initial Night from an immediate bright-burst flip (TC-8b):
++          // the anti_flap path only fires on counter-triggered switches, so set
++          // it explicitly here when starting in Night.
++          if (current == DayNightAlgo::Mode::Night)
++            anti_flap_cooldown = anti_flap_iterations / 2;
++          initial_mode_applied = true;
++          if (daynight_should_log(Logger::INFO)) {
++            LOG_INFO(
++                "DayNight: applied initial mode "
++                << (current == DayNightAlgo::Mode::Day ? "day" : "night")
++                << " (total_gain=" << total_gain << ", ev=" << ev
++                << ", confirm="
++                << (current == DayNightAlgo::Mode::Night ? initial_night_confirm
++                                                         : initial_day_confirm)
++                << ", "
++                << (within_schedule ? "within schedule" : "outside schedule")
++                << ")");
++          }
+         }
+-      } else if (initial_mode_fallback_countdown <= 0) {
++      } else if (initial_mode_fallback_countdown <= 0 &&
++                 apply_mode(DayNightAlgo::Mode::Night)) {
+         // Gain has been stuck in the hysteresis zone long enough that the
+         // normal confirm path will never fire. Default to Night — the camera
+         // is almost certainly in a dark environment (bright scenes produce a
+         // clear day reading well below the 300 threshold within 1-2 samples).
+-        apply_mode(DayNightAlgo::Mode::Night);
+         current = DayNightAlgo::Mode::Night;
+         simple_state.is_night = true;
+         cfg->daynight.live_mode.store("night", std::memory_order_relaxed);
+@@ -871,8 +897,9 @@ void *thread_entry(void *arg) {
+                     << anti_flap_cooldown << " iterations)");
+         }
+         anti_flap_cooldown--;
+-      } else {
+-        apply_mode(dec.target);
++      } else if (apply_mode(dec.target)) {
++        // advance/report the mode only if the optics actually switched; a failed
++        // actuation leaves `current` unchanged so the next tick retries.
+         current = dec.target;
+         simple_state.is_night = (current == DayNightAlgo::Mode::Night);
+         cfg->daynight.live_mode.store(
+diff --git a/src/JsonAPI.cpp b/src/JsonAPI.cpp
+index d252a39..5630b15 100644
+--- a/src/JsonAPI.cpp
++++ b/src/JsonAPI.cpp
+@@ -1315,6 +1315,12 @@ void handle_daynight(JsonValue *obj, std::string &out, bool &sep) {
+       const char *mode = v->value.string;
+       if (std::strcmp(mode, "day") == 0 || std::strcmp(mode, "night") == 0) {
+         cfg->daynight.force_mode.store(strdup(mode));
++        // Keep the PERSISTED member in sync with the runtime atomic. The atomic
++        // drives the live switch (DayNightWorker reads it), but only
++        // force_mode_cfg is bound to the persisted "daynight.force_mode" key
++        // (Config.cpp), so without this a pinned mode is lost on reboot
++        // (silently reverts to auto). save_config serialises this member.
++        cfg->daynight.force_mode_cfg = strdup(mode);
+       }
+       add_key(out, s2, "force_mode");
+       add_str(out, mode);
+diff --git a/src/VideoWorker.cpp b/src/VideoWorker.cpp
+index 59d5fb3..bc08e4c 100644
+--- a/src/VideoWorker.cpp
++++ b/src/VideoWorker.cpp
+@@ -39,6 +39,28 @@ void VideoWorker::run() {
+   uint32_t bps = 0;
+   uint32_t fps = 0;
+   uint32_t error_count = 0; // Keep track of polling errors
++  // Bounded stall recovery: if the encoder yields no frame for kStallRestartMs
++  // (GetStream keeps failing or PollingStream keeps timing out), request the
++  // proven pipeline rebuild instead of spinning forever on `continue`. Stock
++  // prudynt incremented error_count but never acted on it -> a wedged encoder
++  // meant a silent, permanent black live view on a 24/7 life-guard camera.
++  // Reset on every delivered frame and on subscriber (re)connect so an idle
++  // stream that simply has no viewers never trips it.
++  constexpr uint64_t kStallRestartMs = 8000;
++  uint64_t last_progress_ms = monotonic_ms();
++  auto request_restart_if_stalled = [&]() {
++    uint64_t idle = monotonic_ms() - last_progress_ms;
++    if (idle <= kStallRestartMs)
++      return;
++    LOG_ERROR("VideoWorker ch" << encChn << ": no encoded frame for " << idle
++                               << "ms; requesting pipeline restart");
++    {
++      std::lock_guard<std::mutex> lk(mutex_main);
++      global_restart_video = true;
++    }
++    global_cv_worker_restart.notify_all();
++    last_progress_ms = monotonic_ms(); // don't re-trigger before the rebuild
++  };
+   unsigned long long ms = 0;
+   bool run_for_jpeg = false;
+   auto video_state = global_video[encChn];
+@@ -296,6 +318,7 @@ void VideoWorker::run() {
+       ts_last_rtp_us = 0;
+       ts_current_frame_us = 0;
+       ts_have_current_frame = false;
++      last_progress_ms = monotonic_ms(); // fresh start; don't count idle as stall
+     }
+     had_video_clients = video_clients_active;
+ 
+@@ -354,6 +377,7 @@ void VideoWorker::run() {
+         if (IMP_Encoder_GetStream(encChn, &stream, GET_STREAM_BLOCKING) != 0) {
+           LOG_ERROR("IMP_Encoder_GetStream(" << encChn << ") failed");
+           error_count++;
++          request_restart_if_stalled();
+           continue;
+         }
+ 
+@@ -362,6 +386,10 @@ void VideoWorker::run() {
+           continue;
+         }
+ 
++        // A real encoded frame arrived — the encoder is making progress.
++        error_count = 0;
++        last_progress_ms = monotonic_ms();
++
+         int64_t nominal_frame_step_us = 33333;
+         if (video_state && video_state->stream &&
+             video_state->stream->fps > 0) {
+@@ -820,6 +848,7 @@ void VideoWorker::run() {
+         }
+       } else {
+         error_count++;
++        request_restart_if_stalled();
+         LOG_DDEBUG("IMP_Encoder_PollingStream("
+                    << encChn << ", " << cfg->general.imp_polling_timeout_ms
+                    << ") timeout !");
+diff --git a/src/prudyntctl.cpp b/src/prudyntctl.cpp
+index 2760192..d4aaadb 100644
+--- a/src/prudyntctl.cpp
++++ b/src/prudyntctl.cpp
+@@ -7,6 +7,7 @@
+ #include <vector>
+ 
+ #include <sys/socket.h>
++#include <sys/time.h>
+ #include <sys/un.h>
+ 
+ static const char *SOCK_PATH = "/run/prudynt/prudynt.sock";
+@@ -15,6 +16,16 @@ static int connect_sock() {
+   int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+   if (fd < 0)
+     return -1;
++  // Bound every blocking read/write so a wedged prudynt IPC server can never
++  // hang the caller indefinitely. Critical for a life-guard camera: the single
++  // DayNightWorker thread shells out to /sbin/daynight -> color -> prudyntctl,
++  // so an unbounded read here would freeze ALL future day/night switches. 5s is
++  // generous for a local AF_UNIX round-trip.
++  struct timeval tv;
++  tv.tv_sec = 5;
++  tv.tv_usec = 0;
++  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+   sockaddr_un sa{};
+   sa.sun_family = AF_UNIX;
+   strncpy(sa.sun_path, SOCK_PATH, sizeof(sa.sun_path) - 1);
