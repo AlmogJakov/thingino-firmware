@@ -1,0 +1,231 @@
+Subject: [PATCH] T23 high-frequency stream seamlessness: motion change-guard, no per-change keyframe, gated day/night keyframe, leak-free force_mode
+Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (branch stable).
+Stacks on: 0001-0005. Applies with git apply -p1 / patch -p1 AFTER them (verified).
+
+From the high-frequency configuration-robustness review. All changes keep the
+active go2rtc video stream seamless under continuous MQTT/remote commands; none
+add logging/deps/allocations.
+
+M1 (JsonAPI add_boolk_m): rebuild ONLY on a real change. motion.enabled was the
+   one routine remote toggle that set global_restart_video (full T23 rebuild) on
+   EVERY send, including a no-op re-send (HA state sync) — cfg->set returns true
+   on any valid write, so the stored value is now compared explicitly first.
+
+H1 (IMPEncoder setLiveBitrate/setLiveQp): drop the forced IMP_Encoder_RequestIDR
+   per change. An RC/bitrate/QP change keeps the bitstream valid; the next GOP
+   IDR refreshes it. The per-change keyframe was a recurring bitrate spike that
+   inflated the go2rtc video=copy jitter buffer under continuous reconfig.
+
+H1b (DayNightWorker apply_mode): emit the day/night keyframe ONCE per GENUINE
+   colour<->mono cut (new color_cut flag) and only on channels that have a
+   viewer — not on every switch and not on unwatched channels. A reconnecting
+   subscriber still gets its own IDR on connect.
+
+M8 (Config/JsonAPI/DayNightWorker): force_mode is now an int enum (0=none,
+   1=day, 2=night) instead of an atomic<const char*> set via strdup. The config
+   layer never frees char values, so the old design leaked one small string per
+   force command — unbounded under high-frequency MQTT forcing (~tens of MB/day
+   -> eventual watchdog reboot). The int carries no heap, so it cannot leak; the
+   persisted force_mode_cfg mirror is now written only on a real change.
+
+diff --git a/src/Config.hpp b/src/Config.hpp
+index f2600a9..0979f1a 100644
+--- a/src/Config.hpp
++++ b/src/Config.hpp
+@@ -153,8 +153,11 @@ struct _daynight {
+   const char *day_bin_path{nullptr};
+   const char *night_bin_path{nullptr};
+ 
+-  // Manual mode override (set by user via JSON API)
+-  std::atomic<const char *> force_mode{nullptr};
++  // Manual mode override (set by user via JSON API). Int enum, NOT a heap
++  // string: 0=none, 1=day, 2=night. Avoids a per-command strdup leak under
++  // high-frequency MQTT forcing (the config layer never frees char values).
++  // The PERSISTED value is force_mode_cfg below.
++  std::atomic<int> force_mode{0};
+ 
+   // Persisted startup override ("", "day" or "night") so a forced mode survives
+   // restarts/reboots. The worker RECORDS it at startup (sets current/live_mode,
+diff --git a/src/DayNightWorker.cpp b/src/DayNightWorker.cpp
+index 0646b34..a9144ff 100644
+--- a/src/DayNightWorker.cpp
++++ b/src/DayNightWorker.cpp
+@@ -283,7 +283,8 @@ static bool apply_mode(DayNightAlgo::Mode m) {
+                            ? script_cfg
+                            : "/sbin/daynight";
+ 
+-  int sysret = -1; // exit status of the /sbin/daynight actuation
++  int sysret = -1;        // exit status of the /sbin/daynight actuation
++  bool color_cut = false; // true iff the ISP colour<->mono mode actually changed
+   if (m == DayNightAlgo::Mode::Day) {
+     // Switch to day bin if configured and enabled
+     if (cfg->daynight.controls.binswitch) {
+@@ -312,6 +313,7 @@ static bool apply_mode(DayNightAlgo::Mode m) {
+         // duplicates this via HTTP, but that runs async and can fail at boot
+         // if the HTTP server is not yet ready.
+         cfg->image.running_mode = static_cast<int>(hal::isp::RunningMode::Day);
++        color_cut = true;
+       }
+     }
+     std::string cmd = std::string(script) + " day";
+@@ -341,6 +343,7 @@ static bool apply_mode(DayNightAlgo::Mode m) {
+       } else {
+         cfg->image.running_mode =
+             static_cast<int>(hal::isp::RunningMode::Night);
++        color_cut = true;
+       }
+     }
+     std::string cmd = std::string(script) + " night";
+@@ -362,15 +365,18 @@ static bool apply_mode(DayNightAlgo::Mode m) {
+     return false;
+   }
+ 
+-  // Success — force a clean keyframe on the active video channels right after
+-  // the colour<->mono cut. Without it the decoder keeps predicting from
+-  // pre-switch reference frames across the colourspace change (colour/mono
+-  // corruption until the next scheduled IDR). Use the existing idr_fix flag so
+-  // the VideoWorker thread (not this DayNightWorker thread) issues
+-  // IMP_Encoder_RequestIDR — matching prudynt's own cross-thread IDR idiom.
+-  for (int i = 0; i < NUM_VIDEO_CHANNELS; ++i) {
+-    if (global_video[i]) {
+-      global_video[i]->idr_fix = 1;
++  // Force ONE clean keyframe per GENUINE colour<->mono cut (color_cut), and only
++  // on channels that actually have a viewer. Without it the decoder predicts
++  // across the colourspace change (corruption until the next GOP IDR); but
++  // emitting it on every switch and on unwatched channels would, under
++  // high-frequency toggling, become a recurring keyframe spike that inflates the
++  // go2rtc copy jitter buffer. A later subscriber gets its own IDR on connect.
++  if (color_cut) {
++    for (int i = 0; i < NUM_VIDEO_CHANNELS; ++i) {
++      if (global_video[i] &&
++          global_video[i]->hasDataCallback.load(std::memory_order_relaxed)) {
++        global_video[i]->idr_fix = 1;
++      }
+     }
+   }
+   return true;
+@@ -715,35 +721,34 @@ void *thread_entry(void *arg) {
+   while (!global_shutdown_requested.load(std::memory_order_relaxed)) {
+     refresh_daynight_log_level();
+ 
+-    // Check for manual force_mode override
+-    const char *force_mode_str =
+-        cfg->daynight.force_mode.load(std::memory_order_relaxed);
+-    if (force_mode_str != nullptr) {
+-      DayNightAlgo::Mode forced_mode = DayNightAlgo::Mode::Unknown;
+-      if (std::strcmp(force_mode_str, "day") == 0) {
+-        forced_mode = DayNightAlgo::Mode::Day;
+-      } else if (std::strcmp(force_mode_str, "night") == 0) {
+-        forced_mode = DayNightAlgo::Mode::Night;
+-      }
++    // Check for manual force_mode override (int enum: 1=day, 2=night, 0=none).
++    int force_req = cfg->daynight.force_mode.load(std::memory_order_relaxed);
++    if (force_req != 0) {
++      DayNightAlgo::Mode forced_mode = (force_req == 2)
++                                           ? DayNightAlgo::Mode::Night
++                                           : DayNightAlgo::Mode::Day;
+ 
+       bool consume = true; // clear the request unless the switch failed
+-      if (forced_mode != DayNightAlgo::Mode::Unknown &&
+-          forced_mode != current) {
++      if (forced_mode != current) {
+         if (daynight_should_log(Logger::INFO)) {
+-          LOG_INFO("DayNight: applying forced mode " << force_mode_str);
++          LOG_INFO("DayNight: applying forced mode "
++                   << (forced_mode == DayNightAlgo::Mode::Night ? "night"
++                                                                : "day"));
+         }
+         if (apply_mode(forced_mode)) {
+           current = forced_mode;
+           simple_state.is_night = (current == DayNightAlgo::Mode::Night);
+-          cfg->daynight.live_mode.store(force_mode_str,
+-                                        std::memory_order_relaxed);
++          // store a stable literal (not an aliased heap pointer)
++          cfg->daynight.live_mode.store(
++              current == DayNightAlgo::Mode::Day ? "day" : "night",
++              std::memory_order_relaxed);
+           initial_mode_applied = true;
+         } else {
+           consume = false; // failed actuation: keep the request, retry next tick
+         }
+       }
+       if (consume)
+-        cfg->daynight.force_mode.store(nullptr, std::memory_order_relaxed);
++        cfg->daynight.force_mode.store(0, std::memory_order_relaxed);
+     }
+ 
+     // Read ISP sensor values
+diff --git a/src/IMPEncoder.cpp b/src/IMPEncoder.cpp
+index 6f1c2a8..e9b1eee 100644
+--- a/src/IMPEncoder.cpp
++++ b/src/IMPEncoder.cpp
+@@ -110,7 +110,9 @@ int IMPEncoder::setLiveBitrate(int kbps) {
+     LOG_ERROR("setLiveBitrate: SetChnAttrRcMode(" << encChn << ") ret=" << ret);
+     return ret;
+   }
+-  IMP_Encoder_RequestIDR(encChn);
++  // No forced keyframe: an RC/bitrate change keeps the bitstream valid and the
++  // next scheduled GOP IDR refreshes it. Forcing an IDR on every change caused a
++  // recurring keyframe spike that inflated the go2rtc copy jitter buffer.
+   LOG_INFO("setLiveBitrate(" << encChn << "): " << kbps << " kbps (rcMode "
+                              << static_cast<int>(rc.rcMode) << ")");
+   return 0;
+@@ -193,7 +195,8 @@ int IMPEncoder::setLiveQp(int qpMin, int qpMax) {
+     LOG_ERROR("setLiveQp: SetChnAttrRcMode(" << encChn << ") ret=" << ret);
+     return ret;
+   }
+-  IMP_Encoder_RequestIDR(encChn);
++  // No forced keyframe (see setLiveBitrate): a QP-range change keeps the
++  // bitstream valid; the next scheduled GOP IDR refreshes it.
+   LOG_INFO("setLiveQp(" << encChn << "): min=" << qpMin << " max=" << qpMax
+                         << " (rcMode " << static_cast<int>(rc.rcMode) << ")");
+   return 0;
+diff --git a/src/JsonAPI.cpp b/src/JsonAPI.cpp
+index 5630b15..0928fe1 100644
+--- a/src/JsonAPI.cpp
++++ b/src/JsonAPI.cpp
+@@ -1010,9 +1010,16 @@ void handle_motion(JsonValue *obj, std::string &out, bool &sep) {
+                          bool restart_video = false) {
+     if (JsonValue *v = obj_get(obj, key)) {
+       if (v->type == JSON_BOOL) {
+-        cfg->set<bool>(path, v->value.boolean != 0);
+-        if (restart_video)
+-          global_restart_video = true;
++        bool newv = v->value.boolean != 0;
++        // Rebuild ONLY on a real change. A no-op re-send (HA state sync, or a
++        // high-frequency motion on/off that doesn't change state) must not
++        // trigger the T23 pipeline rebuild. cfg->set returns true on any valid
++        // write, so the stored value must be compared explicitly.
++        if (cfg->get<bool>(path) != newv) {
++          cfg->set<bool>(path, newv);
++          if (restart_video)
++            global_restart_video = true;
++        }
+       }
+       add_key(out, s2, key);
+       add_bool(out, cfg->get<bool>(path));
+@@ -1314,13 +1321,17 @@ void handle_daynight(JsonValue *obj, std::string &out, bool &sep) {
+     if (v->type == JSON_STRING && v->value.string) {
+       const char *mode = v->value.string;
+       if (std::strcmp(mode, "day") == 0 || std::strcmp(mode, "night") == 0) {
+-        cfg->daynight.force_mode.store(strdup(mode));
+-        // Keep the PERSISTED member in sync with the runtime atomic. The atomic
+-        // drives the live switch (DayNightWorker reads it), but only
+-        // force_mode_cfg is bound to the persisted "daynight.force_mode" key
+-        // (Config.cpp), so without this a pinned mode is lost on reboot
+-        // (silently reverts to auto). save_config serialises this member.
+-        cfg->daynight.force_mode_cfg = strdup(mode);
++        // Runtime signal to the DayNightWorker as an int enum (1=day, 2=night) —
++        // no heap string, so high-frequency force commands cannot leak.
++        cfg->daynight.force_mode.store(std::strcmp(mode, "night") == 0 ? 2 : 1);
++        // Mirror into the PERSISTED member (bound to the "daynight.force_mode"
++        // key) so a pinned mode survives reboot — but only on a REAL change: the
++        // config layer never frees char values, so an unconditional re-strdup
++        // would leak per command. This matches the codebase's leak-on-change norm.
++        if (!cfg->daynight.force_mode_cfg ||
++            std::strcmp(cfg->daynight.force_mode_cfg, mode) != 0) {
++          cfg->daynight.force_mode_cfg = strdup(mode);
++        }
+       }
+       add_key(out, s2, "force_mode");
+       add_str(out, mode);
