@@ -1,0 +1,108 @@
+Subject: [PATCH] Physical-privacy SOFTWARE mic mute (zero captured PCM; no audio restart)
+Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (branch stable).
+Stacks on: 0001-0006. Applies with git apply -p1 / patch -p1 AFTER them.
+
+Mutes the microphone for physical privacy WITHOUT restarting the audio worker.
+The earlier mic_enabled=false approach was reverted: it set global_restart_audio,
+which on this build (USE_AUDIO_STREAM_REPLICATOR) tears down the audio worker under
+the persistent RTSP audio replicator, starving it -> the go2rtc stream died (reboot
+only). audio.mic_vol=-30 is live/no-restart but does NOT mute this T23 ACODEC.
+
+This patch mutes in SOFTWARE: a runtime atomic `mic_muted` (NOT persisted, set live
+via a new JsonAPI key with NO global_restart_*), and AudioWorker::process_frame zeros
+the captured PCM into a reusable scratch buffer when set -- so the encoder, FIFO tap,
+MP4 recorder, and RTSP/go2rtc feed all get true digital silence while frames KEEP
+FLOWING (the replicator is never starved; nothing restarts; cannot wedge the encoder).
+
+CRITICAL: process_frame operates on a LOCAL COPY of the frame descriptor. The IMP_AI
+DMA frame handed to IMP_AI_ReleaseFrame must stay byte-identical to what GetFrame
+returned -- IMP_AI_ReleaseFrame recovers the block's allocator header from
+*(virAddr-20), so redirecting the RELEASED frame's virAddr would corrupt the free.
+The copy is what gets pointed at the zeroed scratch; the DMA slot (data AND descriptor)
+is never touched. Output/backchannel are NOT gated (privacy = don't transmit captured
+audio). NUM_AUDIO_CHANNELS==1; muted is a relaxed atomic (single standalone flag).
+
+Rootfs /sbin/physical-privacy drives it: do_on -> mic_muted true, do_off (verified-
+lifted branch) -> mic_muted false, do_reenter -> mic_muted true. Boot/restart window:
+the flag is runtime-only, so a fresh prudynt start is briefly audible until do_reenter
+re-mutes (the originally-accepted boot window; no in-process privacy coupling added).
+
+diff --git a/src/AudioWorker.cpp b/src/AudioWorker.cpp
+index 67ac027..d0e58d2 100644
+--- a/src/AudioWorker.cpp
++++ b/src/AudioWorker.cpp
+@@ -350,7 +350,22 @@ void AudioWorker::publishTapFrame(const IMPAudioFrame &frame) {
+                static_cast<size_t>(frame.len));
+ }
+ 
+-void AudioWorker::process_frame(IMPAudioFrame &frame) {
++void AudioWorker::process_frame(IMPAudioFrame &frameRef) {
++  // Physical-privacy software mute: operate on a LOCAL copy so the caller's frame
++  // (released by IMP_AI_ReleaseFrame in run()) stays byte-identical to what GetFrame
++  // returned -- IMP_AI_ReleaseFrame recovers the DMA block's allocator header from
++  // *(virAddr-20), so redirecting the released frame's virAddr would corrupt the free.
++  // The copy is pointed at a zeroed scratch buffer when muted, so the encoder, FIFO tap,
++  // MP4 recorder, and RTSP/go2rtc feed all get true silence; the IMP_AI DMA slot (data
++  // AND descriptor) is never touched. Runtime atomic, no flash.
++  IMPAudioFrame frame = frameRef;
++  if (global_audio[encChn]->muted.load(std::memory_order_relaxed) &&
++      frame.virAddr != nullptr && frame.len > 0) {
++    if (mutedScratch.size() < static_cast<size_t>(frame.len))
++      mutedScratch.resize(static_cast<size_t>(frame.len));
++    memset(mutedScratch.data(), 0, static_cast<size_t>(frame.len));
++    frame.virAddr = reinterpret_cast<uint32_t *>(mutedScratch.data());
++  }
+   if (global_audio[encChn]->imp_audio->outChnCnt == 2 &&
+       frame.soundmode == AUDIO_SOUND_MODE_MONO) {
+     size_t sample_size = frame.bitwidth / 8;
+diff --git a/src/AudioWorker.hpp b/src/AudioWorker.hpp
+index 80b44f7..3a635cd 100644
+--- a/src/AudioWorker.hpp
++++ b/src/AudioWorker.hpp
+@@ -28,6 +28,7 @@ private:
+   int mp4_audio_sample_rate = 0;
+   std::unique_ptr<AudioTap> tap;
+   std::vector<uint8_t> directEncBuf;
++  std::vector<uint8_t> mutedScratch; // zeroed PCM scratch for the physical-privacy mute
+ };
+ 
+ #endif // AUDIO_WORKER_HPP
+diff --git a/src/JsonAPI.cpp b/src/JsonAPI.cpp
+index bb06fca..ad784a4 100644
+--- a/src/JsonAPI.cpp
++++ b/src/JsonAPI.cpp
+@@ -888,6 +888,22 @@ void handle_audio(JsonValue *obj, std::string &out, bool &sep) {
+   add_int("buffer_warn_frames", "audio.buffer_warn_frames", false);
+   add_int("buffer_cap_frames", "audio.buffer_cap_frames", false);
+ 
++  // mic_muted - physical-privacy SOFTWARE mute. Runtime only (NOT persisted, NO
++  // global_restart_audio), so it never tears down the audio worker / starves the RTSP
++  // replicator (unlike mic_enabled). The AudioWorker zeroes the captured PCM when set.
++  // Mirrors the live mic_vol path; echoes the ACTUAL flag for read-back.
++  if (JsonValue *v = obj_get(obj, "mic_muted")) {
++    if (v->type == JSON_BOOL) {
++      bool m = v->value.boolean != 0;
++      for (int i = 0; i < NUM_AUDIO_CHANNELS; i++)
++        if (global_audio[i])
++          global_audio[i]->muted.store(m, std::memory_order_relaxed);
++    }
++    add_key(out, s2, "mic_muted");
++    add_bool(out, global_audio[0] && global_audio[0]->muted.load(std::memory_order_relaxed));
++    wrote = true;
++  }
++
+   if (!wrote) {
+     out.erase(out.size() - 1);
+     return;
+diff --git a/src/globals.hpp b/src/globals.hpp
+index 29ab8ca..341a468 100644
+--- a/src/globals.hpp
++++ b/src/globals.hpp
+@@ -199,6 +199,7 @@ struct audio_stream {
+ 
+   StreamReplicator *streamReplicator = nullptr;
+   std::atomic<int> rtsp_client_count{0};
++  std::atomic<bool> muted{false}; // physical-privacy software mute (PCM zeroed in AudioWorker)
+ 
+   std::mutex tap_mutex;
+   std::vector<AudioTapEntry> audio_taps;
