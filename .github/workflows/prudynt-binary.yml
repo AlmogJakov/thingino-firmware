@@ -153,7 +153,15 @@ jobs:
             || { echo "::error::JsonAPI.cpp: mic_muted key (0007 software mute) not applied"; ok=0; }
           grep -qF "mutedScratch" "$SRC/src/AudioWorker.cpp" \
             || { echo "::error::AudioWorker.cpp: PCM-zeroing scratch (0007 software mute) not applied"; ok=0; }
-          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (0001-0003 base; 0004 live reconfig + IDR; 0005 fault-tolerance; 0006 high-freq seamlessness; 0007 physical-privacy software mic mute)" || exit 1
+          # 22) (0008): steady audio RTP timestamps — sample-clock anchor + drift-gated re-anchor.
+          grep -qF "audioSamplesSinceAnchor" "$SRC/src/IMPDeviceSource.cpp" \
+            || { echo "::error::IMPDeviceSource.cpp: audio sample-clock (0008 RTP timestamp fix) not applied"; ok=0; }
+          # 23) (0008): AAC+force_stereo reframer buffer sized to the reframer's true mono
+          #     output (not *outChnCnt) — prevents the double-dup that advanced the timestamp
+          #     2x. Distinct marker so a STALE 0008 (sample-clock only, no AAC cap) is rejected.
+          grep -qF "Size to the reframer's true mono output" "$SRC/src/AudioWorker.cpp" \
+            || { echo "::error::AudioWorker.cpp: AAC+force_stereo reframer-size fix (0008) missing — STALE 0008 without the codec-safety cap"; ok=0; }
+          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (0001-0003 base; 0004 live reconfig + IDR; 0005 fault-tolerance; 0006 high-freq seamlessness; 0007 physical-privacy software mic mute; 0008 audio RTP sample-clock + AAC codec-safety)" || exit 1
 
       - name: Locate the built MIPS prudynt binary
         id: find
