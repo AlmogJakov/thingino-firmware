@@ -1,0 +1,57 @@
+Subject: [PATCH] Fail fast: exit if IMPSystem init fails instead of running streamless (C2)
+Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (branch stable).
+Stacks on: 0001-0009. Applies with git apply -p1 / patch -p1 AFTER them. Touches only
+main.cpp, in a region no other patch modifies.
+
+main() calls imp_system = IMPSystem::createNew() but never checks the result. createNew()
+catches the constructor exception thrown when IMPSystem::init() fails (IMP_ISP_Open,
+add_sensor_with_retry, enable_sensor, IMP_System_Init, IMP_ISP_EnableTuning, set_running_mode)
+and returns nullptr. On a cold or power-cut boot any of those steps can fail. With no null
+check, main() proceeds to spawn the audio/video/RTSP workers on an uninitialised IMP: the
+encoder never produces SPS/PPS, RTSP registers no channel, and the process stays ALIVE but
+permanently STREAMLESS. An OPTIONS-only watchdog reads that as healthy (the RTSP socket still
+answers OPTIONS=200) and never restarts it -> dead stream until manual intervention. This is
+the worst class of failure for a life-safety camera.
+
+Fix: if IMPSystem::createNew() returns null, log and return 1 (mirroring the existing
+time-sync failure path two blocks up: join the shutdown-signal thread, then return). Exiting
+drops the RTSP socket, so the init system / S32prudyntwd watchdog detects a down socket and
+restarts a fresh, warm process - the proven recovery. Fail-fast turns an invisible
+streamless state into a recoverable one. No new state; the InstanceLock is released by its
+RAII guard on return.
+
+Caveat (honest scope): this catches only the case where createNew() returns null. At DEBUG
+loglevel the IMPSystem constructor SUPPRESSES its throw (init() != 0 && level != DEBUG), and
+the sensor-resolution-0x0 path "continues anyway" without flagging an error - so createNew()
+can return a NON-null but half-initialised object that this check waves through. Those
+residual cases are recovered by 0011 (C5: zero video channels register -> SIGTERM ->
+watchdog restart), which is the required backstop. The durable fix for the non-null-broken
+cases is upstream in IMPSystem's constructor/init (drop the DEBUG-level throw gate; make the
+sensor-0x0 path set a non-zero result) and is out of scope here.
+
+diff --git a/src/main.cpp b/src/main.cpp
+index 11499e5..74961e1 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -606,6 +606,21 @@ int main(int argc, const char *argv[]) {
+     imp_system = IMPSystem::createNew();
+   }
+ 
++  // C2: fail-fast on IMP init failure. IMPSystem::createNew() returns null when
++  // any IMP bring-up step fails (IMP_ISP_Open, add/enable sensor,
++  // IMP_System_Init, EnableTuning ...), which is most likely on a cold or
++  // power-cut boot. Continuing would spawn the audio/video/RTSP workers on an
++  // uninitialised IMP -> the encoder never produces SPS/PPS -> RTSP registers
++  // no channel -> the process stays alive but permanently streamless, which an
++  // OPTIONS-only watchdog reads as healthy and never recovers. Exiting instead
++  // drops the RTSP socket, so the supervisor/watchdog restarts a fresh (warm)
++  // process - the proven recovery.
++  if (!imp_system) {
++    LOG_ERROR("IMPSystem initialisation failed; exiting for supervisor restart");
++    join_signal_thread(true);
++    return 1;
++  }
++
+   bool mic_is_digital = cfg && cfg->audio.mic_is_digital;
+   int audio_input_device_id = mic_is_digital ? 0 : 1;
+   const char *cpu_info = (cfg->sysinfo.cpu && cfg->sysinfo.cpu[0] != '\0')
