@@ -1,0 +1,64 @@
+Subject: [PATCH] Apply factory defaults when the config fails to parse (C1-durable)
+Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (branch stable).
+Stacks on: 0001-0011. Applies with git apply -p1 / patch -p1 AFTER them. Touches only
+Config.cpp, in regions no other patch modifies. Only the parse-FAILURE path changes; a normal
+load is unaffected.
+
+Durable defense-in-depth for the config-corruption brick (audit C1; the rootfs S31prudynt
+guard is the first line, this is the binary backstop for when that guard cannot restore -
+e.g. a full overlay). If /etc/prudynt.json is truncated/corrupt, load_config() returns null,
+readConfig() returns false, and CFG::load() was skipping the entire item-processing block
+(if (jsonConfig) { ... }). With the block skipped, NO item got its items-table default, so
+every field kept its C++ zero-initialised value - critically image.isp_bypass = false (no
+in-class initializer), which disables ISP bypass and BREAKS streaming on this sc2336p unit
+(plus stream/rtsp enable flags falling to false). A permanent dead stream the OPTIONS
+watchdog cannot see.
+
+Fix (two surgical changes, parse-failure path only):
+  1. handleConfigItem() no longer early-returns on a null jsonConfig. getNestedValue() is
+     null-safe (returns null on a null root), so each item simply finds no JSON value and
+     falls through to the EXISTING default-assignment logic (item.value = item.defaultValue,
+     with strdup for char*), and sensor params still read their /proc value.
+  2. CFG::load() runs the item loops unconditionally (bare scope instead of if (jsonConfig)),
+     so those defaults are actually applied when the config didn't parse.
+Result: a corrupt/truncated/missing config degrades to the FACTORY-SAFE configuration (the
+items-table defaults: isp_bypass=true, streams/rtsp enabled, valid codec/geometry...) and the
+stream comes up, instead of a zero-initialised brick. A normal load (non-null jsonConfig) is
+byte-for-byte unchanged. No new state. handleConfigItem2() (the write path used by
+updateConfig()) is intentionally untouched - its null guard is correct for writes.
+
+diff --git a/src/Config.cpp b/src/Config.cpp
+index 1314d29..4b53637 100644
+--- a/src/Config.cpp
++++ b/src/Config.cpp
+@@ -995,8 +995,12 @@ void handleConfigItem(JsonValue *jsonConfig, ConfigItem<T> &item) {
+   bool readFromProc = false;
+   bool readFromConfig = false;
+ 
+-  if (!jsonConfig)
+-    return;
++  // C1-durable: do NOT early-return on a null jsonConfig (corrupt / truncated /
++  // missing config). getNestedValue() below is null-safe (returns null), so each
++  // item falls through to its items-table default - and to its /proc value for
++  // sensor params. This degrades a parse failure to a factory-safe configuration
++  // (e.g. image.isp_bypass stays true) instead of leaving every field
++  // zero-initialised (isp_bypass -> false breaks streaming on this sensor).
+ 
+   // For sensor parameters with proc paths, prioritize proc files over JSON
+   if (isSensorProcParameter(item)) {
+@@ -1333,7 +1337,14 @@ void CFG::load() {
+   config_loaded = readConfig();
+   LOG_DEBUG("CFG::load() - Read config, loaded=" << config_loaded);
+ 
+-  if (jsonConfig) {
++  // C1-durable: always run the item loops, even when jsonConfig is null (a parse
++  // failure / corrupt or truncated config). handleConfigItem() now substitutes
++  // each item's items-table default on a null/missing value, so the config
++  // degrades to factory-safe instead of zero-initialised fields. Without this the
++  // whole block was skipped on a parse failure and image.isp_bypass fell back to
++  // false -> ISP bypass disabled -> dead stream. (Bare scope; the close brace
++  // below is unchanged.)
++  {
+     LOG_DEBUG("CFG::load() - Processing config items");
+     LOG_DEBUG("CFG::load() - Processing bool items (" << boolItems.size()
+                                                       << ")");
