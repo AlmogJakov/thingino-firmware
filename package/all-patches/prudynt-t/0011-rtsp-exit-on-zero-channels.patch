@@ -1,0 +1,110 @@
+Subject: [PATCH] Fail fast: exit if zero RTSP video channels register (C5)
+Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (branch stable).
+Stacks on: 0001-0010. Applies with git apply -p1 / patch -p1 AFTER them. Touches RTSP.cpp /
+RTSP.hpp in regions disjoint from 0009 (which only changes the bootstrap deadline constant in
+wait_for_parameter_sets), so the two coexist.
+
+This closes 0009's residual. 0009 raises the SPS/PPS bootstrap deadline to 45s so a slow
+encoder has time to register ch0; but if the encoder NEVER produces SPS/PPS, addSubsession()
+still skips the channel and returns. If every enabled video stream is skipped, RTSP::start()
+registers no ServerMediaSession yet still calls doEventLoop(): a DESCRIBE then 404s (dead
+stream) while OPTIONS keeps answering 200 - the process-alive-but-streamless state an
+OPTIONS-only watchdog cannot detect.
+
+Fix: addSubsession() now returns bool (true = a session was registered, false = skipped for
+lack of SPS/PPS). RTSP::start() tracks whether any enabled channel registered; if at least one
+video stream was enabled but NONE registered, it logs and raises SIGTERM (kill(getpid(),...)),
+which the dedicated shutdown-signal thread turns into a clean shutdown. The process exits ->
+the RTSP socket drops -> the watchdog sees a down socket and restarts a fresh, warm process,
+instead of serving a permanently dead endpoint. The exit fires ONLY when ZERO channels
+registered, so a working ch0 with a failed ch1 is preserved (not killed). Together with C2
+(0010) this makes every "alive-but-streamless" outcome a clean, watchdog-recoverable exit. No
+new state.
+
+diff --git a/src/RTSP.cpp b/src/RTSP.cpp
+index d077265..2883a17 100644
+--- a/src/RTSP.cpp
++++ b/src/RTSP.cpp
+@@ -2,6 +2,8 @@
+ #include "BackchannelServerMediaSubsession.hpp"
+ #include "IMPBackchannel.hpp"
+ #include <chrono>
++#include <signal.h>
++#include <unistd.h>
+ 
+ #undef MODULE
+ #define MODULE "RTSP"
+@@ -61,7 +63,7 @@ bool wait_for_parameter_sets(int chnNr, bool is_h265, H264NALUnit &sps_out,
+ 
+ } // namespace
+ 
+-void RTSP::addSubsession(int chnNr, _stream &stream) {
++bool RTSP::addSubsession(int chnNr, _stream &stream) {
+   LOG_DEBUG("identify stream " << chnNr);
+ 
+   ServerMediaSession *sms = ServerMediaSession::createNew(
+@@ -95,7 +97,7 @@ void RTSP::addSubsession(int chnNr, _stream &stream) {
+       if (vps) {
+         delete vps;
+       }
+-      return;
++      return false; // C5: channel skipped (no SPS/PPS) -> not registered
+     }
+ 
+     LOG_DEBUG("Got necessary NAL Units.");
+@@ -145,6 +147,7 @@ void RTSP::addSubsession(int chnNr, _stream &stream) {
+ 
+   char *url = rtspServer->rtspURL(sms);
+   LOG_INFO("stream " << chnNr << " available at: " << url);
++  return true; // C5: channel registered
+ }
+ 
+ void RTSP::start() {
+@@ -187,12 +190,30 @@ void RTSP::start() {
+   }
+ #endif
+ 
++  bool any_registered = false;
+   if (cfg->stream0.enabled) {
+-    addSubsession(0, cfg->stream0);
++    if (addSubsession(0, cfg->stream0))
++      any_registered = true;
+   }
+ 
+   if (cfg->stream1.enabled) {
+-    addSubsession(1, cfg->stream1);
++    if (addSubsession(1, cfg->stream1))
++      any_registered = true;
++  }
++
++  // C5: if at least one video stream was enabled but NONE could register (no
++  // SPS/PPS within the bootstrap deadline), the session table is empty: a
++  // DESCRIBE would 404 (dead stream) while OPTIONS still answers 200 - a
++  // process-alive-but-streamless state that an OPTIONS-only watchdog reads as
++  // healthy and never recovers. Fail fast: request a clean shutdown (the signal
++  // thread handles SIGTERM) so the supervisor restarts a fresh, warm process
++  // instead of serving a permanently dead endpoint. Only when ZERO channels
++  // registered - a working ch0 with a failed ch1 is kept.
++  if ((cfg->stream0.enabled || cfg->stream1.enabled) && !any_registered) {
++    LOG_ERROR("No video channel registered (SPS/PPS unavailable); requesting "
++              "shutdown for a clean restart");
++    kill(getpid(), SIGTERM);
++    return;
+   }
+ 
+   // Optional audio-only RTSP session (microphone only, no video/backchannel)
+diff --git a/src/RTSP.hpp b/src/RTSP.hpp
+index cfa45d2..697c0f1 100644
+--- a/src/RTSP.hpp
++++ b/src/RTSP.hpp
+@@ -12,7 +12,9 @@
+ class RTSP {
+ public:
+   RTSP() {};
+-  void addSubsession(int chnNr, _stream &stream);
++  // Returns true if a ServerMediaSession was registered for this channel,
++  // false if it was skipped (e.g. SPS/PPS unavailable within the deadline).
++  bool addSubsession(int chnNr, _stream &stream);
+   void start();
+   static void *run(void *arg);
+ 
