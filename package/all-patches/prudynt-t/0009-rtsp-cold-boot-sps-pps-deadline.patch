@@ -1,0 +1,61 @@
+Subject: [PATCH] Raise RTSP cold-boot SPS/PPS bootstrap deadline 10s -> 45s (fix dead stream after reboot/power-cut)
+Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (branch stable).
+Stacks on: 0001-0008. Applies with git apply -p1 / patch -p1 AFTER them. RTSP.cpp is
+NOT touched by any other patch in the set, so this hunk is order-independent.
+
+After a reboot or (especially) a power-cut, the T23/sc2336p pipeline can take well over
+10 seconds to emit its first SPS/PPS: prudynt itself brings up the sensor/ISP/VPU/encoder,
+and the first IDR only lands once ISP AE has settled and the encoder has produced a
+keyframe. RTSP::addSubsession() registers a channel only AFTER it has the parameter sets:
+it sets bootstrap_requested, nudges the VideoWorker, and calls wait_for_parameter_sets()
+with a fixed deadline (retrying IMP_Encoder_RequestIDR every 250ms). On a slow cold boot
+that deadline expires before the sets arrive, so addSubsession() logs
+"Could not obtain SPS/PPS for stream N - skipping subsession" and returns BEFORE
+rtspServer->addServerMediaSession(). The whole channel (video + audio + backchannel) is
+left unregistered: the RTSP socket is up so OPTIONS returns 200, but DESCRIBE /ch0 returns
+404 -- this is go2rtc's "wrong response on DESCRIBE" and the dead stream that only a
+prudynt restart (with a now-warm encoder) recovers. prudynt does NOT retry registration
+within a run, so a single slow boot wedges the stream until manual intervention. On a
+life-safety camera that is the failure that matters most.
+
+Fix: raise the bootstrap deadline from 10s to 45s so a slow-warming encoder has time to
+produce SPS/PPS and the channel registers normally. This is the smallest, lowest-risk
+prevention:
+
+  * No deadlock. The SPS/PPS are produced by the VideoWorker on a SEPARATE thread; this
+    wait holds codec_config_mutex only inside the check block and releases it before every
+    50ms usleep, so it can never starve the producer it is waiting on.
+  * No added delay on a healthy boot. The loop returns the instant have_sps && have_pps
+    are set, so a normal start (sets in well under a second) is unaffected -- only a slow
+    cold boot waits longer, and it ends with a WORKING channel instead of a dead one.
+  * No new state. Pure compile-time constant: no flash write, no /run marker, no log
+    parsing, no config key (kept a bare constant deliberately, so it does not add a key to
+    prudynt.json on the tight jffs2 config overlay).
+
+Scope / honesty: this is a probabilistic cure for the slow-warmup tail (the observed field
+failure, which a restart recovers => not a permanently wedged encoder). It does NOT rescue
+an encoder that never produces SPS/PPS -- that channel is still skipped, just 45s later.
+Cost in that rare hard-wedge case: addSubsession() waits per channel serially, so the
+worst-case blocking startup is ~2x the deadline (ch0 then ch1) before doEventLoop. That is
+an acceptable trade for eliminating the common dead-stream-after-reboot case.
+
+diff --git a/src/RTSP.cpp b/src/RTSP.cpp
+index d077265..458d2ec 100644
+--- a/src/RTSP.cpp
++++ b/src/RTSP.cpp
+@@ -19,7 +19,14 @@ bool wait_for_parameter_sets(int chnNr, bool is_h265, H264NALUnit &sps_out,
+     return false;
+   }
+ 
+-  const auto deadline = std::chrono::steady_clock::now() + 10s;
++  // Cold-boot bootstrap deadline. A slow-warming T23 encoder can take well over
++  // 10s to emit its first SPS/PPS after a reboot or power-cut (ISP/sensor AE
++  // settle + first IDR). If this deadline expires first, addSubsession() skips
++  // the whole channel (DESCRIBE -> 404, dead stream) and prudynt does NOT retry
++  // within the run, so the stream stays dead until a manual restart. 45s covers
++  // the cold-boot warmup tail; a healthy boot returns the instant the sets
++  // arrive, so this adds no delay to a normal start.
++  const auto deadline = std::chrono::steady_clock::now() + 45s;
+   auto next_idr_retry = std::chrono::steady_clock::now();
+   unsigned wait_timeout_count = 0;
+ 
