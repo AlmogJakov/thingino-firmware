@@ -161,7 +161,31 @@ jobs:
           #     2x. Distinct marker so a STALE 0008 (sample-clock only, no AAC cap) is rejected.
           grep -qF "Size to the reframer's true mono output" "$SRC/src/AudioWorker.cpp" \
             || { echo "::error::AudioWorker.cpp: AAC+force_stereo reframer-size fix (0008) missing — STALE 0008 without the codec-safety cap"; ok=0; }
-          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (0001-0003 base; 0004 live reconfig + IDR; 0005 fault-tolerance; 0006 high-freq seamlessness; 0007 physical-privacy software mic mute; 0008 audio RTP sample-clock + AAC codec-safety)" || exit 1
+          # 24) (0009): raise the RTSP cold-boot SPS/PPS bootstrap deadline 10s -> 45s so a
+          #     slow-warming T23 encoder registers ch0 instead of skipping it (DESCRIBE 404 /
+          #     dead stream after reboot/power-cut). Match the explanatory comment so a STALE
+          #     RTSP.cpp (still 10s) is rejected.
+          grep -qF "Cold-boot bootstrap deadline" "$SRC/src/RTSP.cpp" \
+            || { echo "::error::RTSP.cpp: cold-boot SPS/PPS deadline raise (0009) not applied"; ok=0; }
+          # 25) (0010 / C2): fail-fast exit if IMPSystem::createNew() returns null, so a failed
+          #     IMP init never leaves prudynt alive-but-streamless (watchdog-blind).
+          grep -qF "IMPSystem initialisation failed; exiting for supervisor restart" "$SRC/src/main.cpp" \
+            || { echo "::error::main.cpp: IMP-init null-check exit (0010/C2) not applied"; ok=0; }
+          # 26) (0011 / C5): exit if zero RTSP video channels register (closes 0009's residual:
+          #     a streamless prudynt that answers OPTIONS=200 but DESCRIBE=404). addSubsession
+          #     now returns bool; start() raises SIGTERM when nothing registered.
+          grep -qF "No video channel registered (SPS/PPS unavailable)" "$SRC/src/RTSP.cpp" \
+            || { echo "::error::RTSP.cpp: zero-channel fail-fast exit (0011/C5) not applied"; ok=0; }
+          grep -qF "bool RTSP::addSubsession" "$SRC/src/RTSP.cpp" \
+            || { echo "::error::RTSP.cpp: addSubsession bool return (0011/C5) not applied"; ok=0; }
+          # 27) (0012 / C1-durable): apply factory defaults when the config fails to parse, so a
+          #     corrupt/truncated prudynt.json degrades to factory-safe (isp_bypass stays true)
+          #     instead of zero-init brick. Match BOTH changed sites.
+          grep -qF "C1-durable: always run the item loops" "$SRC/src/Config.cpp" \
+            || { echo "::error::Config.cpp: apply-defaults-on-parse-fail load() change (0012/C1-durable) not applied"; ok=0; }
+          grep -qF "C1-durable: do NOT early-return on a null jsonConfig" "$SRC/src/Config.cpp" \
+            || { echo "::error::Config.cpp: handleConfigItem null-fallthrough (0012/C1-durable) not applied"; ok=0; }
+          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (0001-0003 base; 0004 live reconfig + IDR; 0005 fault-tolerance; 0006 high-freq seamlessness; 0007 physical-privacy software mic mute; 0008 audio RTP sample-clock + AAC codec-safety; 0009 cold-boot RTSP SPS/PPS deadline; 0010 IMP-init fail-fast; 0011 zero-channel fail-fast; 0012 config apply-defaults-on-parse-fail)" || exit 1
 
       - name: Locate the built MIPS prudynt binary
         id: find
