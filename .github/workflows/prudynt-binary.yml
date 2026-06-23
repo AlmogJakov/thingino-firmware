@@ -185,7 +185,13 @@ jobs:
             || { echo "::error::Config.cpp: apply-defaults-on-parse-fail load() change (0012/C1-durable) not applied"; ok=0; }
           grep -qF "C1-durable: do NOT early-return on a null jsonConfig" "$SRC/src/Config.cpp" \
             || { echo "::error::Config.cpp: handleConfigItem null-fallthrough (0012/C1-durable) not applied"; ok=0; }
-          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (0001-0003 base; 0004 live reconfig + IDR; 0005 fault-tolerance; 0006 high-freq seamlessness; 0007 physical-privacy software mic mute; 0008 audio RTP sample-clock + AAC codec-safety; 0009 cold-boot RTSP SPS/PPS deadline; 0010 IMP-init fail-fast; 0011 zero-channel fail-fast; 0012 config apply-defaults-on-parse-fail)" || exit 1
+          # 28) (0013 / reader-hardening): tolerate a double-quoted daynight.force_mode so a
+          #     forced day/night mode persisted as "\"night\"" by the agent set-path is honored
+          #     at boot (strips a surrounding quote pair at config load) instead of being
+          #     rejected by the strict validator -> booting day with night optics.
+          grep -qF "0013 (reader-hardening)" "$SRC/src/Config.cpp" \
+            || { echo "::error::Config.cpp: force_mode quote-tolerance (0013) not applied"; ok=0; }
+          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (0001-0003 base; 0004 live reconfig + IDR; 0005 fault-tolerance; 0006 high-freq seamlessness; 0007 physical-privacy software mic mute; 0008 audio RTP sample-clock + AAC codec-safety; 0009 cold-boot RTSP SPS/PPS deadline; 0010 IMP-init fail-fast; 0011 zero-channel fail-fast; 0012 config apply-defaults-on-parse-fail; 0013 force_mode quote-tolerance)" || exit 1
 
       - name: Locate the built MIPS prudynt binary
         id: find
