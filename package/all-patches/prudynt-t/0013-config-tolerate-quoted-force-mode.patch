@@ -1,0 +1,72 @@
+Subject: [PATCH] Reader-hardening: tolerate a double-quoted daynight.force_mode (C-reader)
+Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (branch stable).
+Stacks on: 0001-0012. Applies with git apply -p1 / patch -p1 AFTER them. Touches only
+Config.cpp (CFG::load), in a region disjoint from 0012's edits.
+
+Root-cause defense for the day/night forced-mode failure seen in the field. The agent set-path
+(the stock thingino-agent prudynt.sh adapter) persists daynight.force_mode DOUBLE-QUOTED -- the
+raw JSON ends up as  "force_mode": "\"night\""  (a JSON string whose CONTENT is the 7 chars
+"night"). prudynt's config item for that key has a strict validator (s == "day" || s ==
+"night"), so it REJECTS the quoted value and reverts force_mode_cfg to "" (empty). Result: the
+forced mode is silently ignored at boot -- the 0001 IMPSystem early-derive leaves
+image.running_mode at its config value (day/color), the DayNightWorker records mode "unknown"
+(UI shows "Day"), yet S56ircut (a lenient shell read of the same key) still sets NIGHT optics
+(IR-cut off + IR LED on). The camera boots a day image with night optics: inconsistent, and on
+a life-safety unit it means no real night vision after a reboot. Confirmed on-device: the raw
+config held "\"night\"", prudyntctl reported mode "unknown", and rewriting the value clean made
+prudynt boot night purely from force_mode (no manual running_mode needed) -- so the only defect
+is the reader rejecting the writer's stray quotes.
+
+Fix (reader side; the writer is fixed separately by the modified adapter, which lands in /rom
+via the firmware rebuild): in CFG::load(), after the item loops, re-read daynight.force_mode,
+strip a single surrounding pair of double quotes, and -- if it is day/night and differs from
+what the strict path stored -- set force_mode_cfg to the clean value. This makes prudynt
+tolerant of a double-quoted value regardless of which tool wrote the config (Postel's law),
+so the boot-derive and the worker both honor the persisted mode. Properties:
+  * One-time at config load -- no per-frame / per-boot-loop cost; negligible.
+  * No-op on an already-clean value: the strict char-item path leaves a clean "night"/"day"
+    intact, the strcmp then matches, and nothing is rewritten (no jffs2 churn, no extra strdup).
+  * getNestedValue() is null-safe; the block is gated on jsonConfig, so a corrupt/missing config
+    (parse failure) is unaffected -- it simply stays in auto, which is safe.
+  * Scoped to daynight.force_mode only -- other string config values (OSD text, paths) are
+    untouched, so no risk of stripping a legitimately-quoted value elsewhere.
+This does NOT mask the writer bug for other readers; it makes prudynt robust. The permanent
+write-side fix (the adapter persisting a clean value + cutting flash churn) is deferred to the
+Phase-3 /rom rebuild; with this patch the camera is correct even before that.
+
+diff --git a/src/Config.cpp b/src/Config.cpp
+index 1314d29..7cb9d48 100644
+--- a/src/Config.cpp
++++ b/src/Config.cpp
+@@ -1357,6 +1357,31 @@ void CFG::load() {
+     LOG_DEBUG("CFG::load() - Finished processing config items");
+   }
+ 
++  // 0013 (reader-hardening): tolerate a daynight.force_mode that a config writer
++  // stored DOUBLE-QUOTED -- raw JSON  "force_mode": "\"night\"" . The strict
++  // validator for that key (s == "day" || s == "night") rejects the quoted value,
++  // leaving force_mode_cfg empty, so the forced day/night mode is silently ignored
++  // at boot (the image derives day and the worker reports "unknown") while the GPIO
++  // optics path still honors it -> inconsistent boot. Re-read the raw value, strip a
++  // single surrounding pair of double quotes, accept day/night, and set
++  // force_mode_cfg clean so the boot-derive and the worker honor the persisted mode
++  // regardless of writer quoting. One-time at load; a no-op on an already-clean value
++  // (the strict char-item path leaves a clean value intact, so this only rewrites a
++  // value the validator had rejected).
++  if (jsonConfig) {
++    JsonValue *fmv = getNestedValue(jsonConfig, "daynight.force_mode");
++    if (fmv) {
++      std::string fm = jsonValueToString(fmv);
++      if (fm.size() >= 2 && fm.front() == '"' && fm.back() == '"')
++        fm = fm.substr(1, fm.size() - 2);
++      if ((fm == "day" || fm == "night") &&
++          (!daynight.force_mode_cfg ||
++           std::strcmp(daynight.force_mode_cfg, fm.c_str()) != 0)) {
++        daynight.force_mode_cfg = strdup(fm.c_str());
++      }
++    }
++  }
++
+   if (!daynight.loglevel || daynight.loglevel[0] == '\0') {
+     daynight.loglevel = (general.loglevel && general.loglevel[0] != '\0')
+                             ? general.loglevel
