@@ -54,10 +54,16 @@ jobs:
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Sanity check - prudynt patches present
+      - name: Confirm prudynt patches 0001-0013 present (fail fast before build)
         run: |
-          ls -l package/all-patches/prudynt-t/ \
-            || { echo "::error::no prudynt patches in package/all-patches/prudynt-t/ - aborting"; exit 1; }
+          D=package/all-patches/prudynt-t
+          [ -d "$D" ] || { echo "::error::$D missing"; exit 1; }
+          ls -l "$D"
+          miss=0
+          for n in 0001 0002 0003 0004 0005 0006 0007 0008 0009 0010 0011 0012 0013; do
+            ls "$D"/"$n"-*.patch >/dev/null 2>&1 && echo "PASS: patch $n present" || { echo "::error::missing patch $n-*.patch"; miss=1; }
+          done
+          [ "$miss" = 0 ] && echo "ALL 13 PRUDYNT PATCHES PRESENT (0001-0013)" || exit 1
 
       - name: Download sources
         run: BOARD="$BOARD" make source WORKFLOW=1
@@ -65,6 +71,27 @@ jobs:
       - name: Build firmware (full image; bakes patches + overlay + package files)
         # `make fast` = defconfig + parallel build + pack (thingino's own CI command).
         run: BOARD="$BOARD" make fast WORKFLOW=1
+
+      - name: Confirm prudynt patches were applied to the source
+        # Non-fragile, source-level: buildroot records every applied patch by name in
+        # the package build dir's .applied_patches_list. No binary introspection.
+        run: |
+          SRC=$(find output -type d -name 'prudynt-t-*' 2>/dev/null | grep -v '/host/' | head -1)
+          [ -n "$SRC" ] || { echo "::error::prudynt-t source dir not found under output/"; exit 1; }
+          echo "prudynt source: $SRC"
+          LIST="$SRC/.applied_patches_list"
+          if [ -f "$LIST" ]; then
+            echo "== .applied_patches_list =="; cat "$LIST"
+            miss=0
+            for n in 0001 0002 0003 0004 0005 0006 0007 0008 0009 0010 0011 0012 0013; do
+              grep -q "^$n-" "$LIST" && echo "PASS: patch $n applied" || { echo "::error::patch $n not in .applied_patches_list"; miss=1; }
+            done
+            [ "$miss" = 0 ] && echo "ALL 13 PRUDYNT PATCHES APPLIED (0001-0013)" || exit 1
+          elif [ -f "$SRC/.stamp_patched" ]; then
+            echo "::warning::.applied_patches_list absent on this buildroot; .stamp_patched present (patch phase ran), but cannot enumerate per-patch"
+          else
+            echo "::error::no .applied_patches_list and no .stamp_patched - cannot confirm patches applied"; exit 1
+          fi
 
       - name: Collect built images
         # Images land under output/<branch>/<camera>-<kernel>-<libc>/images/, not
@@ -77,6 +104,57 @@ jobs:
           mkdir -p artifacts
           cp -a "$IMG_DIR"/. artifacts/
           echo "== artifacts =="; ls -lh artifacts/
+
+      - name: Verify rootfs (safety gate - runs BEFORE upload)
+        # Extract rootfs.squashfs and assert the motors de-loop, executable modes,
+        # absence of /rom/usr/bin/motors, and that the doc isn't baked. Any failure
+        # fails the run, so a bad image is never uploaded.
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends squashfs-tools
+          SQ=$(find artifacts output -name 'rootfs.squashfs' 2>/dev/null | head -1)
+          [ -n "$SQ" ] || { echo "::error::rootfs.squashfs not found"; exit 1; }
+          echo "squashfs: $SQ"
+          rm -rf rootfs_check
+          unsquashfs -d rootfs_check "$SQ" >/dev/null
+          ROOT=rootfs_check
+          fail=0
+          err() { echo "::error::FAIL: $1"; fail=1; }
+          ok()  { echo "PASS: $1"; }
+          M="$ROOT/usr/bin/motors"; B="$ROOT/usr/bin/motors-bin"
+
+          # --- motors wrapper (the self-exec de-loop) ---
+          [ -x "$M" ] && ok "/usr/bin/motors executable" || err "/usr/bin/motors missing or not executable"
+          head -1 "$M" 2>/dev/null | grep -q '^#!/bin/sh' && ok "/usr/bin/motors is a #!/bin/sh wrapper" || err "/usr/bin/motors is not a /bin/sh wrapper"
+          file "$M" 2>/dev/null | grep -q 'ELF' && err "/usr/bin/motors is an ELF (must be the script wrapper, not the binary)" || ok "/usr/bin/motors is not an ELF"
+          grep -q '/usr/bin/motors-bin' "$M" 2>/dev/null && ok "/usr/bin/motors references motors-bin" || err "/usr/bin/motors does not reference motors-bin"
+          grep -q '/rom/usr/bin/motors' "$M" 2>/dev/null && err "/usr/bin/motors still references /rom/usr/bin/motors" || ok "/usr/bin/motors has no /rom reference"
+
+          # --- real motor client (proves the .mk retarget) ---
+          [ -x "$B" ] && ok "/usr/bin/motors-bin executable" || err "/usr/bin/motors-bin missing or not executable"
+          file "$B" 2>/dev/null | grep -qE 'ELF' && ok "/usr/bin/motors-bin is an ELF" || err "/usr/bin/motors-bin is not an ELF executable"
+
+          # --- runtime scripts must be executable (new + modified; adapter prudynt.sh is 0644 by design, not checked) ---
+          for f in \
+            usr/sbin/physical-privacy usr/sbin/tz-update usr/sbin/light \
+            usr/sbin/daynight usr/sbin/color usr/sbin/imp-control \
+            etc/init.d/S31prudynt etc/init.d/S32prudyntwd etc/init.d/S56ircut \
+            etc/init.d/S01timezone etc/init.d/S60physical-privacy etc/ntpd_callback; do
+            [ -x "$ROOT/$f" ] && ok "$f executable" || err "$f missing or not executable"
+          done
+
+          # --- documentation must NOT be baked into the rootfs ---
+          find "$ROOT" -name 'PT2-FIX-SET.md' | grep -q . && err "PT2-FIX-SET.md was installed into the rootfs" || ok "PT2-FIX-SET.md not in rootfs"
+
+          # --- core deliverable present ---
+          { [ -f "$ROOT/usr/bin/prudynt" ] && file "$ROOT/usr/bin/prudynt" 2>/dev/null | grep -qE 'ELF'; } && ok "prudynt binary present (ELF)" || err "prudynt binary missing or not ELF"
+
+          # --- strongest anti-loop net: NO /rom/usr/bin/motors anywhere in the rootfs ---
+          HITS=$(grep -rIl '/rom/usr/bin/motors' "$ROOT" 2>/dev/null || true)
+          [ -z "$HITS" ] && ok "no /rom/usr/bin/motors anywhere in rootfs" || err "/rom/usr/bin/motors referenced in: $(echo "$HITS" | sed "s#$ROOT/##g" | tr '\n' ' ')"
+
+          echo "------------------------------------------------------------"
+          if [ "$fail" = 0 ]; then echo "ROOTFS VERIFICATION PASSED"; else echo "::error::ROOTFS VERIFICATION FAILED"; exit 1; fi
 
       - name: Upload firmware images
         uses: actions/upload-artifact@v4
