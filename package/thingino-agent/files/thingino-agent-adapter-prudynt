@@ -1393,6 +1393,11 @@ thingino_agent_prudynt_persist_value() {
 	path=$1
 	value=$2
 	if command -v jct >/dev/null 2>&1 && [ -f "$THINGINO_AGENT_PRUDYNT_CONFIG" ] && [ -n "$value" ]; then
+		# Write-on-change: a jct set rewrites the whole ~8.5 KB prudynt.json (jffs2 churn /
+		# flash wear), so skip when unchanged. Strip quotes on both sides — jct get returns
+		# strings QUOTED while callers pass force_mode/mode BARE; the runtime apply
+		# (prudyntctl) is done separately, so skipping a redundant persist is behaviour-safe.
+		[ "$(jct "$THINGINO_AGENT_PRUDYNT_CONFIG" get "$path" 2>/dev/null | tr -d '"')" = "$(printf '%s' "$value" | tr -d '"')" ] && return 0
 		jct "$THINGINO_AGENT_PRUDYNT_CONFIG" set "$path" "$value" >/dev/null 2>&1 || true
 	fi
 }
@@ -2005,7 +2010,10 @@ thingino_agent_adapter_prudynt_daynight() {
 		day | night)
 			thingino_agent_prudynt_apply_payload "{\"daynight\":{\"enabled\":false,\"force_mode\":\"$mode\"}}" || return 1
 			thingino_agent_prudynt_persist_value daynight.enabled false
-			thingino_agent_prudynt_persist_value daynight.force_mode "\"$mode\""
+			# Persist BARE ("night", not "\"night\""): jct adds the JSON quoting itself.
+			# Passing it pre-quoted stored "force_mode":"\"night\"" which prudynt's strict
+			# validator rejected at boot. (apply_payload above still quotes it for prudyntctl.)
+			thingino_agent_prudynt_persist_value daynight.force_mode "$mode"
 			printf '{"status":"accepted","mode":%s}\n' "$(thingino_agent_json_string "$mode")"
 			;;
 		*)

@@ -1,0 +1,432 @@
+#!/bin/sh
+# physical-privacy - physical privacy for pan/tilt cameras (Sonoff PT2 / T23):
+# tilts the lens to a privacy pose, FREEZES the current day/night mode (no
+# day<->night switch), kills emitters that would warm the parked sensor (white
+# always; IR only in night) and soft-mutes the mic (prudynt mic_muted, patch
+# 0007). Snapshots pre-privacy state to flash and restores it exactly on `off`.
+# Reboot/power-safe; the guard subcommand is the motors/HA/web interlock choke
+# point (armed=cancel-privacy, busy=drop). Full rationale: PT2-FIX-SET.md.
+#
+# Mark our own actuation internal so the /usr/bin/motors wrapper never guards us.
+export PHYSPRIV_INTERNAL=1
+
+STATE="/etc/physical-privacy-state.json"
+ARMED="/run/physical-privacy.armed"
+LOCK="/run/physical-privacy.lock"
+PRUDYNT_CONFIG="/etc/prudynt.json"
+MOTORS_CONFIG="/etc/motors.json"
+JCT="/usr/bin/jct"
+DEFAULT_POSE_TILT=2152      # privacy pose: lens tilted down/away
+DEFAULT_HOME_TILT=1152      # fallback tilt (motors.json pos_0) if unreadable
+POS_TOL=50                  # tilt steps: "reached target" tolerance
+SETTLE_MAX=12               # bounded per-move wait (seconds)
+SEEK_TRIES=3                # bounded re-jogs if a move falls short
+
+# Talk to the motor driver DIRECTLY (the real client at /usr/bin/motors-bin),
+# bypassing our own /usr/bin/motors wrapper, so our moves are never intercepted.
+# Fall back to PATH only if motors-bin is absent (PHYSPRIV_INTERNAL still shields us).
+REAL_MOTORS="/usr/bin/motors-bin"
+[ -x "$REAL_MOTORS" ] || REAL_MOTORS="motors"
+_motors() { "$REAL_MOTORS" "$@"; }
+
+log() { logger -t physical-privacy "$*" 2>/dev/null; }
+
+# ---- lock (atomic serialization + "busy" signal) -------------------------
+acquire_lock() {
+	if mkdir "$LOCK" 2>/dev/null; then echo $$ >"$LOCK/pid" 2>/dev/null; return 0; fi
+	# Lock present — stale (owner dead)? Break it once, then retry.
+	hp=$(cat "$LOCK/pid" 2>/dev/null)
+	if [ -z "$hp" ] || ! kill -0 "$hp" 2>/dev/null; then
+		rm -rf "$LOCK" 2>/dev/null
+		if mkdir "$LOCK" 2>/dev/null; then echo $$ >"$LOCK/pid" 2>/dev/null; return 0; fi
+	fi
+	return 1
+}
+release_lock() { rm -rf "$LOCK" 2>/dev/null; }
+lock_busy() {   # true if a transition is running (lock held by a LIVE owner)
+	[ -d "$LOCK" ] || return 1
+	hp=$(cat "$LOCK/pid" 2>/dev/null)
+	[ -n "$hp" ] && kill -0 "$hp" 2>/dev/null
+}
+# Run by the detached transition waiter as its FIRST action: take ownership of
+# the lock with its OWN pid (so the busy signal never points at a dead pid), and
+# arrange to release on exit. In a backgrounded ( ) subshell /proc/self is this
+# subshell, so its first stat field is our real pid ($$ would be the parent's).
+waiter_claim() {
+	read _wp _ </proc/self/stat 2>/dev/null
+	[ -n "$_wp" ] && echo "$_wp" >"$LOCK/pid" 2>/dev/null
+	trap 'release_lock' EXIT
+}
+
+# ---- armed marker --------------------------------------------------------
+arm()      { : >"$ARMED" 2>/dev/null; }
+disarm()   { rm -f "$ARMED" 2>/dev/null; }
+is_armed() { [ -f "$ARMED" ]; }
+
+# ---- state readers (grep, no jct — we own the format) --------------------
+st_active()     { grep -o '"active":[a-z]*'           "$STATE" 2>/dev/null | head -1 | grep -o '[a-z]*$'; }
+st_pose_tilt()  { v=$(grep -o '"pose":{"tilt":[0-9-]*' "$STATE" 2>/dev/null | grep -o '[0-9-]*$'); printf '%s' "${v:-$DEFAULT_POSE_TILT}"; }
+st_saved_tilt() { grep -o '"saved":{"tilt":[0-9-]*'   "$STATE" 2>/dev/null | grep -o '[0-9-]*$'; }
+st_saved_mode() { grep -o '"daynight_mode":"[a-z]*"'  "$STATE" 2>/dev/null | head -1 | sed 's/.*:"//; s/"//'; }
+st_live_mode()  { grep -o '"live_mode":"[a-z]*"'      "$STATE" 2>/dev/null | head -1 | sed 's/.*:"//; s/"//'; }
+
+# ---- other readers -------------------------------------------------------
+get_tilt()  { _motors -p 2>/dev/null | tr -dc '0-9,-' | sed 's/.*,//'; }   # "PAN,TILT" -> TILT
+home_tilt() { hp=$("$JCT" "$MOTORS_CONFIG" get motors.pos_0 2>/dev/null | tr -d '"'); printf '%s' "${hp##*,}"; }
+
+dn_mode() {  # current day/night intent (the TARGET): auto | day | night
+	# Read the LEAF keys, NEVER the whole daynight object: `jct get daynight` includes a
+	# nested "schedule":{"enabled":...}, so a substring match on '"enabled":true' would
+	# mis-read a forced camera that has the day/night SCHEDULE enabled as "auto" — which
+	# would clobber the forced mode on privacy exit. This matches S56ircut / ha-state / the
+	# agent, all of which read daynight.enabled directly and are immune to the nested key.
+	[ "$("$JCT" "$PRUDYNT_CONFIG" get daynight.enabled 2>/dev/null | tr -d '" ')" = "true" ] && { printf 'auto'; return; }
+	[ "$("$JCT" "$PRUDYNT_CONFIG" get daynight.force_mode 2>/dev/null | tr -d '" ')" = "night" ] && { printf 'night'; return; }
+	printf 'day'
+}
+
+dn_live() {  # current LIVE visual mode (what the engine is actually showing): day | night
+	m=$(awk 'NR==1{print $1}' /run/prudynt/daynight_mode 2>/dev/null | tr -d '\n')
+	case "$m" in night) printf 'night' ;; *) printf 'day' ;; esac
+}
+
+# ---- atomic state writers (+ flash sync for power-loss durability) -------
+# Fail-safe: if the write fails (e.g. overlay full), DELETE the temp (don't leak
+# it onto the already-full flash) and log loudly + return non-zero, instead of
+# leaving an orphan temp and silently reporting success (which desynced HA).
+_w() {
+	tmp="${STATE}.tmp.$$"
+	if printf '%s\n' "$1" >"$tmp" 2>/dev/null && mv -f "$tmp" "$STATE"; then
+		sync
+		return 0
+	fi
+	rm -f "$tmp" 2>/dev/null
+	log "STATE WRITE FAILED (overlay full?) - privacy state NOT persisted"
+	return 1
+}
+write_on()  { _w "{\"version\":1,\"active\":true,\"pose\":{\"tilt\":$1},\"saved\":{\"tilt\":$2,\"daynight_mode\":\"$3\",\"live_mode\":\"$4\"}}"; }
+write_off() { _w "{\"version\":1,\"active\":false,\"pose\":{\"tilt\":$1}}"; }
+
+# ---- actuators -----------------------------------------------------------
+tilt_jog() { # current_tilt target_tilt — one async relative jog; pan untouched
+	dy=$(($2 - $1))
+	[ "$dy" = 0 ] || _motors -d g -x 0 -y "$dy" >/dev/null 2>&1
+}
+
+wait_motors_idle() {  # bounded: return once the lens stops (two equal reads)
+	last=""; n=0
+	while [ "$n" -lt "$SETTLE_MAX" ]; do
+		p=$(_motors -p 2>/dev/null | tr -dc '0-9,-')
+		[ -n "$p" ] && [ "$p" = "$last" ] && return 0
+		last="$p"; n=$((n + 1)); sleep 1
+	done
+	return 0
+}
+
+# Move the lens to an absolute target tilt and CONFIRM it got there, re-jogging
+# (bounded) if a jog fell short. Reads the real position every round, so it never
+# relies on assumed deltas. Returns when within tolerance or out of tries.
+seek_tilt() { # target_tilt
+	target=$1; tries=0
+	while [ "$tries" -le "$SEEK_TRIES" ]; do
+		cur=$(get_tilt)
+		case "$cur" in
+			'' | *[!0-9-]*)
+				# Position unreadable (sensor/daemon hiccup): do ONE best-effort blind
+				# jog from the calibrated home toward the target so privacy is still
+				# physically applied, then stop (a relative jog can't be verified, and
+				# repeating it would compound). Far better than never tilting.
+				fb=$(home_tilt); [ -n "$fb" ] || fb=$DEFAULT_HOME_TILT
+				tilt_jog "$fb" "$target"
+				return 1
+				;;
+		esac
+		d=$((cur - target)); ad=${d#-}
+		[ "$ad" -le "$POS_TOL" ] && return 0
+		tilt_jog "$cur" "$target"
+		wait_motors_idle
+		tries=$((tries + 1))
+	done
+	return 0
+}
+
+# Persist a prudynt.json key ONLY when it actually changes. A `jct set` rewrites
+# the whole ~8.5KB prudynt.json and jffs2 keeps the old copy as an obsolete node
+# until GC -> needless flash churn/wear on a 224KB overlay. Skipping unchanged
+# writes makes a re-assert (e.g. auto when already auto) cost ZERO flash. The
+# RUNTIME change (prudyntctl, in RAM) always runs below, so live behaviour is
+# unchanged. Returns 0 if it wrote, 1 if already at target, 2 if the write FAILED (logged).
+jset() {
+	[ "$("$JCT" "$PRUDYNT_CONFIG" get "$1" 2>/dev/null | tr -d '" ')" = "$2" ] && return 1
+	"$JCT" "$PRUDYNT_CONFIG" set "$1" "$2" >/dev/null 2>&1 && return 0
+	log "jset: failed to persist $1=$2 (config write error; runtime applied, reboot may differ)"
+	return 2
+}
+
+# day/night applied DIRECTLY (runtime + persisted + executor). Bypasses
+# thingino-agentctl / json-imp / ha-commands, so it never trips our own
+# interlock. Mirrors the day/night adapter so a reboot lands the same mode.
+# prudyntctl = runtime (RAM, no flash); jset = persist ONLY on change; sync only
+# if we persisted -> minimal flash writes for endurance.
+set_daynight() { # auto|day|night
+	_wrote=0
+	case "$1" in
+		auto)
+			echo '{"daynight":{"enabled":true}}' | prudyntctl json - >/dev/null 2>&1
+			jset daynight.enabled true && _wrote=1
+			jset daynight.force_mode "" && _wrote=1
+			;;
+		day | night)
+			echo "{\"daynight\":{\"enabled\":false,\"force_mode\":\"$1\"}}" | prudyntctl json - >/dev/null 2>&1
+			jset daynight.enabled false && _wrote=1
+			jset daynight.force_mode "$1" && _wrote=1
+			[ -x /sbin/daynight ] && /sbin/daynight "$1" >/dev/null 2>&1
+			;;
+		*) return 0 ;;
+	esac
+	[ "$_wrote" = 1 ] && sync   # flush to flash only if we actually persisted a change
+}
+
+# Freeze the day/night engine on the given LIVE mode (day|night): disable auto and
+# pin force_mode, at runtime (prudyntctl, RAM) + persisted only-on-change. Unlike
+# set_daynight it does NOT run the executor: the optics are already in this mode,
+# and re-running it would re-light the IR we are about to kill. Pinning force_mode
+# to the live mode means the engine sees no change and never re-actuates an LED.
+freeze_daynight() { # day|night
+	echo "{\"daynight\":{\"enabled\":false,\"force_mode\":\"$1\"}}" | prudyntctl json - >/dev/null 2>&1
+	_wrote=0
+	jset daynight.enabled false && _wrote=1
+	jset daynight.force_mode "$1" && _wrote=1
+	[ "$_wrote" = 1 ] && sync
+}
+
+# Drive an emitter (ir|white|…) on|off with read-back verification — a single `light`
+# write can be dropped (that's why the executor uses the same 3x retry), and at ENTRY
+# the IR off can lose a last-writer race to an in-flight /sbin/daynight child still
+# retrying IR on. Goes direct, bypassing /sbin/daynight's same-mode dedup (which would
+# no-op a night re-assert on exit). For an IR/white "on", the caller MUST have lifted
+# the guard (active=false) first, or the guard refuses it. An undefined pin reads empty
+# -> treated as done. NOTE: `light ir` resolves ONE pin (ir850, else ir940); this unit
+# is ir850-only — for a dual-IR board call light_verified for ir850 AND ir940.
+light_verified() { # type on|off
+	_t="$1"; _want="$2"; _r=0; [ "$_want" = "on" ] && _r=1
+	_n=0
+	while [ "$_n" -lt 3 ]; do
+		light "$_t" "$_want" 2>/dev/null
+		_cur=$(light "$_t" read 2>/dev/null)
+		{ [ -z "$_cur" ] || [ "$_cur" = "$_r" ]; } && return 0
+		_n=$((_n + 1)); usleep 50000
+	done
+	log "physical-privacy: $_t did not verify '$_want'"
+	return 1
+}
+
+# Microphone SOFTWARE mute (physical privacy must not transmit audio). Sets prudynt's
+# runtime `mic_muted` flag via prudyntctl: the audio worker then zeros the captured PCM
+# (true silence) with NO audio-worker restart — so the RTSP/go2rtc stream is never
+# disrupted. (The earlier `mic_enabled` approach restarted the audio worker and broke the
+# stream — see PT2-FIX-SET.md.) RAM only, ZERO flash. Read-back verified (prudynt echoes the
+# flag), bounded retry. Requires the 0007-privacy-mic-software-mute prudynt patch; on a
+# stock binary the key is an unknown no-op (audio simply not muted) — it can NEVER break
+# the stream (no restart), it just logs "not confirmed". Best-effort: callers don't gate.
+mic_set() { # true|false
+	_n=0
+	while [ "$_n" -lt 3 ]; do
+		echo "{\"audio\":{\"mic_muted\":$1}}" | prudyntctl json - 2>/dev/null \
+			| grep -qE "\"mic_muted\": *$1" && return 0
+		_n=$((_n + 1)); usleep 50000
+	done
+	log "physical-privacy: mic_muted '$1' not confirmed (prudyntctl; 0007 binary deployed?)"
+	return 1
+}
+mic_mute()    { mic_set true; }
+mic_restore() { mic_set false; }
+
+# ---- commands ------------------------------------------------------------
+do_on() {
+	acquire_lock || return 0                      # a transition is already running -> ignore
+	# Idempotent: already private (armed, or persisted active across a reboot).
+	if is_armed || [ "$(st_active)" = "true" ]; then release_lock; return 0; fi
+
+	PT=$(st_pose_tilt)
+	SY=$(get_tilt)
+	case "$SY" in
+		'' | *[!0-9-]*)
+			SY=$(home_tilt); [ -n "$SY" ] || SY=$DEFAULT_HOME_TILT
+			log "warning: tilt unreadable on enter; saving fallback $SY"
+			;;
+	esac
+	MODE=$(dn_mode)                               # intent (auto/day/night) BEFORE we freeze
+	# Derive the live latch from the INTENT for forced modes (reliable) and read the
+	# lagging /run file only for auto. This stops a transient/empty daynight_mode from
+	# mis-saving LIVE=day for a forced-night camera (which would skip the exit IR restore
+	# and persist the wrong force_mode).
+	case "$MODE" in
+		day | night) LIVE="$MODE" ;;
+		*) LIVE=$(dn_live) ;;
+	esac
+
+	# Persist active=true + snapshot FIRST, and ABORT if it fails. The emitter guard
+	# (/usr/sbin/light, /sbin/daynight) keys on this persisted flag, so arming without it
+	# would leave the guard OPEN at the pose (a full overlay is a live condition here).
+	# Fail safe: don't arm, don't park, leave the lens at the scene (no warming).
+	if ! write_on "$PT" "$SY" "$MODE" "$LIVE"; then
+		release_lock
+		log "do_on: state write failed (overlay full?) — NOT arming (guard would be open)"
+		return 0
+	fi
+
+	# Freeze the CURRENT mode (no day<->night switch): disable auto if on and pin
+	# force_mode=LIVE. After write_on armed the guard, every NEW /sbin/daynight run is
+	# privacy-aware (drives IR off); freezing ensures no new switch spawns at all. The
+	# only residual emitter source is an in-flight daynight child started a hair before
+	# write_on (it read active=false -> ir_want=on, retries ~150ms).
+	freeze_daynight "$LIVE"
+
+	# Assert emitters OFF, VERIFIED (read-back retry), so the off OUTLASTS that in-flight
+	# child. Independent of the LIVE read; a no-op in day; pure runtime GPIO, no persisted
+	# LED state -> normal night/day untouched. Done before the lens moves -> no warming.
+	light_verified ir off
+	light_verified white off
+
+	# Mute the mic at the SOURCE (software PCM zero in prudynt) so no audio is streamed
+	# while private. Runtime only, no restart, no flash; no position/race dependency, so a
+	# single synchronous call is enough (best-effort — never blocks the lens park).
+	mic_mute
+
+	# Detached transition: park the lens (verified), RE-ASSERT emitters off AT the pose
+	# (deterministic last-writer — no new switch can spawn now and any in-flight one is
+	# long done), THEN arm. So "armed" implies the lens is parked AND no emitter is lit.
+	# The lock (busy) is held throughout, so concurrent changes are dropped until parked.
+	( waiter_claim
+	  seek_tilt "$PT"
+	  light_verified white off
+	  light_verified ir off
+	  arm
+	) </dev/null >/dev/null 2>&1 &
+	echo "$!" >"$LOCK/pid" 2>/dev/null            # backup: same pid the waiter records
+	return 0
+}
+
+do_off() {
+	acquire_lock || return 0
+	if ! is_armed && [ "$(st_active)" != "true" ]; then release_lock; return 0; fi
+
+	SY=$(st_saved_tilt)
+	MODE=$(st_saved_mode)                          # pre-privacy intent (auto/day/night)
+	# Capture the live latch BEFORE write_off rewrites $STATE (it drops the "saved"
+	# block, so a later st_live_mode would read empty -> "day").
+	LIVE=$(st_live_mode); case "$LIVE" in night) ;; *) LIVE=day ;; esac
+
+	# Detached recovery. CRITICAL ordering: keep BOTH the persisted guard (active=true)
+	# AND the /run armed marker until the lens has VERIFIABLY returned to the SAVED tilt,
+	# and only THEN write_off (lift guard) + disarm + restore. Lifting the guard while the
+	# lens still faces the body would let a concurrent actor (auto twilight flip, an HA
+	# "ir on", the boot apply) light IR at the pose and warm the sensor.
+	#  - Success = ARRIVAL at the saved tilt (|cur-SY|<=POS_TOL), NOT "left the pose"
+	#    (which deadlocks when the saved viewing tilt ~= the privacy pose, e.g. set-pose
+	#    near the normal angle). seek_tilt's rc is untrusted (0 even on exhausted retries).
+	#  - Corrupt/empty saved tilt is unrecoverable -> best-effort home then fail OPEN, so
+	#    the unit is never wedged with no software escape.
+	#  - Stuck/unreadable motor -> fail CLOSED (both flags stay, IR off; a retried off
+	#    recovers). No AE settle / mode switch: the mode was frozen, never changed.
+	( waiter_claim
+	  clear=0
+	  case "$SY" in
+	    '' | *[!0-9-]*)
+	      fb=$(home_tilt); case "$fb" in '' | *[!0-9-]*) fb=$DEFAULT_HOME_TILT ;; esac
+	      seek_tilt "$fb"; clear=1               # snapshot unrecoverable -> best-effort home, fail OPEN
+	      ;;
+	    *)
+	      seek_tilt "$SY"; cur=$(get_tilt)        # confirm ARRIVAL at saved tilt
+	      case "$cur" in
+	        '' | *[!0-9-]*) cur='(unreadable)' ;; # unreadable -> fail closed (a retried off recovers)
+	        *) d=$((cur - SY)); ad=${d#-}; [ "$ad" -le "$POS_TOL" ] && clear=1 ;;
+	      esac
+	      ;;
+	  esac
+	  if [ "$clear" = 1 ]; then
+	    if write_off "$(st_pose_tilt)"; then      # ONLY disarm if the guard was actually lifted
+	      disarm                                  # active=false + armed cleared, together
+	      [ "$LIVE" = "night" ] && light_verified ir on # verified IR restore (bypasses daynight dedup)
+	      [ "$MODE" = "auto" ] && set_daynight auto      # re-enable auto if it was auto (self-heals)
+	      mic_restore                                    # unmute audio (only once privacy verifiably lifted)
+	    else
+	      # State write FAILED (overlay full). Keep BOTH active=true AND armed so motors +
+	      # do_guard keep treating commands as cancel-privacy and the light guard keeps IR
+	      # off; a retried off recovers once flash frees. Don't restore IR — guard refuses.
+	      log "do_off: state write failed (overlay full?) — privacy kept ARMED, IR off"
+	    fi
+	  else
+	    log "do_off: lens did not return to saved tilt (cur=$cur saved=$SY) — privacy kept ARMED, IR off"
+	  fi
+	) </dev/null >/dev/null 2>&1 &
+	echo "$!" >"$LOCK/pid" 2>/dev/null
+	return 0
+}
+
+do_reenter() {  # boot re-park; uses the persisted snapshot, takes none
+	[ "$(st_active)" = "true" ] || return 0
+	acquire_lock || return 0
+	if is_armed; then release_lock; return 0; fi  # already re-parked this boot
+
+	# Privacy survived a reboot. The persisted active flag already makes the guard
+	# keep emitters off (/usr/sbin/light) and the executor drive IR off in night, so
+	# the boot day/night apply cannot warm the camera. Re-park the lens, asserting the
+	# emitters off first (off is always allowed by the guard) as belt-and-suspenders,
+	# and re-mute the mic (the mute flag is runtime-only, so a fresh prudynt start comes up
+	# unmuted until this fires — the accepted boot/restart window).
+	PT=$(st_pose_tilt)
+	( waiter_claim
+	  light_verified white off
+	  light_verified ir off
+	  mic_mute
+	  seek_tilt "$PT"
+	  arm
+	) </dev/null >/dev/null 2>&1 &
+	echo "$!" >"$LOCK/pid" 2>/dev/null
+	return 0
+}
+
+# guard: called by the day/night choke points. Exit 0 = caller may proceed;
+# non-zero = caller MUST drop the command (privacy was transitioning or active).
+do_guard() {
+	if lock_busy; then return 1; fi               # transition running -> drop, don't interrupt
+	# Cancel privacy on the armed marker OR the persisted active flag — a fail-closed
+	# do_off can leave active=true with the /run armed marker gone; keying on both
+	# ensures a day/night change or motor move still cancels privacy in that state.
+	if is_armed || [ "$(st_active)" = "true" ]; then do_off; return 1; fi
+	return 0
+}
+
+do_status() {
+	printf 'active=%s armed=%s busy=%s pose_tilt=%s saved_tilt=%s saved_mode=%s\n' \
+		"$(st_active)" "$(is_armed && echo yes || echo no)" \
+		"$(lock_busy && echo yes || echo no)" \
+		"$(st_pose_tilt)" "$(st_saved_tilt)" "$(st_saved_mode)"
+}
+
+do_set_pose() {  # store the current tilt as the privacy pose (privacy must be off)
+	if is_armed || [ "$(st_active)" = "true" ]; then
+		echo "set-pose: turn physical privacy off first" >&2; return 1
+	fi
+	PY=$(get_tilt)
+	case "$PY" in '' | *[!0-9-]*) echo "set-pose: cannot read tilt from motors" >&2; return 1 ;; esac
+	write_off "$PY"
+	echo "physical privacy pose tilt set to $PY"
+}
+
+case "$1" in
+	on)        do_on ;;
+	off)       do_off ;;
+	reenter)   do_reenter ;;
+	guard)     do_guard; exit $? ;;
+	status)    do_status ;;
+	set-pose)  do_set_pose; exit $? ;;
+	*)
+		echo "Usage: $0 {on|off|reenter|guard|status|set-pose}"
+		exit 1
+		;;
+esac
+
+exit 0

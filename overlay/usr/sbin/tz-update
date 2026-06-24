@@ -1,0 +1,108 @@
+#!/bin/sh
+# tz-update - resolve a uClibc-safe POSIX TZ string for the configured timezone and
+# write /etc/TZ ONLY when it changes.
+#
+# Why: uClibc-ng's POSIX-TZ parser rejects a DST transition hour > 24 (the glibc
+# extended form, e.g. Asia/Jerusalem "...,M3.4.4/26,..." or Gaza/Hebron "/50",
+# Fiji "/99") and falls the WHOLE zone back to UTC. This repairs that:
+#   - Asia/Jerusalem : emit the EXACT rule for the current year,
+#         IST-2IDT,J<n>/2,M10.5.0/2
+#     where n = 59 + day-of-month of the Friday before March's last Sunday.
+#     (J<n> skips Feb 29 so n is stable; the Oct end M10.5.0/2 is always exact.)
+#   - Any other zone with an hour > 24 : carry whole days into the weekday so it
+#     parses (generic fallback; approximate only near rare week-boundary years).
+#   - Every other zone : passed through byte-for-byte (untouched).
+#
+# Modes:
+#   boot  - from S01timezone (clock may be the build-date fallback, pre-NTP).
+#           Conservative: if /etc/TZ already resolves to a real (non-UTC) zone,
+#           leave it and let the NTP callback refine the year -> no needless writes.
+#   sync  - from /etc/ntpd_callback once the clock is correct (and periodically).
+#           Authoritative: recompute + write-on-change (~1 write/year at rollover).
+#
+# Usage: tz-update [boot|sync]
+
+TZCODE_FILE="/etc/TZ"
+TZJSON_FILE="/usr/share/tz.json"
+TZNAME_FILE="/etc/timezone"
+
+mode="${1:-sync}"
+
+# --- exact Israel spring rule for the current year -> Julian day number --------------
+# 12:00 noon dodges any midnight/TZ edge, so the day-of-week / day-of-month are correct
+# regardless of the (possibly wrong) current $TZ. Uses %d (leap-safe), never %j.
+israel_spring_jn() {
+	_y=$(date -u +%Y 2>/dev/null) || return 1
+	_e=$(date -u -d "${_y}-03-31 12:00:00" +%s 2>/dev/null) || return 1
+	[ -n "$_e" ] || return 1
+	while [ "$(date -u -d "@${_e}" +%w 2>/dev/null)" != "0" ]; do
+		_e=$((_e - 86400))               # step back to March's last Sunday
+	done
+	_e=$((_e - 172800))                      # last Sunday -> the Friday before it
+	_dom=$(date -u -d "@${_e}" +%d 2>/dev/null) || return 1
+	_dom=${_dom#0}                           # strip leading zero (avoid octal); days are 01..31
+	[ -n "$_dom" ] || return 1
+	echo $((59 + _dom))                      # 59 = Jan(31)+Feb(28)
+}
+
+# --- generic fallback: carry whole days into the weekday for any Mm.w.d/H with H>24 ---
+sanitize_hours() {
+	echo "$1" | awk '
+	function fix(f,   mwd, h, q, m, w, d, nd, nh) {
+		if (f ~ /^M[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+/) {
+			split(f, mwd, "/"); h = mwd[2] + 0
+			if (h > 24) {
+				split(mwd[1], q, "."); m = substr(q[1], 2) + 0; w = q[2] + 0; d = q[3] + 0
+				nd = d + int(h / 24); nh = h % 24
+				if (nd > 6) { nd = d; nh = 24 }     # week overflow -> clamp to /24
+				return "M" m "." w "." nd "/" nh
+			}
+		}
+		return f
+	}
+	{ n = split($0, a, ","); o = ""; for (i = 1; i <= n; i++) o = (i == 1) ? fix(a[i]) : o "," fix(a[i]); print o }'
+}
+
+# --- does the string carry a uClibc-unsafe hour (25..169)? ---------------------------
+needs_fix() {
+	echo "$1" | grep -qE '/(2[5-9]|[3-9][0-9]|1[0-6][0-9])([,:]|$)'
+}
+
+# --- look up the raw POSIX string for a zone name in tz.json -------------------------
+lookup_tzjson() {
+	[ -f "$TZJSON_FILE" ] || return 1
+	sed 's/},{/\n/g' "$TZJSON_FILE" | sed 's/^\[{//;s/}\]$//' |
+		sed 's/"n":"\([^"]*\)","v":"\([^"]*\)"/\1:\2/' |
+		grep -F "$1:" | head -1 | cut -d: -f2-
+}
+
+# --- resolve a raw POSIX string to a uClibc-safe one ---------------------------------
+resolve_tz() {   # $1 = zone name, $2 = raw posix string
+	case "$1" in
+	Asia/Jerusalem)
+		_jn=$(israel_spring_jn) && [ -n "$_jn" ] && { echo "IST-2IDT,J${_jn}/2,M10.5.0/2"; return; }
+		;;                                   # date math failed -> fall through to generic
+	esac
+	if needs_fix "$2"; then sanitize_hours "$2"; else echo "$2"; fi
+}
+
+tzname=$(cat "$TZNAME_FILE" 2>/dev/null)
+[ -n "$tzname" ] || exit 0
+
+# Boot mode: trust an already-valid /etc/TZ (let the NTP callback refine the year).
+if [ "$mode" = "boot" ]; then
+	_z=$(TZ="$(cat "$TZCODE_FILE" 2>/dev/null)" date +%Z 2>/dev/null)
+	case "$_z" in
+	"" | UTC | GMT) : ;;                     # missing / broken / genuine-UTC base -> resolve now
+	*) exit 0 ;;                             # already a real zone -> leave it untouched
+	esac
+fi
+
+raw=$(lookup_tzjson "$tzname")
+[ -n "$raw" ] || exit 0
+
+new=$(resolve_tz "$tzname" "$raw")
+[ -n "$new" ] || exit 0
+[ "$new" = "$(cat "$TZCODE_FILE" 2>/dev/null)" ] && exit 0   # write-on-change only
+
+printf '%s\n' "$new" > "$TZCODE_FILE" && export TZ="$new"

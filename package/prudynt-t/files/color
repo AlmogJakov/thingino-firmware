@@ -4,16 +4,29 @@
 MODE_FILE="/tmp/colormode.txt"
 [ -f "$MODE_FILE" ] || touch "$MODE_FILE"
 
-# NB! ISP mode is set backwards: 0 - color, 1 - monochrome
+# running_mode: 0 = color, 1 = monochrome.
+# NB! We drive prudynt directly via prudyntctl (local control socket) instead of
+# `imp-control`, because imp-control POSTs to prudynt's HTTP API which requires
+# auth (http.auth_required=true) and sends no credentials -> every write 401s and
+# the mode never changes. prudyntctl has no such problem.
 
 switch_to_color() {
-	imp-control color on
-	echo "1" >"$MODE_FILE"
+	# Idempotent: skip the prudyntctl IPC when already in color. Under a
+	# day/night switch the executor runs twice (manual + prudynt worker); the
+	# second call is a no-op here, avoiding a redundant ISP reconfig/IPC.
+	[ "$(cat "$MODE_FILE" 2>/dev/null)" = "1" ] && return 0
+	# Record the new mode ONLY if the IPC actually succeeded, so a failed switch
+	# isn't cached and the next (idempotent) call still retries it.
+	if echo '{"image":{"running_mode":0}}' | prudyntctl json - >/dev/null 2>&1; then
+		echo "1" >"$MODE_FILE"
+	fi
 }
 
 switch_to_monochrome() {
-	imp-control color off
-	echo "0" >"$MODE_FILE"
+	[ "$(cat "$MODE_FILE" 2>/dev/null)" = "0" ] && return 0
+	if echo '{"image":{"running_mode":1}}' | prudyntctl json - >/dev/null 2>&1; then
+		echo "0" >"$MODE_FILE"
+	fi
 }
 
 case "$1" in

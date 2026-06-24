@@ -90,12 +90,22 @@ else
 	ha_clear_disc switch ircut
 fi
 
-# Select: Day/Night mode
+# Select: Day/Night mode (target: auto / day / night)
 if ha_entity_enabled daynight; then
 	ha_pub_disc select daynight \
-		"{\"name\":\"Day\\/Night Mode\",\"unique_id\":\"thingino_${HA_CAMERA_ID}_daynight\",\"state_topic\":\"${ST}/daynight/state\",\"command_topic\":\"${ST}/daynight/set\",\"options\":[\"day\",\"night\"],\"icon\":\"mdi:theme-light-dark\",\"availability\":${AVAIL_JSON},\"device\":${DEVICE_JSON}}"
+		"{\"name\":\"Day\\/Night Mode\",\"unique_id\":\"thingino_${HA_CAMERA_ID}_daynight\",\"state_topic\":\"${ST}/daynight/state\",\"command_topic\":\"${ST}/daynight/set\",\"options\":[\"auto\",\"day\",\"night\"],\"icon\":\"mdi:theme-light-dark\",\"availability\":${AVAIL_JSON},\"device\":${DEVICE_JSON}}"
 else
 	ha_clear_disc select daynight
+fi
+
+# Sensor: actual Day/Night status (read-only). Reflects the live mode the
+# camera is currently in (day/night) regardless of the auto/day/night
+# selection above. Sourced from /run/prudynt/daynight_mode.
+if ha_entity_enabled daynight_status; then
+	ha_pub_disc sensor daynight_status \
+		"{\"name\":\"Day\\/Night Status\",\"unique_id\":\"thingino_${HA_CAMERA_ID}_daynight_status\",\"state_topic\":\"${ST}/daynight_status/state\",\"icon\":\"mdi:theme-light-dark\",\"availability\":${AVAIL_JSON},\"device\":${DEVICE_JSON}}"
+else
+	ha_clear_disc sensor daynight_status
 fi
 
 # Switch: Privacy screen
@@ -104,6 +114,15 @@ if ha_entity_enabled privacy; then
 		"{\"name\":\"Privacy Screen\",\"unique_id\":\"thingino_${HA_CAMERA_ID}_privacy\",\"state_topic\":\"${ST}/privacy/state\",\"command_topic\":\"${ST}/privacy/set\",\"payload_on\":\"ON\",\"payload_off\":\"OFF\",\"icon\":\"mdi:eye-off\",\"availability\":${AVAIL_JSON},\"device\":${DEVICE_JSON}}"
 else
 	ha_clear_disc switch privacy
+fi
+
+# Switch: Physical Privacy (tilt the lens away + force day; no video overlay).
+# Only published when the camera has motors (PTZ).
+if ha_entity_enabled physical_privacy && [ -x /sbin/physical-privacy ] && command -v motors >/dev/null 2>&1; then
+	ha_pub_disc switch physical_privacy \
+		"{\"name\":\"Physical Privacy\",\"unique_id\":\"thingino_${HA_CAMERA_ID}_physical_privacy\",\"state_topic\":\"${ST}/physical_privacy/state\",\"command_topic\":\"${ST}/physical_privacy/set\",\"payload_on\":\"ON\",\"payload_off\":\"OFF\",\"icon\":\"mdi:eye-off-outline\",\"availability\":${AVAIL_JSON},\"device\":${DEVICE_JSON}}"
+else
+	ha_clear_disc switch physical_privacy
 fi
 
 # Switch: Color mode
@@ -138,6 +157,15 @@ else
 	ha_clear_disc switch white
 fi
 
+# Switch: Microphone (software mute via prudynt's runtime mic_muted flag, 0007 patch).
+# ON = mic live (unmuted), OFF = muted. RAM-only, no audio restart, no flash write.
+if ha_entity_enabled mic; then
+	ha_pub_disc switch mic \
+		"{\"name\":\"Microphone\",\"unique_id\":\"thingino_${HA_CAMERA_ID}_mic\",\"state_topic\":\"${ST}/mic/state\",\"command_topic\":\"${ST}/mic/set\",\"payload_on\":\"ON\",\"payload_off\":\"OFF\",\"icon\":\"mdi:microphone\",\"availability\":${AVAIL_JSON},\"device\":${DEVICE_JSON}}"
+else
+	ha_clear_disc switch mic
+fi
+
 # Sensor: Gain
 if ha_entity_enabled gain; then
 	ha_pub_disc sensor gain \
@@ -152,6 +180,27 @@ if ha_entity_enabled rssi; then
 		"{\"name\":\"WiFi Signal\",\"unique_id\":\"thingino_${HA_CAMERA_ID}_rssi\",\"state_topic\":\"${ST}/rssi/state\",\"unit_of_measurement\":\"dBm\",\"device_class\":\"signal_strength\",\"state_class\":\"measurement\",\"availability\":${AVAIL_JSON},\"device\":${DEVICE_JSON}}"
 else
 	ha_clear_disc sensor rssi
+fi
+
+# Sensor: Config storage (overlay) usage — diagnostic. The writable config
+# overlay is a small jffs2 partition; surface its used% so HA can alert BEFORE
+# it fills and blocks config writes (which silently desyncs switches). Value is
+# a read-only df, so this monitor never itself writes flash.
+if ha_entity_enabled overlay_used; then
+	ha_pub_disc sensor overlay_used \
+		"{\"name\":\"Config Storage Used\",\"unique_id\":\"thingino_${HA_CAMERA_ID}_overlay_used\",\"state_topic\":\"${ST}/overlay_used/state\",\"unit_of_measurement\":\"%\",\"state_class\":\"measurement\",\"entity_category\":\"diagnostic\",\"icon\":\"mdi:harddisk\",\"availability\":${AVAIL_JSON},\"device\":${DEVICE_JSON}}"
+else
+	ha_clear_disc sensor overlay_used
+fi
+
+# Binary sensor: Shabbat Ready — ON only when the camera is in a Shabbat-suitable
+# static state: motion detection OFF and day/night FORCED (not auto). Read-only
+# indicator (no command_topic); the conditions are set via the existing controls.
+if ha_entity_enabled shabbat; then
+	ha_pub_disc binary_sensor shabbat \
+		"{\"name\":\"Shabbat Ready\",\"unique_id\":\"thingino_${HA_CAMERA_ID}_shabbat\",\"state_topic\":\"${ST}/shabbat/state\",\"payload_on\":\"ON\",\"payload_off\":\"OFF\",\"icon\":\"mdi:candle\",\"availability\":${AVAIL_JSON},\"device\":${DEVICE_JSON}}"
+else
+	ha_clear_disc binary_sensor shabbat
 fi
 
 # Button: Snapshot
@@ -186,10 +235,25 @@ else
 	ha_clear_disc update firmware
 fi
 
-# PTZ: always cleared (handled by dedicated ONVIF/RTSP integrations)
-for _dir in up down left right home; do
-	ha_clear_disc button "ptz_${_dir}"
-done
+# Buttons: PTZ motors (pan/tilt). Published automatically whenever this camera
+# has a motor driver (the `motors` command); driven locally by ha-commands (no
+# ONVIF/HTTP dependency). Hardware-gated so fixed cameras stay clean.
+if command -v motors >/dev/null 2>&1; then
+	ha_pub_disc button ptz_up \
+		"{\"name\":\"PTZ Up\",\"unique_id\":\"thingino_${HA_CAMERA_ID}_ptz_up\",\"command_topic\":\"${ST}/ptz_up/set\",\"payload_press\":\"PRESS\",\"icon\":\"mdi:arrow-up-bold\",\"availability\":${AVAIL_JSON},\"device\":${DEVICE_JSON}}"
+	ha_pub_disc button ptz_down \
+		"{\"name\":\"PTZ Down\",\"unique_id\":\"thingino_${HA_CAMERA_ID}_ptz_down\",\"command_topic\":\"${ST}/ptz_down/set\",\"payload_press\":\"PRESS\",\"icon\":\"mdi:arrow-down-bold\",\"availability\":${AVAIL_JSON},\"device\":${DEVICE_JSON}}"
+	ha_pub_disc button ptz_left \
+		"{\"name\":\"PTZ Left\",\"unique_id\":\"thingino_${HA_CAMERA_ID}_ptz_left\",\"command_topic\":\"${ST}/ptz_left/set\",\"payload_press\":\"PRESS\",\"icon\":\"mdi:arrow-left-bold\",\"availability\":${AVAIL_JSON},\"device\":${DEVICE_JSON}}"
+	ha_pub_disc button ptz_right \
+		"{\"name\":\"PTZ Right\",\"unique_id\":\"thingino_${HA_CAMERA_ID}_ptz_right\",\"command_topic\":\"${ST}/ptz_right/set\",\"payload_press\":\"PRESS\",\"icon\":\"mdi:arrow-right-bold\",\"availability\":${AVAIL_JSON},\"device\":${DEVICE_JSON}}"
+	ha_pub_disc button ptz_home \
+		"{\"name\":\"PTZ Home\",\"unique_id\":\"thingino_${HA_CAMERA_ID}_ptz_home\",\"command_topic\":\"${ST}/ptz_home/set\",\"payload_press\":\"PRESS\",\"icon\":\"mdi:home\",\"availability\":${AVAIL_JSON},\"device\":${DEVICE_JSON}}"
+else
+	for _dir in up down left right home; do
+		ha_clear_disc button "ptz_${_dir}"
+	done
+fi
 
 # Flush all queued discovery publishes with rate limiting.
 ha_pub_flush

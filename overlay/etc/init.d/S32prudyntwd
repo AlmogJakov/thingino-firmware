@@ -1,0 +1,439 @@
+#!/bin/sh
+#
+# S32prudyntwd - prudynt RTSP stream watchdog (life-safety: Sonoff PT2 / T23).
+# Recovers a dead/streamless/wedged prudynt without ever disturbing one that is
+# still bootstrapping: pidof-liveness gate + monotonic /proc/uptime startup grace;
+# the RTSP OPTIONS probe only classifies serving-vs-not and is never itself a
+# trigger. Backstop: RESTART_LIMIT warranted restarts -> reboot (T23 VPU wedge).
+# Full rationale: PT2-FIX-SET.md.
+
+RTSP_URL="rtsp://thingino:thingino@127.0.0.1/ch0"
+PID_FILE="/run/rtsp_watchdog.pid"     # our OWN pidfile (allowed); NOT a status marker
+PORTAL_MODE_FLAG="/run/portal_mode"
+PRUDYNT_INIT="/etc/init.d/S31prudynt"
+
+# --- tunables (justification in the accompanying notes) --------------------
+
+# Normal full-check period once healthy. Independent K99 (~60s) is not starved
+# by this; we keep the cycle near that budget to bound recovery latency.
+INTERVAL=60
+
+# Faster re-evaluation once we are actively recovering (RESTART_COUNT>0), so the
+# warranted-restart budget reaches the reboot backstop in minutes, not many.
+RECOVER_INTERVAL=20
+
+# OPTIONS probe attempts per cycle before declaring "not serving THIS cycle".
+RETRY_COUNT=2
+RETRY_DELAY=5
+
+# Per-probe hard timeout (applies to curl AND to nc).
+CHECK_TIMEOUT=5
+
+# Startup / post-relaunch GRACE (seconds), measured monotonically. MUST exceed
+# the worst-case HEALTHY bringup. With 0009: serial ch0(45s)+ch1(45s) ~= 90s,
+# plus cold/power-cut sensor IMP init (M1: wait_for_sensor_resolution +
+# add_sensor_with_retry can add real time). 200s puts the worst-case cold-boot
+# bringup well inside the window with margin (directive floor was ~120-150s; we
+# sit above it because the documented failure mode is "slow healthy bringup").
+# RAISE, NEVER LOWER, and pin to an on-device cold-boot + restart measurement.
+GRACE=200
+
+# Number of CONSECUTIVE not-serving cycles PAST grace before we treat an ALIVE
+# prudynt as wedged and restart it. >1 so a single transient slow cycle on a
+# working-but-loaded stream cannot trigger a needless restart.
+DOWN_STREAK_LIMIT=2
+
+# Consecutive serving cycles required to declare SUSTAINED recovery and reset the
+# warranted-restart counter. >1 so a single flukey OPTIONS 200 from a
+# flapping/run-then-die prudynt cannot silently re-arm the full reboot budget.
+HEALTHY_STREAK_LIMIT=2
+
+# Warranted restarts (process-gone OR alive-past-grace) without SUSTAINED
+# recovery before escalating to reboot (T23 VPU wedge is reboot-only).
+RESTART_LIMIT=3
+
+# Seconds to wait, then re-check, before treating a GONE observation as real.
+# Absorbs the start-stop-daemon fork race and an external `service restart
+# prudynt` (day/night, MQTT, web-UI) kill+reclaim window so we do not double-drive.
+GONE_CONFIRM_DELAY=5
+
+RTSP_HOST=""
+RTSP_PORT=""
+PID=""
+
+# --- process-local state (held in the backgrounded watch() subshell; NO new
+#     /run files). -------------------------------------------------------------
+RESTART_COUNT=0       # warranted restarts since last SUSTAINED-healthy reset
+GRACE_UNTIL=0         # monotonic-uptime second at which the current grace ends
+DOWN_STREAK=0         # consecutive not-serving-past-grace cycles
+HEALTHY_STREAK=0      # consecutive serving cycles
+LAST_LIVE=0           # prudynt_live result from the previous iteration (0/1)
+STREAMER_WAS_DISABLED=0
+
+is_streamer_disabled() {
+	[ "true" = "$disable_streamer" ] || [ -f "$PORTAL_MODE_FLAG" ]
+}
+
+# Integer seconds of monotonic uptime from /proc/uptime field 1. Pure parameter
+# expansion (no 'date', no octal-leading-zero arithmetic trap). On read failure
+# prints nothing and returns 1 so callers can fail SAFE per their own context
+# (within_grace -> stay protected; do not invent a recovery from a /proc hiccup).
+uptime_secs() {
+	local _u _whole
+	_u=$(cat /proc/uptime 2>/dev/null) || return 1
+	[ -n "$_u" ] || return 1
+	_u=${_u%% *}        # "12345.67" -> "12345.67" trimmed of any trailing fields
+	_whole=${_u%%.*}    # "12345.67" -> "12345"
+	case "$_whole" in
+		''|*[!0-9]*) return 1 ;;   # unparseable -> signal failure to caller
+	esac
+	printf '%s\n' "$_whole"
+}
+
+# Re-arm the grace window: a fresh prudynt is bootstrapping NOW; give it GRACE
+# monotonic seconds before its OPTIONS state can trigger anything. If uptime is
+# unreadable we keep the OLD deadline rather than poison it with a bad base.
+arm_grace() {
+	local _now
+	_now=$(uptime_secs) || return 0
+	GRACE_UNTIL=$(( _now + GRACE ))
+}
+
+# True (0) while inside the grace window. FAIL-SAFE: if uptime is unreadable we
+# return TRUE (stay protected / do nothing this cycle) -- a transient /proc
+# hiccup is NOT evidence prudynt is wedged, and the GONE path (which does not
+# consult uptime) remains the unconditional recovery trigger for a dead process.
+within_grace() {
+	local _now
+	_now=$(uptime_secs) || return 0   # unreadable -> treat as within grace (safe)
+	[ "$_now" -lt "$GRACE_UNTIL" ]
+}
+
+# True (0) if a genuinely LIVE (non-zombie) prudynt exists. Mirrors S31prudynt's
+# pid_live: a 'D' (uninterruptible) prudynt counts as ALIVE; only Z/X/x are gone.
+prudynt_live() {
+	local _p _rest _state
+	for _p in $(pidof prudynt 2>/dev/null); do
+		[ -n "$_p" ] || continue
+		if [ -r "/proc/$_p/stat" ]; then
+			_rest=$(cat "/proc/$_p/stat" 2>/dev/null)
+			_rest=${_rest##*) }
+			_state=${_rest%% *}
+			case "$_state" in
+				Z|X|x) continue ;;   # defunct / dead -> not a live instance
+			esac
+		fi
+		return 0
+	done
+	return 1
+}
+
+parse_rtsp_endpoint() {
+	local url="${RTSP_URL#rtsp://}"
+	local creds_trim="${url##*@}"
+	local host_port="${creds_trim%%/*}"
+	if [ -z "$host_port" ]; then
+		return 1
+	fi
+	if echo "$host_port" | grep -q ':'; then
+		RTSP_HOST="${host_port%%:*}"
+		RTSP_PORT="${host_port##*:}"
+	else
+		RTSP_HOST="$host_port"
+		RTSP_PORT=554
+	fi
+	[ -n "$RTSP_HOST" ] && [ -n "$RTSP_PORT" ]
+}
+
+check_with_curl() {
+	curl -s --max-time "$CHECK_TIMEOUT" --fail -X OPTIONS "$RTSP_URL" >/dev/null 2>&1
+}
+
+check_with_nc() {
+	[ -n "$RTSP_HOST" ] || parse_rtsp_endpoint || return 1
+	# Do NOT capture the request in $(...): command substitution strips trailing
+	# newlines, truncating the terminating CRLF so the request ends "...\r\n\r"
+	# instead of "...\r\n\r\n". live555 then waits for the rest of the request and
+	# never replies, so the probe FALSE-FAILS on a healthy stream. Pipe printf
+	# straight into nc so the full \r\n\r\n terminator reaches the server.
+	printf 'OPTIONS %s RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: stream-watchdog\r\n\r\n' "$RTSP_URL" \
+		| timeout "$CHECK_TIMEOUT" nc -w "$CHECK_TIMEOUT" "$RTSP_HOST" "$RTSP_PORT" 2>/dev/null \
+		| grep -q "RTSP/1.0 200"
+}
+
+# One probe pass: curl, then raw-nc fallback. Classifies serving vs not-serving;
+# never itself a restart trigger (only via the grace + streak gates in watch()).
+check_rtsp_stream() {
+	if check_with_curl; then
+		return 0
+	fi
+	if check_with_nc; then
+		return 0
+	fi
+	return 1
+}
+
+# Up to RETRY_COUNT passes; success on any. Worst-case duration on a fully-down
+# socket: RETRY_COUNT * (curl CHECK_TIMEOUT + nc CHECK_TIMEOUT) + (RETRY_COUNT-1)
+# * RETRY_DELAY = 2*(5+5) + 1*5 = ~25s (well under the K99 ~60s budget, and the
+# nc leg IS counted here -- earlier ~40s claims omitted it).
+probe_serving() {
+	local i
+	i=1
+	while [ "$i" -le "$RETRY_COUNT" ]; do
+		if check_rtsp_stream; then
+			return 0
+		fi
+		echo "Stream Watchdog: probe attempt $i/$RETRY_COUNT failed"
+		[ "$i" -lt "$RETRY_COUNT" ] && sleep "$RETRY_DELAY"
+		i=$((i + 1))
+	done
+	return 1
+}
+
+# Current loop period: tighter while actively recovering so the warranted-restart
+# budget reaches the reboot backstop in a bounded few minutes.
+current_interval() {
+	if [ "$RESTART_COUNT" -gt 0 ]; then
+		echo "$RECOVER_INTERVAL"
+	else
+		echo "$INTERVAL"
+	fi
+}
+
+# Drive a WARRANTED restart via S31prudynt (synchronous: confirm-gone + 15s
+# reclaim + C1 config-heal + start). Branch on its return code:
+#   rc==0 -> a fresh prudynt was actually launched: re-arm the full bootstrap
+#            grace (it deserves a clean bringup budget) and reset DOWN_STREAK.
+#   rc!=0 -> S31 ABORTED (could not confirm death = D-state VPU wedge; nothing
+#            relaunched): do NOT re-arm grace (there is no bringup to protect)
+#            and clear GRACE_UNTIL so the very next cycle is immediately
+#            past-grace and marches straight toward the reboot backstop.
+# Either way the attempt was warranted, so RESTART_COUNT is bumped.
+do_restart() {
+	local _rc
+	echo "Stream Watchdog: restarting prudynt (warranted; count will be $((RESTART_COUNT + 1)))"
+	"$PRUDYNT_INIT" restart
+	_rc=$?
+	RESTART_COUNT=$((RESTART_COUNT + 1))
+	DOWN_STREAK=0
+	HEALTHY_STREAK=0
+	if [ "$_rc" -eq 0 ]; then
+		arm_grace                 # fresh process launched -> protect its bringup
+	else
+		echo "Stream Watchdog: S31prudynt restart aborted (rc=$_rc, undead/wedged) - NOT re-arming grace"
+		GRACE_UNTIL=0             # force next cycle past-grace -> fast escalation
+	fi
+}
+
+# Escalate to reboot after RESTART_LIMIT warranted restarts with no sustained
+# recovery. A true VPU wedge is reboot-only. After issuing reboot we BLOCK so the
+# loop cannot fire more restarts/reboots while the kernel tears down.
+do_reboot() {
+	echo "Stream Watchdog: $RESTART_COUNT warranted restarts without sustained recovery - rebooting (T23 VPU wedge is reboot-only)"
+	sync
+	reboot
+	# reboot() signals init and RETURNS; teardown is async. Do NOT keep looping
+	# (that would re-drive S31 restart and thrash the VPU during shutdown). Park.
+	while true; do
+		sleep 60
+	done
+}
+
+# Confirm a GONE observation is real, not a mid-restart / fork-race transient.
+# Returns 0 only if prudynt is STILL gone after a short bounded re-check.
+confirm_gone() {
+	prudynt_live && return 1
+	sleep "$GONE_CONFIRM_DELAY"
+	prudynt_live && return 1
+	return 0
+}
+
+watch() {
+	local _slept
+
+	# Seed grace from CURRENT uptime so prudynt's first (cold-boot) bringup is
+	# protected. If prudynt is ALREADY up AND serving when we start (e.g. the
+	# watchdog itself was restarted while prudynt was healthy for hours), do NOT
+	# grant a fresh 200s blind window -- expire the grace immediately so we can
+	# act on an established-but-dead prudynt without waiting a full bringup.
+	if prudynt_live && probe_serving; then
+		GRACE_UNTIL=0
+		HEALTHY_STREAK="$HEALTHY_STREAK_LIMIT"
+	else
+		arm_grace
+	fi
+	if prudynt_live; then LAST_LIVE=1; else LAST_LIVE=0; fi
+
+	while true; do
+		# (0) Honor the kill-switch every cycle. While disabled we touch nothing.
+		if is_streamer_disabled; then
+			STREAMER_WAS_DISABLED=1
+			sleep "$INTERVAL"
+			continue
+		fi
+
+		# Leaving a disabled window: prudynt is typically (re)started on
+		# re-enable and needs a fresh bringup. Re-arm grace and reset streaks so
+		# we never treat that legitimate bootstrap as a wedge (the exact original
+		# bug, on the portal-mode-exit edge).
+		if [ "$STREAMER_WAS_DISABLED" -eq 1 ]; then
+			STREAMER_WAS_DISABLED=0
+			arm_grace
+			DOWN_STREAK=0
+			HEALTHY_STREAK=0
+			if prudynt_live; then LAST_LIVE=1; else LAST_LIVE=0; fi
+		fi
+
+		# Detect a NEW prudynt incarnation that appeared without our doing (an
+		# external `service restart prudynt`, or a self-relaunch). It deserves a
+		# fresh bootstrap window so we never restart something legitimately
+		# coming up underneath us.
+		if prudynt_live; then
+			if [ "$LAST_LIVE" -eq 0 ]; then
+				arm_grace
+				DOWN_STREAK=0
+			fi
+			LAST_LIVE=1
+		else
+			LAST_LIVE=0
+
+			# (A) GONE. Confirm it is not a transient restart/fork window, then
+			#     fail-fast restart. Rate-limited by the SAME warranted counter,
+			#     so a deterministic bringup-crash (cold sensor under C2/C5) does
+			#     NOT spin restarts forever -- it climbs to the reboot backstop
+			#     just like any other warranted restart, which on a unit needing
+			#     to physically warm is still the correct eventual action.
+			if confirm_gone; then
+				echo "Stream Watchdog: prudynt process GONE (confirmed) - restarting"
+				do_restart
+				if [ "$RESTART_COUNT" -ge "$RESTART_LIMIT" ]; then
+					do_reboot
+				fi
+				sleep "$(current_interval)"
+				continue
+			fi
+			# Re-check said it is actually alive: fall through and treat as ALIVE.
+			LAST_LIVE=1
+		fi
+
+		# prudynt is ALIVE. Is it actually serving?
+		if probe_serving; then
+			HEALTHY_STREAK=$((HEALTHY_STREAK + 1))
+			DOWN_STREAK=0
+			# SUSTAINED recovery only: a single flukey 200 from a flapping prudynt
+			# must NOT zero the reboot budget. Reset the warranted counter only
+			# after HEALTHY_STREAK_LIMIT consecutive serving cycles.
+			if [ "$HEALTHY_STREAK" -ge "$HEALTHY_STREAK_LIMIT" ]; then
+				RESTART_COUNT=0
+			fi
+			sleep "$(current_interval)"
+			continue
+		fi
+
+		# ALIVE + NOT serving. Decide purely by the monotonic grace + streak.
+		HEALTHY_STREAK=0
+		if within_grace; then
+			# Still bootstrapping: OPTIONS is meaningless here. DO NOTHING. This
+			# is the property that ends the field reboot-loop.
+			echo "Stream Watchdog: prudynt alive, not serving, within startup grace - waiting"
+			DOWN_STREAK=0
+			sleep "$(current_interval)"
+			continue
+		fi
+
+		# ALIVE + not-serving + PAST grace. Require DOWN_STREAK_LIMIT consecutive
+		# such cycles so one transient slow cycle on a loaded-but-working stream
+		# cannot trigger a restart.
+		DOWN_STREAK=$((DOWN_STREAK + 1))
+		if [ "$DOWN_STREAK" -lt "$DOWN_STREAK_LIMIT" ]; then
+			echo "Stream Watchdog: prudynt alive, not serving past grace ($DOWN_STREAK/$DOWN_STREAK_LIMIT) - confirming"
+			sleep "$(current_interval)"
+			continue
+		fi
+
+		echo "Stream Watchdog: prudynt alive but not serving past grace ($DOWN_STREAK cycles) - wedged, restarting"
+		do_restart
+		if [ "$RESTART_COUNT" -ge "$RESTART_LIMIT" ]; then
+			do_reboot
+		fi
+		sleep "$(current_interval)"
+	done
+}
+
+# Read a clean numeric PID from a (possibly junk/partial) pidfile. Empty if not
+# a bare number. /run is tmpfs so this is belt-and-suspenders for a torn write.
+read_wd_pid() {
+	local _p
+	[ -f "$PID_FILE" ] || return 1
+	IFS= read -r _p <"$PID_FILE" 2>/dev/null || return 1
+	_p=${_p%%[!0-9]*}
+	case "$_p" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	printf '%s\n' "$_p"
+}
+
+cleanup() {
+	local _p
+	_p=$(read_wd_pid) || { rm -f "$PID_FILE"; return 0; }
+	# Never self-kill (the trap is inherited by the watch() subshell whose own
+	# PID is what we stored). Only the foreground owner reaps the background loop.
+	if [ "$_p" != "$$" ]; then
+		kill "$_p" 2>/dev/null || true
+	fi
+	rm -f "$PID_FILE"
+}
+
+# Stopping the watchdog must touch nothing but the watchdog. Verify the stored
+# PID is genuinely our backgrounded loop before killing (guard against PID reuse
+# on a stale tmpfs pidfile).
+trap 'echo "Stream Watchdog: Stopping watchdog..."; cleanup; exit 0' INT TERM
+
+start() {
+	echo -c 15 "Starting Stream Watchdog"
+
+	if is_streamer_disabled; then
+		echo "Streamer disabled" >&2
+		exit 1
+	fi
+
+	parse_rtsp_endpoint || true
+
+	watch &
+	PID=$!
+	echo "$PID" >"$PID_FILE"   # store the PID of the background watch() subshell
+}
+
+stop() {
+	echo -c 15 "Stopping Stream Watchdog"
+
+	PID=$(read_wd_pid) || { echo "No valid watchdog PID."; rm -f "$PID_FILE"; return 0; }
+	if kill -0 "$PID" 2>/dev/null; then
+		kill "$PID"
+		echo "Watchdog process stopped."
+	else
+		echo "No running watchdog process found."
+	fi
+	rm -f "$PID_FILE"
+}
+
+case "$1" in
+	start)
+		start
+		;;
+	stop)
+		stop
+		;;
+	restart)
+		stop
+		sleep 1
+		start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+		;;
+esac
+
+exit 0

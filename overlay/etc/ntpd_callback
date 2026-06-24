@@ -12,3 +12,13 @@ grep -E '^(action|freq_drift_ppm|offset|poll_interval|stratum|timestamp)=' | \
 sort > /run/sync_status
 
 [ "$action" = "step" ] || [ "$action" = "stratum" ] && touch /run/sync_success
+
+# Recompute the timezone once the clock is trustworthy: on the initial step and on each
+# periodic poll. tz-update writes /etc/TZ only when the value changes (so this is a cheap
+# no-op except at first sync and at the once-a-year DST-date rollover) and produces a
+# uClibc-safe POSIX string (exact yearly rule for Asia/Jerusalem).
+case "$action" in
+	step | periodic | stratum)
+		[ -x /usr/sbin/tz-update ] && /usr/sbin/tz-update sync
+		;;
+esac

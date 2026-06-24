@@ -54,6 +54,30 @@ case "$type" in
 		;;
 esac
 
+# Physical-privacy guard: while privacy is active the lens faces the camera body,
+# so refuse to switch any IR/white emitter ON (it would warm the sensor). Only the
+# turn-ON paths (on/toggle) are blocked; off/read/gpio are always allowed and
+# normal (non-privacy) operation is untouched. Keyed on the PERSISTED privacy flag
+# so the block also holds at boot, before any /run marker exists. Exits 0 (success)
+# so one-shot callers (e.g. S56ircut) don't error; the day/night executor is
+# itself privacy-aware (drives IR off in night), so it never hits this path.
+case "$type" in
+	ir | ir850 | ir940 | white | flood)
+		case "$mode" in
+			1 | on | ~ | toggle)
+				# Refuse if privacy is active by EITHER signal: the /run armed marker
+				# (runtime) OR the persisted "active":true (survives reboot before /run
+				# exists, and covers an overlay-full entry where the persist failed). The
+				# OR means the guard never depends solely on a flash write having succeeded.
+				if [ -f /run/physical-privacy.armed ] || grep -q '"active":true' /etc/physical-privacy-state.json 2>/dev/null; then
+					echo "light: $type on refused — physical privacy active" >&2
+					exit 0
+				fi
+				;;
+		esac
+		;;
+esac
+
 if [ "true" = "$(get_config_active_low "$type")" ]; then
 	pin_on=0
 	pin_off=1

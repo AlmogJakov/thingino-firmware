@@ -814,9 +814,13 @@ function toggleAudio(device, state) {
   const button = $("#" + device);
   if (button) button.classList.add("pending");
 
-  const param = device === "microphone" ? "mic_enabled" : "spk_enabled";
+  const param = device === "microphone" ? "mic_muted" : "spk_enabled";
+  // Mic button "active" = mic ON = NOT muted, so mic_muted is the inverse of state.
+  // (mic_muted is the 0007 software mute: runtime, no audio-worker restart, unlike
+  // the old mic_enabled which restarted audio and disrupted the stream.)
+  const value = device === "microphone" ? !state : state;
   const payload = JSON.stringify({
-    audio: { [param]: state },
+    audio: { [param]: value },
   });
   console.log(ts(), "===>", payload);
   fetch("/x/json-prudynt.cgi", {
@@ -839,7 +843,7 @@ function toggleAudio(device, state) {
         }
       }
       // Fall back to the known target state
-      updateHeartbeatUi({ [param]: state });
+      updateHeartbeatUi({ [param]: value });
     })
     .catch((err) => {
       console.error("Audio toggle error", err);
@@ -1109,12 +1113,12 @@ function updateHeartbeatUi(json) {
     }
   }
 
-  // Update microphone button
-  if (typeof json.mic_enabled !== "undefined") {
+  // Update microphone button (mic_muted: true = muted => button inactive/mic-mute icon)
+  if (typeof json.mic_muted !== "undefined") {
     const micBtn = $("#microphone");
     if (micBtn) {
       micBtn.classList.remove("pending");
-      const isActive = json.mic_enabled === true;
+      const isActive = json.mic_muted !== true;
       micBtn.classList.toggle("active", isActive);
       const img = micBtn.querySelector("img");
       if (img) {
@@ -1209,6 +1213,27 @@ async function fetchSlowHeartbeatStatus() {
     }
 
     updateHeartbeatUi(await response.json());
+
+    // The agent heartbeat reports mic_enabled (capture on/off), NOT mic_muted (the
+    // software mute the HA entity uses). Poll mic_muted directly so the mic button
+    // reflects HA/MQTT-driven mutes too. Non-fatal if it fails.
+    try {
+      const micResp = await fetch("/x/json-prudynt.cgi", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ audio: { mic_muted: null } }),
+        cache: "no-store",
+        credentials: "same-origin",
+      });
+      if (micResp.ok) {
+        const micData = await micResp.json();
+        if (micData && micData.audio && typeof micData.audio.mic_muted !== "undefined") {
+          updateHeartbeatUi({ mic_muted: micData.audio.mic_muted });
+        }
+      }
+    } catch (micErr) {
+      console.error("mic_muted poll error", micErr);
+    }
   } catch (error) {
     console.error("Slow heartbeat fetch error", error);
   } finally {

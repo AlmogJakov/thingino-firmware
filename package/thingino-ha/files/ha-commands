@@ -15,6 +15,26 @@ prudynt_disable_auto() {
 	printf '{"daynight":{"enabled":false}}' | prudyntctl json - >/dev/null 2>&1
 }
 
+# Physical-privacy interlock for day/night-class changes. Returns 0 if the caller
+# should proceed; non-zero if physical privacy intercepted the command (it was
+# transitioning -> dropped, or armed -> privacy cancelled). On intercept we
+# re-sync HA so the switches reflect the cancellation.
+physpriv_intercept() {
+	[ -x /sbin/physical-privacy ] || return 0
+	/sbin/physical-privacy guard && return 0
+	{ sleep 2; ha-state; } &
+	return 1
+}
+
+# PTZ relative move via the local motors driver (no auth, no HTTP).
+# Mapping per /sbin/ptz-ctrl: Up = -y, Down = +y, Left = -x, Right = +x.
+# Home = motors -r. Step magnitude is configurable via the PTZ_STEP env var.
+PTZ_STEP="${PTZ_STEP:-100}"
+ptz_move() {
+	command -v motors >/dev/null 2>&1 || return 0
+	motors -d g -x "$1" -y "$2" >/dev/null 2>&1
+}
+
 # ---------------------------------------------------------------------------
 # Subscriber command
 # LWT ensures HA sees 'offline' if this connection drops unexpectedly.
@@ -64,25 +84,36 @@ dispatch() {
 			;;
 
 		ircut)
-			prudynt_disable_auto
-			case "$payload" in
-				on|ON|day|1)   ircut on;  ha_pub_state ircut ON  ;;
-				off|OFF|night|0) ircut off; ha_pub_state ircut OFF ;;
-			esac
+			# IR-cut is a day/night-class control, so behave like daynight/color: a manual
+			# change while physical privacy is on means "cancel privacy" (drop this command;
+			# physpriv_intercept re-syncs HA itself). When privacy is off it runs normally.
+			# (No emitter is lit either way — the light guard is the warming enforcement.)
+			if physpriv_intercept; then
+				prudynt_disable_auto
+				case "$payload" in
+					on|ON|day|1)    ircut on;  ha_pub_state ircut ON  ;;
+					off|OFF|night|0) ircut off; ha_pub_state ircut OFF ;;
+				esac
+				{ sleep 2; ha-state; } &
+			fi
 			;;
 
 		daynight)
-			# Use prudyntctl to set force_mode — this controls both ISP processing
-			# and hardware (ircut, LEDs, color) through prudynt's day/night engine.
-			case "$payload" in
-				day|night)
-					printf '{"daynight":{"enabled":false,"force_mode":"%s"}}' "$payload" \
-						| prudyntctl json - >/dev/null 2>&1
-					ha_pub_state daynight "$payload"
-					;;
-			esac
-			# Daynight changes ircut/color/ir850 — re-sync all states after settle
-			{ sleep 2; ha-state; } &
+			# Route through the agent (thingino-agentctl): updates prudynt
+			# runtime AND persisted config, and physically switches via the
+			# configured executor. Supports auto / day / night.
+			# A manual day/night change while physical privacy is on means
+			# "cancel privacy" (drop this command); it re-syncs HA itself.
+			if physpriv_intercept; then
+				case "$payload" in
+					auto|day|night)
+						thingino-agentctl daynight "$payload" >/dev/null 2>&1
+						ha_pub_state daynight "$payload"
+						;;
+				esac
+				# Daynight changes ircut/color/ir850 — re-sync all states after settle
+				{ sleep 2; ha-state; } &
+			fi
 			;;
 
 		privacy)
@@ -98,62 +129,87 @@ dispatch() {
 			esac
 			;;
 
-		color)
-			# running_mode: 0 = color, 1 = monochrome
+		physical_privacy)
+			# Physical privacy: tilt the lens away + force day (no overlay).
+			# Publish optimistically, then re-sync after the move settles so the
+			# day/night entity reflects the forced/restored mode.
 			case "$payload" in
 				on|ON|1)
-					printf '{"daynight":{"enabled":false},"image":{"running_mode":0}}' \
-						| prudyntctl json - >/dev/null 2>&1
-					ha_pub_state color ON
+					ha_pub_state physical_privacy ON
+					/sbin/physical-privacy on >/dev/null 2>&1
+					{ sleep 3; ha-state; } &
 					;;
 				off|OFF|0)
-					printf '{"daynight":{"enabled":false},"image":{"running_mode":1}}' \
-						| prudyntctl json - >/dev/null 2>&1
-					ha_pub_state color OFF
+					ha_pub_state physical_privacy OFF
+					/sbin/physical-privacy off >/dev/null 2>&1
+					{ sleep 3; ha-state; } &
 					;;
 			esac
+			;;
+
+		color)
+			# running_mode: 0 = color, 1 = monochrome. This is a day/night-class
+			# change, so it is interlocked with physical privacy.
+			if physpriv_intercept; then
+				case "$payload" in
+					on|ON|1)
+						printf '{"daynight":{"enabled":false},"image":{"running_mode":0}}' \
+							| prudyntctl json - >/dev/null 2>&1
+						ha_pub_state color ON
+						;;
+					off|OFF|0)
+						printf '{"daynight":{"enabled":false},"image":{"running_mode":1}}' \
+							| prudyntctl json - >/dev/null 2>&1
+						ha_pub_state color OFF
+						;;
+				esac
+			fi
 			;;
 
 		ir850)
 			prudynt_disable_auto
 			case "$payload" in
-				on|ON|1)
-					light ir850 on
-					ha_pub_state ir850 ON
-					;;
-				off|OFF|0)
-					light ir850 off
-					ha_pub_state ir850 OFF
-					;;
+				on|ON|1)  light ir850 on  ;;
+				off|OFF|0) light ir850 off ;;
 			esac
+			# Publish the ACTUAL GPIO state, not the requested one: while physical
+			# privacy is active the light guard refuses the turn-on (exits 0), so a
+			# requested ON physically stays OFF — read it back so HA never desyncs.
+			if [ "$(light ir850 read 2>/dev/null)" = "1" ]; then ha_pub_state ir850 ON; else ha_pub_state ir850 OFF; fi
 			;;
 
 		ir940)
 			prudynt_disable_auto
 			case "$payload" in
-				on|ON|1)
-					light ir940 on
-					ha_pub_state ir940 ON
-					;;
-				off|OFF|0)
-					light ir940 off
-					ha_pub_state ir940 OFF
-					;;
+				on|ON|1)  light ir940 on  ;;
+				off|OFF|0) light ir940 off ;;
 			esac
+			if [ "$(light ir940 read 2>/dev/null)" = "1" ]; then ha_pub_state ir940 ON; else ha_pub_state ir940 OFF; fi
 			;;
 
 		white)
-			prudynt_disable_auto
+			# White LED is a plain visible floodlight — NOT managed by prudynt's
+			# day/night engine (daynight.controls.white=false). Do NOT disable
+			# auto here: that would knock the camera out of auto and surface a
+			# stale force_mode (e.g. flipping to night). Just toggle the GPIO.
 			case "$payload" in
-				on|ON|1)
-					light white on
-					ha_pub_state white ON
-					;;
-				off|OFF|0)
-					light white off
-					ha_pub_state white OFF
-					;;
+				on|ON|1)  light white on  ;;
+				off|OFF|0) light white off ;;
 			esac
+			# Read back the actual state (the privacy guard may have refused ON).
+			if [ "$(light white read 2>/dev/null)" = "1" ]; then ha_pub_state white ON; else ha_pub_state white OFF; fi
+			;;
+
+		mic)
+			# Microphone software mute via prudynt's runtime mic_muted flag (0007 patch):
+			# the audio worker zeros captured PCM with NO restart, so the stream is
+			# undisturbed. RAM only, zero flash. ON = unmuted (live), OFF = muted.
+			case "$payload" in
+				on|ON|1)   echo '{"audio":{"mic_muted":false}}' | prudyntctl json - >/dev/null 2>&1 ;;
+				off|OFF|0) echo '{"audio":{"mic_muted":true}}'  | prudyntctl json - >/dev/null 2>&1 ;;
+			esac
+			# Read back the real flag (privacy mode's mute may override a manual ON).
+			if echo '{"audio":{"mic_muted":null}}' | prudyntctl json - 2>/dev/null | grep -qE '"mic_muted": *true'; then ha_pub_state mic OFF; else ha_pub_state mic ON; fi
 			;;
 
 		snapshot)
@@ -167,6 +223,12 @@ dispatch() {
 		firmware)
 			[ "$payload" = "install" ] && (touch /tmp/webupgrade; sysupgrade -p) &
 			;;
+
+		ptz_up)    ptz_move 0 "-$PTZ_STEP" ;;
+		ptz_down)  ptz_move 0 "$PTZ_STEP" ;;
+		ptz_left)  ptz_move "-$PTZ_STEP" 0 ;;
+		ptz_right) ptz_move "$PTZ_STEP" 0 ;;
+		ptz_home)  command -v motors >/dev/null 2>&1 && motors -r >/dev/null 2>&1 ;;
 
 		*)
 			echo "ha-commands: unknown entity '$entity' (topic: $topic)" >&2

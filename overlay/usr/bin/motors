@@ -1,0 +1,47 @@
+#!/bin/sh
+# motors — physical-privacy interlock wrapper around the real motor client.
+#
+# Deployed at /usr/bin/motors, shadowing the real motor client which the build
+# installs at /usr/bin/motors-bin. Because /bin -> /usr/bin (merged-usr), this
+# also catches /bin/motors (ONVIF) and bare `motors` (PATH) — every caller.
+#
+# Only ACTUATION verbs (-d <h|g|b|s>, -r) are interlocked; status reads (-p, -b)
+# and speed (-s) pass straight through. While physical privacy is:
+#   * transitioning (lock held by a live owner) -> drop, so on/off isn't interrupted;
+#   * armed (steady ON)                          -> a user move cancels privacy
+#                                                   (privacy off), command dropped.
+# Fail-open: privacy not installed/active, or anything unexpected -> straight to
+# the real driver. Motors can never be bricked by this shim.
+
+REAL="/usr/bin/motors-bin"
+
+# Fail-open: if the real client is missing, never loop or hard-fail callers.
+[ -x "$REAL" ] || { logger -t motors "real client $REAL missing" 2>/dev/null; exit 0; }
+
+# The streamer's own moves are marked internal — never interlock them.
+[ "$PHYSPRIV_INTERNAL" = 1 ] && exec "$REAL" "$@"
+
+# Classify by exact option token (not substring): -d and -r actuate the motor;
+# -p/-b (status) and -s (speed) do not.
+actuates=0
+for _a in "$@"; do
+	case "$_a" in
+		-d | -r) actuates=1; break ;;
+	esac
+done
+
+if [ "$actuates" = 1 ]; then
+	if [ -d /run/physical-privacy.lock ]; then
+		bp=$(cat /run/physical-privacy.lock/pid 2>/dev/null)
+		# transition in progress (owner alive) -> drop, don't interrupt it
+		[ -n "$bp" ] && kill -0 "$bp" 2>/dev/null && exit 0
+	fi
+	# Armed-only BY DESIGN (not persisted active=true): boot homing via S59motor must pass so S60 can re-park; an active-flag check here would cancel privacy on every reboot. See PT2-FIX-SET.md.
+	if [ -f /run/physical-privacy.armed ] && [ -x /sbin/physical-privacy ]; then
+		# steady ON -> treat as "cancel privacy"; the original move is dropped
+		/sbin/physical-privacy off
+		exit 0
+	fi
+fi
+
+exec "$REAL" "$@"

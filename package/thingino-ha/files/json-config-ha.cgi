@@ -118,6 +118,7 @@ handle_post() {
 	new_en_gain=$(jct "$REQ_FILE" get enable_gain 2>/dev/null)
 	new_en_rssi=$(jct "$REQ_FILE" get enable_rssi 2>/dev/null)
 	new_en_snapshot=$(jct "$REQ_FILE" get enable_snapshot 2>/dev/null)
+	new_en_live_view=$(jct "$REQ_FILE" get enable_live_view 2>/dev/null)
 	new_en_reboot=$(jct "$REQ_FILE" get enable_reboot 2>/dev/null)
 	new_en_ota=$(jct "$REQ_FILE" get enable_ota 2>/dev/null)
 
@@ -136,6 +137,7 @@ handle_post() {
 	en_gain=$(normalize_bool "$new_en_gain")
 	en_rssi=$(normalize_bool "$new_en_rssi")
 	en_snapshot=$(normalize_bool "$new_en_snapshot")
+	en_live_view=$(normalize_bool "$new_en_live_view")
 	en_reboot=$(normalize_bool "$new_en_reboot")
 	en_ota=$(normalize_bool "$new_en_ota")
 
@@ -192,6 +194,7 @@ handle_post() {
 	jct "$TMP_FILE" set "${DOMAIN}.enable_gain" "$en_gain" >/dev/null 2>&1
 	jct "$TMP_FILE" set "${DOMAIN}.enable_rssi" "$en_rssi" >/dev/null 2>&1
 	jct "$TMP_FILE" set "${DOMAIN}.enable_snapshot" "$en_snapshot" >/dev/null 2>&1
+	jct "$TMP_FILE" set "${DOMAIN}.enable_live_view" "$en_live_view" >/dev/null 2>&1
 	jct "$TMP_FILE" set "${DOMAIN}.enable_reboot" "$en_reboot" >/dev/null 2>&1
 	jct "$TMP_FILE" set "${DOMAIN}.enable_ota" "$en_ota" >/dev/null 2>&1
 

@@ -59,10 +59,24 @@ if ha_entity_enabled ircut; then
 		ha_pub_state ircut OFF "$FORCE"
 fi
 
-# Day/Night select
+# Day/Night select — reflects the TARGET mode (what was selected): "auto" when
+# prudynt's day/night engine is enabled, otherwise the forced mode (day/night).
 if ha_entity_enabled daynight; then
-	val=$(awk 'NR==1 {print $1}' /run/prudynt/daynight_mode 2>/dev/null)
-	ha_pub_state daynight "${val:-day}" "$FORCE"
+	dn_enabled=$(jct "$PRUDYNT_CONFIG" get daynight.enabled 2>/dev/null | tr -d '"')
+	if [ "$dn_enabled" = "true" ]; then
+		target=auto
+	else
+		target=$(jct "$PRUDYNT_CONFIG" get daynight.force_mode 2>/dev/null | tr -d '"')
+		[ "$target" = "day" ] || [ "$target" = "night" ] || target=day
+	fi
+	ha_pub_state daynight "$target" "$FORCE"
+fi
+
+# Day/Night status sensor — the ACTUAL live mode (day/night) regardless of the
+# auto/day/night selection. Sourced from the value prudynt updates continuously.
+if ha_entity_enabled daynight_status; then
+	actual=$(awk 'NR==1 {print $1}' /run/prudynt/daynight_mode 2>/dev/null)
+	ha_pub_state daynight_status "${actual:-day}" "$FORCE"
 fi
 
 # Privacy screen switch
@@ -70,6 +84,14 @@ if ha_entity_enabled privacy; then
 	[ -f /run/prudynt/privacy.active ] &&
 		ha_pub_state privacy ON "$FORCE" ||
 		ha_pub_state privacy OFF "$FORCE"
+fi
+
+# Physical privacy switch (persisted intent in /etc/physical-privacy-state.json)
+if ha_entity_enabled physical_privacy; then
+	case "$(grep -o '"active":[a-z]*' /etc/physical-privacy-state.json 2>/dev/null | head -1 | grep -o '[a-z]*$')" in
+		true) ha_pub_state physical_privacy ON "$FORCE" ;;
+		*)    ha_pub_state physical_privacy OFF "$FORCE" ;;
+	esac
 fi
 
 # Color mode switch (0=color, 1=monochrome)
@@ -112,6 +134,16 @@ if ha_entity_enabled white_light && command -v light >/dev/null 2>&1; then
 			ha_pub_state white OFF "$FORCE"; }
 fi
 
+# Microphone (prudynt runtime mic_muted flag, 0007 patch). ON = live (unmuted), OFF = muted.
+# Read-only query (mic_muted:null), publish-on-change, no flash writes, no audio restart.
+if ha_entity_enabled mic && command -v prudyntctl >/dev/null 2>&1; then
+	if echo '{"audio":{"mic_muted":null}}' | prudyntctl json - 2>/dev/null | grep -qE '"mic_muted": *true'; then
+		ha_pub_state mic OFF "$FORCE"
+	else
+		ha_pub_state mic ON "$FORCE"
+	fi
+fi
+
 # Gain sensor
 if ha_entity_enabled gain; then
 	gain=""
@@ -142,6 +174,32 @@ if ha_entity_enabled rssi; then
 			/proc/net/wireless 2>/dev/null)
 	fi
 	[ -n "$rssi" ] && [ "$rssi" != "0" ] && ha_pub_state rssi "$rssi" "$FORCE"
+fi
+
+# Config storage (overlay) usage — read-only df, never writes flash. Surfaces
+# the jffs2 config-overlay used% so HA can alert before it fills and blocks
+# config writes. Publishes only on change (ha_pub_state cache), so an idle
+# camera sends nothing.
+if ha_entity_enabled overlay_used; then
+	# Pull the Use% field (the token ending in % whose body is all digits — this
+	# skips the "Use%" header and is robust to column widths). NB: do NOT use
+	# `grep -o '[0-9]*%'` here — busybox grep -o mishandles a leading can-match-
+	# empty atom and returns nothing.
+	used=$(df / 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+%$/){sub(/%/,"",$i); print $i; exit}}')
+	[ -n "$used" ] && ha_pub_state overlay_used "$used" "$FORCE"
+fi
+
+# Shabbat Ready — ON only when motion detection is OFF (motion.enabled=false) AND
+# day/night is FORCED, not auto (daynight.enabled=false). Either unmet -> OFF.
+# Read-only (jct get), publish-on-change, no flash writes.
+if ha_entity_enabled shabbat; then
+	mo=$(jct "$PRUDYNT_CONFIG" get motion.enabled 2>/dev/null | tr -d '"')
+	dn=$(jct "$PRUDYNT_CONFIG" get daynight.enabled 2>/dev/null | tr -d '"')
+	if [ "$mo" = "false" ] && [ "$dn" = "false" ]; then
+		ha_pub_state shabbat ON "$FORCE"
+	else
+		ha_pub_state shabbat OFF "$FORCE"
+	fi
 fi
 
 # Firmware update entity

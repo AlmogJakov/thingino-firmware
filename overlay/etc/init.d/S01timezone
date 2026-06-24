@@ -3,6 +3,7 @@
 TZCODE_FILE="/etc/TZ"
 TZJSON_FILE="/usr/share/tz.json"
 TZNAME_FILE="/etc/timezone"
+TZUPDATE="/usr/sbin/tz-update"
 
 start() {
 	echo -c 15 "Setting timezone"
@@ -13,6 +14,20 @@ start() {
 	fi
 
 	echo -c 240 -e "- Timezone name: $(cat $TZNAME_FILE)"
+
+	# Preferred path: tz-update resolves a uClibc-safe POSIX string (exact yearly rule
+	# for Asia/Jerusalem; generic day-carry for other >24h-hour zones; byte-identical
+	# otherwise) and writes /etc/TZ only on change. 'boot' is conservative -- it leaves
+	# an already-valid /etc/TZ alone and lets the NTP callback refine the year, so a
+	# normal reboot does not rewrite /etc/TZ.
+	if [ -x "$TZUPDATE" ]; then
+		"$TZUPDATE" boot
+		[ -f "$TZCODE_FILE" ] && export TZ="$(cat "$TZCODE_FILE")"
+		echo -c 240 -e "- Set TZ to $(cat "$TZCODE_FILE" 2>/dev/null)"
+		return 0
+	fi
+
+	# Fallback (tz-update absent): original behaviour -- raw tz.json value, write-on-change.
 	tzname=$(cat "$TZNAME_FILE")
 
 	if [ ! -f "$TZJSON_FILE" ]; then
@@ -20,7 +35,7 @@ start() {
 		exit 1
 	fi
 
-	tz=$(cat "$TZJSON_FILE" | sed 's/},{/\n/g' | sed 's/^\[{//;s/}\]$//' |
+	tz=$(sed 's/},{/\n/g' "$TZJSON_FILE" | sed 's/^\[{//;s/}\]$//' |
 		sed 's/"n":"\([^"]*\)","v":"\([^"]*\)"/\1:\2/' |
 		grep -F "${tzname}:" | head -1 | cut -d: -f2-)
 
@@ -29,21 +44,13 @@ start() {
 		exit 1
 	fi
 
-	if [ ! -f "$TZCODE_FILE" ]; then
-		echo -c 240 -e "- Timezone code not found, default to GMT0"
-		echo "GMT0" >"$TZCODE_FILE"
-	fi
-
-	if [ "$tz" != "$(cat $TZCODE_FILE)" ]; then
+	if [ ! -f "$TZCODE_FILE" ] || [ "$tz" != "$(cat $TZCODE_FILE)" ]; then
 		echo -c 240 -e "- Set timezone to $tz"
 		echo "$tz" >"$TZCODE_FILE"
 	fi
 
 	echo -c 240 -e "- Set TZ to $tz"
-	TZ="$tz"
-
-	echo -c 240 -e "- Export TZ globally"
-	export TZ
+	export TZ="$tz"
 }
 
 case "$1" in

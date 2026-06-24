@@ -1,11 +1,45 @@
 #!/bin/sh
+#
+# IR-CUT boot init - settles the OPTICS into the persisted mode. Stock calibration
+# always ended in DAY (filter on, IR LED off), so a forced-night camera booted with
+# day optics; this keeps the exact calibration, then for forced-night removes the
+# filter and turns the IR LED on. GPIO only (filter + IR LED); running_mode is
+# prudynt's persisted config, so this never touches the pipeline. Pure GPIO at boot.
+
+PRUDYNT_CONFIG="/etc/prudynt.json"
+
+# Boot to night optics ONLY for a forced-night mode: daynight.enabled=false AND
+# daynight.force_mode="night". Everything else keeps the stock day calibration:
+#   * forced day  (enabled=false, force_mode="day")  -> day
+#   * auto        (enabled=true)                      -> day start; prudynt's
+#       worker then switches on the measured light level. enabled is the real
+#       discriminator — in auto the adapter clears force_mode, but guard on
+#       enabled too so a stale value can never force night.
+#   * privacy / unset / no config                    -> day (safe default)
+persisted_night() {
+	[ -f "$PRUDYNT_CONFIG" ] || return 1
+	command -v jct >/dev/null 2>&1 || return 1
+	[ "$(jct "$PRUDYNT_CONFIG" get daynight.enabled 2>/dev/null | tr -d '"')" = "false" ] || return 1
+	[ "$(jct "$PRUDYNT_CONFIG" get daynight.force_mode 2>/dev/null | tr -d '"')" = "night" ]
+}
 
 start() {
 	echo -c 15 "Initializing IR-CUT"
 
+	# Calibrate the mechanical filter (unchanged from stock).
 	ircut off >/dev/null 2>&1
 	sleep 0.5
 	ircut on >/dev/null 2>&1
+
+	# Settle into the persisted mode. Day = filter engaged (already set above).
+	if persisted_night; then
+		sleep 0.3
+		ircut off >/dev/null 2>&1   # remove IR-CUT filter (night)
+		# Generic: turn on whichever IR LED this camera actually has. `light ir`
+		# resolves the configured pin (ir850, falling back to ir940), so it works
+		# on ir850-only and ir940-only cameras alike — no hardcoding both.
+		command -v light >/dev/null 2>&1 && light ir on >/dev/null 2>&1
+	fi
 }
 
 case "$1" in

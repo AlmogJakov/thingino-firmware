@@ -7,6 +7,76 @@ DAEMON="/usr/bin/prudynt"
 PIDFILE="/run/prudynt.pid"
 HEARTBEAT_INIT="/etc/init.d/S99heartbeat"
 
+# --- C1/C3 tunables --------------------------------------------------------
+# Grace (whole seconds) for a SIGTERM exit before escalating to SIGKILL. On
+# T23 prudynt skips ALL hardware teardown on SIGTERM and exits fast, so a long
+# graceful wait buys nothing; keep it short. These same caps gate the rcK
+# shutdown stop(), so they must stay small (rcK runs every S-script's stop
+# serially inside the 60s hardware-watchdog budget).
+TERM_GRACE=2          # seconds: max wait for SIGTERM exit before SIGKILL
+KILL_GRACE=2          # seconds: max wait for the process to vanish after SIGKILL
+# Kernel hardware-reclaim settle AFTER the process is confirmed gone. The
+# field-proven recipe is "killall -9 prudynt; sleep 15; start"; never go below
+# 15s. Applied ONLY on restart, never on cold-boot start (boot pays nothing).
+RECLAIM_WAIT=15       # seconds: floor for VPU/ISP/VB/audio-DMA/:554 reclaim
+# Bound for each jct probe of a possibly-corrupt config so a hung/looping jct
+# cannot freeze the boot critical path (rcS runs start() inline) or the
+# watchdog's synchronous "service restart prudynt". On timeout we fall through
+# to the fail-safe no-op (leave the live config untouched).
+JCT_TIMEOUT=5         # seconds: hard cap per jct invocation
+
+# Read the pid from the pidfile (first field of the first line). Empty on any
+# failure. Mirrors S99heartbeat's reader.
+read_pid() {
+	local _pid
+	[ -r "$PIDFILE" ] || return 1
+	IFS= read -r _pid <"$PIDFILE" 2>/dev/null || return 1
+	[ -n "$_pid" ] || return 1
+	printf '%s\n' "$_pid"
+}
+
+# True if the given pid exists AND is not a zombie/dead task. A pid we just
+# SIGKILLed can briefly be Z (defunct) before init reaps it; pidof/kill -0
+# still match it, but for hardware-reclaim purposes it is already gone, so we
+# must NOT treat it as alive (else restart() would falsely abort). Field 3 of
+# /proc/<pid>/stat is the state char; Z or X means dead.
+pid_live() {
+	local _p _state _rest
+	_p="$1"
+	[ -n "$_p" ] || return 1
+	kill -0 "$_p" 2>/dev/null || return 1
+	# /proc/<pid>/stat: "pid (comm) STATE ..."; comm may contain spaces/parens,
+	# but the state char is the first token AFTER the last ')'.
+	if [ -r "/proc/$_p/stat" ]; then
+		_rest=$(cat "/proc/$_p/stat" 2>/dev/null)
+		_rest=${_rest##*) }
+		_state=${_rest%% *}
+		case "$_state" in
+			Z|X|x) return 1 ;;   # defunct / dead -> treat as gone
+		esac
+	fi
+	return 0
+}
+
+# True if ANY live prudynt exists: prefer the pidfile pid, fall back to pidof
+# (catches an orphan whose pidfile was lost after a power cut, since /run is
+# tmpfs). Zombies are excluded via pid_live so a reap-pending corpse cannot
+# wedge the restart into a false abort.
+prudynt_alive() {
+	local _pid _p
+	_pid="$(read_pid)"
+	if pid_live "$_pid"; then
+		return 0
+	fi
+	# Fall back to name match; re-check each candidate is genuinely live.
+	for _p in $(pidof prudynt 2>/dev/null); do
+		if pid_live "$_p"; then
+			return 0
+		fi
+	done
+	return 1
+}
+
 restart_heartbeat() {
 	if [ -x "$HEARTBEAT_INIT" ]; then
 		"$HEARTBEAT_INIT" restart >/dev/null 2>&1
@@ -23,19 +93,179 @@ start_daemon() {
 	start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON"
 }
 
-stop_daemon() {
-	if [ -f "$PIDFILE" ]; then
-		start-stop-daemon -K -p "$PIDFILE" -x "$DAEMON"
-		status=$?
-		rm -f "$PIDFILE"
-		return $status
+# --- C1: validate-and-restore prudynt.json (brick prevention) --------------
+# A power-cut-truncated/missing /etc/prudynt.json makes prudynt skip ALL config
+# defaults -> image.isp_bypass falls back to false -> the sc2336p stream is
+# permanently dead (recoverable only by reflash/reboot loop). Restore the ROM
+# copy ONLY when we have POSITIVE evidence the live file cannot yield the brick
+# field, OR the live file is missing entirely. Every ambiguous case (jct
+# missing, jct timed out, ROM missing/empty, ROM doesn't probe clean, write
+# fails) leaves the live file EXACTLY as-is: worst case == doing nothing.
+#
+# jct facts (themactep/jct @46e15ef, the pinned build commit):
+#   - "get image.isp_bypass" on a valid file prints exactly "true\n"/"false\n"
+#     (lowercase, unquoted) to stdout; $(...) strips the newline.
+#   - on a truncated/corrupt/empty file, parse_json_file returns an EMPTY
+#     object (not NULL), so the key-miss prints only to stderr and writes
+#     NOTHING to stdout (exit 1). => the value-shape check below, NOT jct's
+#     exit code, is what decides validity (the orchestrator flagged jct exit
+#     codes as unverified, so we deliberately never branch on $?).
+# Runs entirely BEFORE start_daemon and touches no hardware -> cannot wedge VPU.
+validate_and_restore_config() {
+	local CFG ROM probe romval
+	CFG=/etc/prudynt.json
+	ROM=/rom/etc/prudynt.json
+
+	# No jct, or no usable ROM source -> we cannot validate or safely restore.
+	# Do nothing (a maybe-bad config still has a chance to stream; we never
+	# act blind).
+	command -v jct >/dev/null 2>&1 || return 0
+	[ -s "$ROM" ] || return 0
+
+	# Reclaim any orphan temp from a prior interrupted run BEFORE we allocate a
+	# new one (overlay is near-full; free first, then write).
+	rm -f "$CFG.c1tmp" 2>/dev/null
+
+	# Probe the live file (timeout-bounded). A missing file yields empty probe
+	# below and routes straight to the restore arm. Capture stdout only; ignore
+	# exit code by design.
+	if [ -f "$CFG" ]; then
+		probe=$(timeout "$JCT_TIMEOUT" jct "$CFG" get image.isp_bypass 2>/dev/null)
+	else
+		probe=""
 	fi
 
-	start-stop-daemon -K -x "$DAEMON"
+	case "$probe" in
+		true|false)
+			# Positively valid: file parses and the brick field resolves to a
+			# real boolean. Trust it. This is the ONLY branch that does nothing
+			# to a present file, and it is the only common (fast) boot path.
+			return 0
+			;;
+	esac
+
+	# Reach here only when the live file is MISSING or did NOT yield true/false
+	# (corrupt / truncated / empty / jct-timed-out). Restore ONLY if the ROM
+	# copy itself probes clean to "true" -- never copy a bad/timed-out ROM over
+	# the live file.
+	romval=$(timeout "$JCT_TIMEOUT" jct "$ROM" get image.isp_bypass 2>/dev/null)
+	if [ "$romval" != "true" ]; then
+		echo "C1: ROM copy did not probe clean; left config untouched" >&2
+		return 0
+	fi
+
+	# Atomic-ish restore: write a temp on the SAME overlay (jffs2 upperdir),
+	# sync the temp's DATA durable, then a single rename. In the C1 threat model
+	# the corrupt live file always already has an upperdir copy (the jct write
+	# that truncated it created it), so this mv is an upper-to-upper rename and
+	# is atomic; a missing live file is created by the rename. A power cut:
+	#   - before mv  -> live file unchanged (or still absent); only an orphan
+	#                   .c1tmp remains, reclaimed by the rm -f above next boot.
+	#   - during mv  -> rename is atomic: live file is the old contents or the
+	#                   full ROM copy, never a truncated blend.
+	# We do NOT re-introduce the in-place "cp over the live file" truncation
+	# the naive one-liner would cause. Only ONE sync (of the temp, before mv);
+	# no second global sync (jffs2 GC is lazy post-power-cut on a near-full
+	# overlay and a second sync only lengthens the boot/watchdog critical
+	# section for no atomicity benefit).
+	if cp "$ROM" "$CFG.c1tmp" 2>/dev/null && sync && mv -f "$CFG.c1tmp" "$CFG" 2>/dev/null; then
+		echo "C1: restored prudynt.json from ROM (was missing/unparseable)"
+	else
+		# Overlay full / write failed: discard temp, leave the live file
+		# (present-but-corrupt or still-absent) exactly as it was. A genuinely
+		# corrupt config on a full overlay will not self-heal here -- that is
+		# the pre-existing overlay-exhaustion constraint, not a regression, and
+		# is the durable rebuild fix's job (in-class isp_bypass{true}).
+		rm -f "$CFG.c1tmp" 2>/dev/null
+		echo "C1: restore FAILED (overlay full?); left config untouched" >&2
+	fi
+	return 0
+}
+# --- end C1 ----------------------------------------------------------------
+
+# --- C3: deterministic stop ------------------------------------------------
+# 1. SIGTERM (by pidfile if present, else by name) 2. poll whole-second up to
+# TERM_GRACE 3. escalate to SIGKILL (pidfile pid + killall by name) 4. poll up
+# to KILL_GRACE 5. drop the stale pidfile 6. CONFIRM gone.
+# Returns 0 only if prudynt is confirmed gone; 1 if something LIVE survives
+# (caller MUST NOT start a new prudynt on top -- that is what wedges the VPU).
+# All waits are whole-second sleep loops: no usleep dependency, no nested
+# arithmetic, no divide-by-zero, time accounting always exact.
+stop_daemon() {
+	local _pid _waited
+
+	# Already gone? Idempotent fast path (also the common rcK-at-shutdown and
+	# already-dead cases). Just clear the stale pidfile.
+	if ! prudynt_alive; then
+		rm -f "$PIDFILE"
+		return 0
+	fi
+
+	_pid="$(read_pid)"
+
+	# 1. SIGTERM. start-stop-daemon -K sends TERM by default; -s TERM is
+	#    explicit. With a pid use -p, else match by binary path. We ignore
+	#    s-s-d's exit code; prudynt_alive is the source of truth.
+	if [ -n "$_pid" ]; then
+		start-stop-daemon -K -s TERM -p "$PIDFILE" -x "$DAEMON" 2>/dev/null
+	else
+		start-stop-daemon -K -s TERM -x "$DAEMON" 2>/dev/null
+	fi
+
+	# 2. Wait out the (short) graceful exit, whole seconds.
+	_waited=0
+	while prudynt_alive; do
+		[ "$_waited" -ge "$TERM_GRACE" ] && break
+		sleep 1
+		_waited=$((_waited + 1))
+	done
+
+	# 3. Escalate to SIGKILL if still alive: kill the pidfile pid AND killall
+	#    by name (catches an orphan whose pidfile was lost after a power cut).
+	if prudynt_alive; then
+		_pid="$(read_pid)"
+		[ -n "$_pid" ] && kill -9 "$_pid" 2>/dev/null
+		killall -9 prudynt 2>/dev/null
+		_waited=0
+		while prudynt_alive; do
+			[ "$_waited" -ge "$KILL_GRACE" ] && break
+			sleep 1
+			_waited=$((_waited + 1))
+		done
+	fi
+
+	# 5. Drop the now-stale pidfile (start_daemon's -m recreates it).
+	rm -f "$PIDFILE"
+
+	# 6. Confirm gone. A still-live prudynt here is a genuine wedge (e.g. stuck
+	#    in a VPU ioctl in D-state, where SIGKILL cannot help). Refuse to start
+	#    on top of it; the watchdog will re-drive restart and, on a down socket,
+	#    reach its RESTART_LIMIT reboot -- the only real cure for a wedge.
+	if prudynt_alive; then
+		echo "prudynt: FAILED to terminate (still alive after SIGKILL)" >&2
+		return 1
+	fi
+	return 0
+}
+
+# Fixed kernel-reclaim settle AFTER the process is confirmed gone. No verified
+# /proc proxy for "VPU free" exists on this unit (the /proc/jz nodes prudynt
+# touches are sensor-info only), so we do NOT gate on a fragile proxy -- we use
+# the field-proven 15s margin. Caller invokes this ONLY on restart.
+reclaim_wait() {
+	local _i=0
+	while [ "$_i" -lt "$RECLAIM_WAIT" ]; do
+		sleep 1
+		_i=$((_i + 1))
+	done
 }
 
 start() {
 	echo -c 15 "Starting Prudynt"
+	# C1: heal a missing/corrupt config before launch so isp_bypass cannot
+	#     silently fall back to false. Runs on EVERY start (cold boot AND
+	#     post-restart). Bounded by JCT_TIMEOUT; fail-safe = leave file as-is.
+	validate_and_restore_config
 	start_daemon
 	status=$?
 	if [ "$status" -eq 0 ]; then
@@ -50,22 +280,41 @@ stop() {
 	stop_daemon
 }
 
+# Hardened restart: quiesce heartbeat FIRST (so it stops polling prudyntctl at
+# the dying daemon during the kill+reclaim window), then stop. Only if stop
+# CONFIRMED prudynt is gone do we wait out the kernel reclaim and start. If the
+# stop could not confirm death, do NOT start (starting on top of a live/half-
+# dead instance is exactly what wedges the VPU); return non-zero so `service`
+# reports failure and leave the stream down for the watchdog's reboot
+# escalation. NOTE: restart() intentionally does NOT call stop() (it calls
+# stop_daemon directly) so it can read the confirmation return code -- do not
+# "simplify" it to call stop or the abort guarantee is lost.
+restart() {
+	stop_heartbeat
+	if stop_daemon; then
+		reclaim_wait
+		start
+	else
+		echo "prudynt: restart aborted - process did not die; leaving stream down for watchdog/reboot escalation" >&2
+		return 1
+	fi
+}
+
 case "$1" in
 	start)
 		start
+		exit $?
 		;;
 	stop)
 		stop
+		exit $?
 		;;
 	restart)
-		stop || true
-		sleep 1
-		start
+		restart
+		exit $?
 		;;
 	*)
 		echo "Usage: $0 {start|stop|restart}"
 		exit 1
 		;;
 esac
-
-exit 0

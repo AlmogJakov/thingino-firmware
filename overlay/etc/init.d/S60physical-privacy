@@ -1,0 +1,55 @@
+#!/bin/sh
+# S60physical-privacy — re-park the lens into the privacy pose after boot if
+# physical privacy was active before shutdown / power loss.
+#
+# Runs right after motors (S59) — as early as the boot homing allows. DAY mode
+# is already native at this point (persisted prudynt config -> running_mode at
+# S31, optics by S56ircut), so we ONLY re-park the lens. We wait for the boot
+# homing/calibration to settle first, then jog to the saved pose. The persisted
+# snapshot in /etc/physical-privacy-state.json is NOT modified here.
+
+STATE="/etc/physical-privacy-state.json"
+REAL_MOTORS="/usr/bin/motors-bin"
+[ -x "$REAL_MOTORS" ] || REAL_MOTORS="motors"
+
+start() {
+	[ -f "$STATE" ] || exit 0
+	case "$(grep -o '"active":[a-z]*' "$STATE" 2>/dev/null | head -1 | grep -o '[a-z]*$')" in
+		true) ;;
+		*) exit 0 ;;
+	esac
+
+	(
+		# 1) wait (bounded) for the motors daemon to be up
+		i=0
+		while [ "$i" -lt 60 ]; do
+			[ -e /run/motors-daemon.pid ] && break
+			i=$((i + 1)); sleep 1
+		done
+		# 2) wait for boot homing/calibration to fully SETTLE before re-parking, so
+		#    we never fight S59's `motors -r` / `motors -d h`. Require the position
+		#    to be stable across SEVERAL consecutive reads (a brief plateau during
+		#    the continuous homing motion must not be mistaken for "done").
+		last=""; eq=0; s=0
+		while [ "$s" -lt 40 ]; do
+			p=$("$REAL_MOTORS" -p 2>/dev/null | tr -dc '0-9,-')
+			if [ -n "$p" ] && [ "$p" = "$last" ]; then
+				eq=$((eq + 1)); [ "$eq" -ge 3 ] && break
+			else
+				eq=0
+			fi
+			last="$p"; s=$((s + 1)); sleep 1
+		done
+		# 3) re-park (tilt to the saved pose); no new snapshot
+		physical-privacy reenter >/dev/null 2>&1
+	) &
+}
+
+case "$1" in
+	start) start ;;
+	stop) : ;;
+	restart) start ;;
+	*) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac
+
+exit 0

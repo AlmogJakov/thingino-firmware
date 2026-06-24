@@ -21,8 +21,10 @@ define THINGINO_MOTORS_BUILD_CMDS
 endef
 
 define THINGINO_MOTORS_INSTALL_TARGET_CMDS
+	# Real motor client installed as motors-bin; the physical-privacy overlay wrapper
+	# ships at /usr/bin/motors and execs this, so it can never self-exec (brick PTZ).
 	$(INSTALL) -D -m 0755 $(@D)/motors \
-		$(TARGET_DIR)/usr/bin/motors
+		$(TARGET_DIR)/usr/bin/motors-bin
 
 	$(INSTALL) -D -m 0755 $(@D)/motors-daemon \
 		$(TARGET_DIR)/usr/bin/motors-daemon

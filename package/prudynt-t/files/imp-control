@@ -101,18 +101,39 @@ case "$COMMAND" in
 		}
 		send_config "{\"image\": {\"brightness\": $VALUE}}"
 		;;
-	color | ispmode)
+	ispmode)
+		# Raw ISP running_mode passthrough: 0 = day/color, 1 = night/monochrome.
+		[ -z "$VALUE" ] && {
+			echo "Error: ispmode requires value 0 or 1" >&2
+			exit 1
+		}
+		case "$VALUE" in
+			0 | 1)
+				MODE_VALUE="$VALUE"
+				;;
+			*)
+				echo "Error: ispmode requires 0 or 1" >&2
+				exit 1
+				;;
+		esac
+		send_config "{\"image\": {\"running_mode\": $MODE_VALUE}}"
+		;;
+	color)
+		# Semantic color switch. NB! running_mode is inverted relative to the
+		# "color on/off" wording (see /sbin/color):
+		#   color on  / day   -> color      -> running_mode 0
+		#   color off / night -> monochrome -> running_mode 1
 		[ -z "$VALUE" ] && {
 			echo "Error: color requires value (boolean, 0/1, or on/off)" >&2
 			exit 1
 		}
 		VALUE_NORM=$(printf '%s' "$VALUE" | tr '[:upper:]' '[:lower:]')
 		case "$VALUE_NORM" in
-			1 | true | on)
-				MODE_VALUE=1
-				;;
-			0 | false | off)
+			1 | true | on | day)
 				MODE_VALUE=0
+				;;
+			0 | false | off | night)
+				MODE_VALUE=1
 				;;
 			*)
 				echo "Error: color requires boolean, 0/1, or on/off" >&2
