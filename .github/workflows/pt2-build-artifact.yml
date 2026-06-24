@@ -73,10 +73,15 @@ jobs:
         run: BOARD="$BOARD" make fast WORKFLOW=1
 
       - name: Confirm prudynt patches were applied to the source
-        # Non-fragile, source-level: buildroot records every applied patch by name in
-        # the package build dir's .applied_patches_list. No binary introspection.
+        # Non-fragile, source-level: buildroot's apply-patches.sh records every applied
+        # patch in the package build dir's .applied_patches_list as a FULL PATH per line,
+        # ending in /<basename>.patch (e.g. .../prudynt-t/0001-...patch). No binary introspection.
         run: |
-          SRC=$(find output -type d -name 'prudynt-t-*' 2>/dev/null | grep -v '/host/' | head -1)
+          SRC=""
+          for d in $(find output -type d -name 'prudynt-t-*' 2>/dev/null | grep -v '/host/'); do
+            [ -f "$d/.applied_patches_list" ] && { SRC="$d"; break; }
+          done
+          [ -n "$SRC" ] || SRC=$(find output -type d -name 'prudynt-t-*' 2>/dev/null | grep -v '/host/' | head -1)
           [ -n "$SRC" ] || { echo "::error::prudynt-t source dir not found under output/"; exit 1; }
           echo "prudynt source: $SRC"
           LIST="$SRC/.applied_patches_list"
@@ -84,11 +89,11 @@ jobs:
             echo "== .applied_patches_list =="; cat "$LIST"
             miss=0
             for n in 0001 0002 0003 0004 0005 0006 0007 0008 0009 0010 0011 0012 0013; do
-              grep -q "^$n-" "$LIST" && echo "PASS: patch $n applied" || { echo "::error::patch $n not in .applied_patches_list"; miss=1; }
+              grep -qE "/${n}-.*\.patch$" "$LIST" && echo "PASS: patch $n applied" || { echo "::error::patch $n not in .applied_patches_list"; miss=1; }
             done
             [ "$miss" = 0 ] && echo "ALL 13 PRUDYNT PATCHES APPLIED (0001-0013)" || exit 1
           elif [ -f "$SRC/.stamp_patched" ]; then
-            echo "::warning::.applied_patches_list absent on this buildroot; .stamp_patched present (patch phase ran), but cannot enumerate per-patch"
+            echo "::warning::.applied_patches_list absent; .stamp_patched present (patch phase ran), cannot enumerate per-patch"
           else
             echo "::error::no .applied_patches_list and no .stamp_patched - cannot confirm patches applied"; exit 1
           fi
