@@ -48,7 +48,8 @@ index 67ac027..774cf59 100644
 +  // the RTP timestamp by this frame's exact duration. Read ONLY by IMPDeviceSource's OPUS
 +  // path; for non-OPUS frames it is set but unused (no behavior change for AAC/PCM/G711).
 +  af.samples = static_cast<uint32_t>(frame_samples);
- 
+-
++
    bool any_recorder_active = false;
    for (int ch = 0; ch < NUM_VIDEO_CHANNELS; ++ch) {
 diff --git a/src/IMPDeviceSource.cpp b/src/IMPDeviceSource.cpp
@@ -167,7 +168,8 @@ index 6c8485e..f416c2c 100644
 +  int64_t audioAnchorUs{-1};          // wallclock us of the current anchor
 +  int64_t audioSamplesSinceAnchor{0}; // samples emitted since the anchor
 +  int audioAnchorRate{0};             // capture rate the anchor was built at
- 
+-
++
    // Video encoder timestamp tracking (avoids gettimeofday jitter)
    bool videoFirstFrame{true};
 diff --git a/src/globals.hpp b/src/globals.hpp
@@ -180,5 +182,6 @@ index 29ab8ca..7f945b5 100644
    struct timeval time;
 +  uint32_t samples{0}; // per-channel CAPTURE PCM sample count (pre-encode); drives the OPUS RTP timestamp step
  };
- 
+-
++
  struct H264NALUnit {
