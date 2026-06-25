@@ -58,7 +58,8 @@ index a1a7666..b1a04cb 100644
 @@ -122,41 +122,93 @@ void IMPDeviceSource<FrameType, Stream>::deliverFrame() {
        fFrameSize = nal.data.size();
      }
- 
+-
++
      /* Use monotonic counter-based timestamps for AAC to produce perfectly
         steady +1024 RTP PTS increments and avoid gettimeofday jitter. */
      if constexpr (std::is_same_v<FrameType, AudioFrame>) {
@@ -72,7 +73,8 @@ index a1a7666..b1a04cb 100644
            sampleRate = imp_audio->sample_rate;
          }
        }
- 
+-
++
 +      // OPUS/WebRTC needs a perfectly steady RTP clock: stamp from a monotonic SAMPLE
 +      // counter (advance by each frame's exact duration); re-anchor only on a large
 +      // forward wallclock gap. EVERY non-OPUS codec (AAC, PCM, G711, ...) falls through to
@@ -128,7 +130,8 @@ index a1a7666..b1a04cb 100644
        // same clock domain as live555's presetNextTimestamp(), so NTP steps
        // and stale ring-buffer frames never cause RTP timestamp jumps.
        gettimeofday(&fPresentationTime, NULL);
- 
+-
++
        int64_t pts_us = tv_to_us(fPresentationTime);
        int rate_for_tick = sampleRate > 0 ? sampleRate : 16000;
        // AAC: 1024 samples/frame; non-AAC: ~40ms frames
