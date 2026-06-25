@@ -55,7 +55,7 @@ diff --git a/src/IMPDeviceSource.cpp b/src/IMPDeviceSource.cpp
 index a1a7666..b1a04cb 100644
 --- a/src/IMPDeviceSource.cpp
 +++ b/src/IMPDeviceSource.cpp
-@@ -122,40 +122,92 @@ void IMPDeviceSource<FrameType, Stream>::deliverFrame() {
+@@ -122,41 +122,93 @@ void IMPDeviceSource<FrameType, Stream>::deliverFrame() {
        fFrameSize = nal.data.size();
      }
  
@@ -72,6 +72,7 @@ index a1a7666..b1a04cb 100644
            sampleRate = imp_audio->sample_rate;
          }
        }
+ 
 +      // OPUS/WebRTC needs a perfectly steady RTP clock: stamp from a monotonic SAMPLE
 +      // counter (advance by each frame's exact duration); re-anchor only on a large
 +      // forward wallclock gap. EVERY non-OPUS codec (AAC, PCM, G711, ...) falls through to
