@@ -156,17 +156,15 @@ jobs:
           # 22) (0008): steady audio RTP timestamps — sample-clock anchor + drift-gated re-anchor.
           grep -qF "audioSamplesSinceAnchor" "$SRC/src/IMPDeviceSource.cpp" \
             || { echo "::error::IMPDeviceSource.cpp: audio sample-clock (0008 RTP timestamp fix) not applied"; ok=0; }
-          # 23) (0008, OPUS-ONLY revision): the sample-clock is gated to OPUS frames only —
-          #     AAC/PCM/G711 keep the stock timestamp path (byte-for-byte). Confirm the OPUS
-          #     gate + the af.samples plumbing, AND reject the OLD 0008 that also resized the
-          #     AAC reframer buffer (that change caused AAC "horrible noise" and was removed).
-          grep -qF "imp_audio->format == IMPAudioFormat::OPUS" "$SRC/src/IMPDeviceSource.cpp" \
-            || { echo "::error::IMPDeviceSource.cpp: OPUS-only sample-clock gate (revised 0008) missing — STALE 0008"; ok=0; }
+          # 23) (0008, all-codec sample-clock): af.samples carries the per-frame PCM count that
+          #     drives the steady RTP timestamp step, AND the AAC+force_stereo reframer buffer is
+          #     sized to the reframer's true mono output (1024*sizeof(uint16_t), not *outChnCnt).
+          #     NOTE: the AAC "horrible noise" was a SEPARATE live-codec-switch bug, fixed by 0014
+          #     (RTSP/SDP rebuild) -- NOT this reframer fix; the OPUS-only 0008 revision is abandoned.
           grep -qF "af.samples = static_cast<uint32_t>(frame_samples)" "$SRC/src/AudioWorker.cpp" \
             || { echo "::error::AudioWorker.cpp: af.samples plumbing (0008) not applied"; ok=0; }
-          if grep -qF "Size to the reframer's true mono output" "$SRC/src/AudioWorker.cpp"; then
-            echo "::error::AudioWorker.cpp: OLD 0008 AAC reframer-resize present (caused AAC noise) — use the OPUS-only 0008"; ok=0
-          fi
+          grep -qF "Size to the reframer's true mono output" "$SRC/src/AudioWorker.cpp" \
+            || { echo "::error::AudioWorker.cpp: AAC+force_stereo reframer-size fix (0008) not applied — STALE 0008"; ok=0; }
           # 24) (0009): raise the RTSP cold-boot SPS/PPS bootstrap deadline 10s -> 45s so a
           #     slow-warming T23 encoder registers ch0 instead of skipping it (DESCRIBE 404 /
           #     dead stream after reboot/power-cut). Match the explanatory comment so a STALE
@@ -197,7 +195,14 @@ jobs:
           #     rejected by the strict validator -> booting day with night optics.
           grep -qF "0013 (reader-hardening)" "$SRC/src/Config.cpp" \
             || { echo "::error::Config.cpp: force_mode quote-tolerance (0013) not applied"; ok=0; }
-          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (0001-0003 base; 0004 live reconfig + IDR; 0005 fault-tolerance; 0006 high-freq seamlessness; 0007 physical-privacy software mic mute; 0008 audio RTP sample-clock (OPUS-only); 0009 cold-boot RTSP SPS/PPS deadline; 0010 IMP-init fail-fast; 0011 zero-channel fail-fast; 0012 config apply-defaults-on-parse-fail; 0013 force_mode quote-tolerance)" || exit 1
+          # 29) (0014): a live audio codec/rate switch (mic_format / mic_sample_rate) now ALSO
+          #     rebuilds the RTSP audio subsession so its cached SDP regenerates and go2rtc
+          #     re-DESCRIBEs against the new codec -- fixes AAC stutter / AAC->OPUS audio loss
+          #     without an S31prudynt restart. Diff-gated; sets global_restart_rtsp via the new
+          #     add_strk_a_rtsp / add_int_a_rtsp lambdas in handle_audio.
+          grep -qF "add_strk_a_rtsp" "$SRC/src/JsonAPI.cpp" \
+            || { echo "::error::JsonAPI.cpp: live audio codec-switch RTSP rebuild (0014) not applied"; ok=0; }
+          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (0001-0003 base; 0004 live reconfig + IDR; 0005 fault-tolerance; 0006 high-freq seamlessness; 0007 physical-privacy software mic mute; 0008 audio RTP sample-clock (all codecs) + AAC force_stereo reframer fix; 0009 cold-boot RTSP SPS/PPS deadline; 0010 IMP-init fail-fast; 0011 zero-channel fail-fast; 0012 config apply-defaults-on-parse-fail; 0013 force_mode quote-tolerance; 0014 live audio codec-switch RTSP rebuild)" || exit 1
 
       - name: Locate the built MIPS prudynt binary
         id: find
