@@ -1,16 +1,16 @@
-Subject: [PATCH] Rebuild RTSP audio subsession on live audio codec/rate change
+Subject: [PATCH] Rebuild RTSP audio subsession on live audio codec change
 Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (branch stable).
 Stacks on: 0001-0013. Applies with git apply -p1 / patch -p1 AFTER them.
 
-Changing the audio codec (mic_format: OPUS<->AAC<->...) or the input sample
-rate (mic_sample_rate) live via the web UI / JsonAPI stuttered AAC horribly and
-killed go2rtc audio on AAC->OPUS, recoverable only by `S31prudynt restart`.
+Changing the audio codec (mic_format: OPUS<->AAC<->...) live via the web UI /
+JsonAPI stuttered AAC horribly and killed go2rtc audio on AAC->OPUS, recoverable
+only by `S31prudynt restart`.
 
 ROOT CAUSE (source-verified). handle_audio raised global_restart_audio ONLY for
-mic_format / mic_sample_rate, never global_restart_rtsp. In main()'s supervisor
-loop global_restart_audio DOES join+respawn the AudioWorker (thread_entry ->
-IMPAudio::createNew re-reads cfg->audio.input_format), so the encoder rebuilds
-and real new-codec bytes hit the wire. But only global_restart_rtsp re-runs
+mic_format, never global_restart_rtsp. In main()'s supervisor loop
+global_restart_audio DOES join+respawn the AudioWorker (thread_entry ->
+IMPAudio::createNew re-reads cfg->audio.input_format), so the encoder rebuilds and
+real new-codec bytes hit the wire. But only global_restart_rtsp re-runs
 RTSP::start(), the sole path that rebuilds ServerMediaSession, the
 IMPAudioServerMediaSubsession, the audio IMPDeviceSource and the persistent
 StreamReplicator -- and thereby regenerates the audio SDP. live555 freezes the
@@ -18,19 +18,19 @@ subsession's fSDPLines at the first DESCRIBE (IMPAudioServerMediaSubsession
 overrides neither sdpLines() nor getAuxSDPLine()), so a client (go2rtc) that
 negotiated once keeps depacketizing against the old codec's rtpmap/clock/payload
 type. New AAC bytes vs the stale negotiated SDP -> clock/framing skew (stutter);
-AAC->OPUS (SimpleRTPSink, clock forced 48000, 2ch, dynamic PT) is unmappable to
-a session holding AAC MPEG4-GENERIC -> audio drops entirely; video is a separate
+AAC->OPUS (SimpleRTPSink, clock forced 48000, 2ch, dynamic PT) is unmappable to a
+session holding AAC MPEG4-GENERIC -> audio drops entirely; video is a separate
 subsession so it survives. A full restart rebuilt encoder + RTSP + SDP together,
 which is why it worked.
 
-FIX. On a REAL change to an SDP-affecting audio key, raise global_restart_rtsp
-in addition to global_restart_audio -- the exact discipline 0001/0004 use for the
-video "format" key. In main()'s restart loop audio is (re)started BEFORE rtsp, so
-the new audioSource/StreamReplicator (RTSP::start) bind the respawned worker's
-PERSISTENT global_audio[0]->msgChannel (allocated once in main, never recreated)
-so there is no starvation, unlike the 0007 bare-global_restart_audio (input
-disabled) case. The new IMPAudioServerMediaSubsession computes a fresh SDP and go2rtc
-re-DESCRIBEs against the true codec on reconnect.
+FIX. On a REAL mic_format change, raise global_restart_rtsp in addition to
+global_restart_audio -- the exact discipline 0001/0004 use for the video "format"
+key. In main()'s restart loop audio is (re)started BEFORE rtsp, so the new
+audioSource/StreamReplicator (RTSP::start) bind the respawned worker's PERSISTENT
+global_audio[0]->msgChannel (allocated once in main, never recreated) so there is
+no starvation, unlike the 0007 bare-global_restart_audio (input disabled) case.
+The new IMPAudioServerMediaSubsession computes a fresh SDP and go2rtc re-DESCRIBEs
+against the true codec on reconnect.
 
 Stock handle_audio raises the restart flag UNCONDITIONALLY on key presence (no
 diff-check -- the cfg->set<>() return is ignored), so this patch adds a read-back
@@ -38,24 +38,25 @@ diff-gate (rebuild only when old != new) so HA/agent state re-sends do not
 needlessly churn the RTSP server (which also briefly reconnects video, since one
 RTSP thread serves both subsessions).
 
-SDP-affecting keys handled: mic_format (codec) and mic_sample_rate (RTP clock for
-non-OPUS codecs; OPUS forces 48000 regardless). force_stereo (channel count) is a
-related candidate left untouched for now (separate, rarer live toggle).
+SCOPE: only mic_format (the codec) is handled here -- one self-contained hunk.
+mic_sample_rate (the RTP clock for non-OPUS codecs) is also SDP-affecting but is a
+separate, rarer live change; it stays on the stock global_restart_audio-only path
+and can be a follow-up patch reusing the same diff-gated idiom.
 
 diff --git a/src/JsonAPI.cpp b/src/JsonAPI.cpp
 index 1111111..2222222 100644
 --- a/src/JsonAPI.cpp
 +++ b/src/JsonAPI.cpp
-@@ -762,6 +762,44 @@ void handle_audio(JsonValue *obj, std::string &out, bool &sep) {
+@@ -762,6 +762,28 @@ void handle_audio(JsonValue *obj, std::string &out, bool &sep) {
    // Input
    add_boolk_a("mic_enabled", "audio.mic_enabled", false, true);
 -  add_strk_a("mic_format", "audio.mic_format", true);
-+  // mic_format / mic_sample_rate are SDP-affecting (codec and RTP clock). On a
-+  // REAL change they must rebuild the RTSP audio subsession too, so its cached
-+  // SDP is regenerated and clients (go2rtc) re-DESCRIBE against the new codec.
-+  // global_restart_audio alone respawns the encoder (new bytes on the wire) but
-+  // leaves the stale SDP -> AAC stutters, AAC->OPUS drops audio. Mirrors the
-+  // video "format" path; diff-gated (read-back) so HA/agent re-sends never churn.
++  // mic_format (audio codec) is SDP-affecting: on a REAL change it must rebuild
++  // the RTSP audio subsession too, so its cached SDP regenerates and clients
++  // (go2rtc) re-DESCRIBE against the new codec. global_restart_audio alone
++  // respawns the encoder (new bytes on the wire) but leaves the stale SDP ->
++  // AAC stutters, AAC->OPUS drops audio. Mirrors the video "format" path; diff-
++  // gated (read-back) so HA/agent re-sends never churn the RTSP server.
 +  auto add_strk_a_rtsp = [&](const char *key, const char *path) {
 +    if (JsonValue *v = obj_get(obj, key)) {
 +      if (v->type == JSON_STRING && v->value.string) {
@@ -72,29 +73,7 @@ index 1111111..2222222 100644
 +      wrote = true;
 +    }
 +  };
-+  auto add_int_a_rtsp = [&](const char *key, const char *path) {
-+    if (JsonValue *v = obj_get(obj, key)) {
-+      if (v->type == JSON_NUMBER) {
-+        int newv = (int)v->value.number.integer;
-+        bool changed = cfg->get<int>(path) != newv;
-+        cfg->set<int>(path, newv);
-+        if (changed) {
-+          global_restart_audio = true;
-+          global_restart_rtsp = true;
-+        }
-+      }
-+      add_key(out, s2, key);
-+      add_num(out, cfg->get<int>(path));
-+      wrote = true;
-+    }
-+  };
 +  add_strk_a_rtsp("mic_format", "audio.mic_format");
 
    // mic_vol - apply immediately without restart
    if (JsonValue *v = obj_get(obj, "mic_vol")) {
-@@ -800,4 +800,4 @@ void handle_audio(JsonValue *obj, std::string &out, bool &sep) {
-   }
-   add_int("mic_bitrate", "audio.mic_bitrate", true);
--  add_int("mic_sample_rate", "audio.mic_sample_rate", true);
-+  add_int_a_rtsp("mic_sample_rate", "audio.mic_sample_rate");
- #if defined(LIB_AUDIO_PROCESSING)
