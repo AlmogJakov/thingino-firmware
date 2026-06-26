@@ -1,0 +1,218 @@
+name: prudynt-binary
+# Builds the firmware for the Sonoff PT2 (T23 / sc2336p) board with the
+# daynight-stats + forced-mode patch applied, and uploads ONLY the resulting
+# prudynt binary as a downloadable artifact (you copy it to /usr/bin/prudynt;
+# no flashing, no firmware image needed).
+#
+# Run it: Actions tab -> "prudynt-binary" -> Run workflow -> pick your branch.
+# Download: the finished run -> Artifacts -> "prudynt-<board>".
+#
+# It uses the exact two build commands thingino's own CI uses (make source +
+# make), so prudynt is compiled with our patch as part of the normal build.
+# First run can take ~1-2 h (toolchain + packages). Free GitHub runners.
+
+on:
+  workflow_dispatch:
+    inputs:
+      board:
+        description: 'Camera/board config name'
+        required: true
+        default: 'sonoff_pt2_t23n_sc2336p_atbm6012bx'
+
+env:
+  FORCE_UNSAFE_CONFIGURE: 1
+  TERM: linux
+  TZ: UTC
+
+jobs:
+  build-prudynt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    container:
+      image: debian:trixie
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends --no-install-suggests \
+            autoconf build-essential bc ca-certificates cmake cpio curl file \
+            gawk git jq lzop m4 make p7zip-full perl procps python3 rsync \
+            tzdata u-boot-tools unzip wget
+
+      - name: Set timezone
+        run: ln -sf /usr/share/zoneinfo/UTC /etc/localtime && echo UTC > /etc/timezone
+
+      - name: Checkout firmware (this branch, with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: 'true'
+          fetch-depth: '0'
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Show the prudynt patch that will be applied
+        # thingino uses a GLOBAL patch dir: BR2_GLOBAL_PATCH_DIR=package/all-patches,
+        # so package patches live in package/all-patches/<pkg>/ (NOT package/<pkg>/patches/).
+        run: |
+          echo "Patches present for prudynt-t:"
+          ls -l package/all-patches/prudynt-t/ \
+            || { echo "::error::no patch in package/all-patches/prudynt-t/ — aborting"; exit 1; }
+
+      - name: Download sources
+        run: BOARD=${{ github.event.inputs.board }} make source WORKFLOW=1
+
+      - name: Build firmware (compiles prudynt with the patch)
+        # `make fast` is the parallel full build thingino's own CI uses.
+        run: BOARD=${{ github.event.inputs.board }} make fast WORKFLOW=1
+
+      - name: Confirm the FINAL patch actually applied
+        run: |
+          SRC=$(find output -type d -name 'prudynt-t-*' 2>/dev/null | grep -v '/host/' | head -1)
+          echo "prudynt source dir: $SRC"
+          [ -n "$SRC" ] || { echo "::error::prudynt source dir not found"; exit 1; }
+          ok=1
+          # 1) config key (all versions)
+          grep -qF "force_mode_cfg" "$SRC/src/Config.hpp" \
+            || { echo "::error::Config.hpp: force_mode_cfg missing — patch did not apply"; ok=0; }
+          # 2) IMPSystem EARLY-DERIVE of running_mode from force_mode (final patch only;
+          #    a stale patch sets a local boot_mode at end-of-init instead)
+          grep -qF "image.running_mode = static_cast<int>(hal::isp::RunningMode::" "$SRC/src/IMPSystem.cpp" \
+            || { echo "::error::IMPSystem.cpp: early-derive missing — STALE patch, not the final single-source version"; ok=0; }
+          # 3) worker RECORD block (final patch references force_mode_cfg in the worker)
+          grep -qF "force_mode_cfg" "$SRC/src/DayNightWorker.cpp" \
+            || { echo "::error::DayNightWorker.cpp: record block missing — STALE patch"; ok=0; }
+          # 4) must NOT be the rejected v3 deferred-apply variant
+          if grep -qF "pending_force_apply" "$SRC/src/DayNightWorker.cpp"; then
+            echo "::error::DayNightWorker.cpp: contains pending_force_apply — this is the rejected v3 deferred patch"; ok=0
+          fi
+          # 5) encoder config-change restart fix (Part 2): JsonAPI handle_stream
+          #    rebuilds the pipeline when a numeric encoder field changes.
+          grep -qF "rtsp_too" "$SRC/src/JsonAPI.cpp" \
+            || { echo "::error::JsonAPI.cpp: rtsp_too missing — encoder config-change restart fix (Part 2) not applied"; ok=0; }
+          # 6) VideoWorker teardown (0002): framesource is DELETED (not just disabled),
+          #    which frees the VB pool that leaked on every in-process rebuild.
+          grep -qF "delete global_video[encChn]->imp_framesource" "$SRC/src/VideoWorker.cpp" \
+            || { echo "::error::VideoWorker.cpp: framesource-free fix (0002) not applied"; ok=0; }
+          # 7) main.cpp quiesce (0003): StopRecvPic on all encoders before the
+          #    in-process rebuild tears down any channel (prevents the T23 VPU fault).
+          grep -qF "T23 VPU quiesce" "$SRC/src/main.cpp" \
+            || { echo "::error::main.cpp: encoder quiesce (0003) not applied"; ok=0; }
+          # 8) live reconfig (0004): IMPEncoder live setters exist.
+          grep -qF "setLiveBitrate" "$SRC/src/IMPEncoder.cpp" \
+            || { echo "::error::IMPEncoder.cpp: live setters (0004) not applied"; ok=0; }
+          # 9) live reconfig (0004): video_stream reconfig request fields exist.
+          grep -qF "req_bitrate" "$SRC/src/globals.hpp" \
+            || { echo "::error::globals.hpp: live req_* fields (0004) not applied"; ok=0; }
+          # 10) live reconfig (0004): VideoWorker drains the reconfig queue.
+          grep -qF "reconfig.exchange" "$SRC/src/VideoWorker.cpp" \
+            || { echo "::error::VideoWorker.cpp: live reconfig drain (0004) not applied"; ok=0; }
+          # 11) live reconfig (0004): JsonAPI no longer rebuilds for live fields.
+          grep -qF "do_rebuild" "$SRC/src/JsonAPI.cpp" \
+            || { echo "::error::JsonAPI.cpp: live-field no-rebuild logic (0004) not applied"; ok=0; }
+          # 11b) live reconfig (0004 FIXED): queue a live reconfig ONLY on a real
+          #      numeric set, never on a null read-query — otherwise every HA/agent
+          #      state poll reconfigures the live encoder and stalls the RTSP feed.
+          grep -qF "is_num_set" "$SRC/src/JsonAPI.cpp" \
+            || { echo "::error::JsonAPI.cpp: read-query guard (is_num_set) missing — STALE/buggy 0004 that reconfigs on every poll"; ok=0; }
+          # 12) day/night keyframe (0004, gated by 0006): apply_mode flags a
+          #     keyframe (idr_fix) after a genuine colour<->mono cut. Match the
+          #     stable code marker, NOT a comment string (0006 reworded it).
+          grep -qF "idr_fix = 1" "$SRC/src/DayNightWorker.cpp" \
+            || { echo "::error::DayNightWorker.cpp: day/night keyframe (0004/0006) not applied"; ok=0; }
+          # 13) H1 (0005): prudyntctl IPC socket is bounded (cannot hang the worker).
+          grep -qF "SO_RCVTIMEO" "$SRC/src/prudyntctl.cpp" \
+            || { echo "::error::prudyntctl.cpp: IPC socket timeout (0005 H1) not applied"; ok=0; }
+          # 14) H2 (0005): VideoWorker escalates a persistent encoder stall to a rebuild.
+          grep -qF "request_restart_if_stalled" "$SRC/src/VideoWorker.cpp" \
+            || { echo "::error::VideoWorker.cpp: stall recovery (0005 H2) not applied"; ok=0; }
+          # 15) M5 (0005): apply_mode honours the optics-switch result (returns bool).
+          grep -qF "static bool apply_mode" "$SRC/src/DayNightWorker.cpp" \
+            || { echo "::error::DayNightWorker.cpp: apply_mode result-honouring (0005 M5) not applied"; ok=0; }
+          # 16) M4 (0005): forced day/night mode is mirrored into the persisted member.
+          grep -qF "force_mode_cfg = strdup" "$SRC/src/JsonAPI.cpp" \
+            || { echo "::error::JsonAPI.cpp: forced-mode persistence (0005 M4) not applied"; ok=0; }
+          # 17) M1 (0006): motion.enabled (add_boolk_m) rebuilds only on a real change.
+          grep -qF "Rebuild ONLY on a real change" "$SRC/src/JsonAPI.cpp" \
+            || { echo "::error::JsonAPI.cpp: motion change-guard (0006 M1) not applied"; ok=0; }
+          # 18) H1 (0006): setLive* no longer force a per-change keyframe.
+          grep -qF "No forced keyframe" "$SRC/src/IMPEncoder.cpp" \
+            || { echo "::error::IMPEncoder.cpp: per-change IDR removal (0006 H1) not applied"; ok=0; }
+          # 19) H1b (0006): day/night keyframe gated to a genuine colour<->mono cut.
+          grep -qF "color_cut" "$SRC/src/DayNightWorker.cpp" \
+            || { echo "::error::DayNightWorker.cpp: gated day/night keyframe (0006 H1b) not applied"; ok=0; }
+          # 20) M8 (0006): force_mode is a leak-free int enum (no per-command strdup).
+          grep -qF "std::atomic<int> force_mode" "$SRC/src/Config.hpp" \
+            || { echo "::error::Config.hpp: leak-free force_mode int enum (0006 M8) not applied"; ok=0; }
+          # 21) (0007): physical-privacy software mic mute — JsonAPI `mic_muted` key (runtime,
+          #     no restart) + AudioWorker zeros the captured PCM into a scratch buffer.
+          grep -qF "mic_muted" "$SRC/src/JsonAPI.cpp" \
+            || { echo "::error::JsonAPI.cpp: mic_muted key (0007 software mute) not applied"; ok=0; }
+          grep -qF "mutedScratch" "$SRC/src/AudioWorker.cpp" \
+            || { echo "::error::AudioWorker.cpp: PCM-zeroing scratch (0007 software mute) not applied"; ok=0; }
+          # 22) (0008): steady audio RTP timestamps — sample-clock anchor + drift-gated re-anchor.
+          grep -qF "audioSamplesSinceAnchor" "$SRC/src/IMPDeviceSource.cpp" \
+            || { echo "::error::IMPDeviceSource.cpp: audio sample-clock (0008 RTP timestamp fix) not applied"; ok=0; }
+          # 23) (0008, OPUS-ONLY revision): the sample-clock is gated to OPUS frames only —
+          #     AAC/PCM/G711 keep the stock timestamp path (byte-for-byte). Confirm the OPUS
+          #     gate + the af.samples plumbing, AND reject the OLD 0008 that also resized the
+          #     AAC reframer buffer (that change caused AAC "horrible noise" and was removed).
+          grep -qF "imp_audio->format == IMPAudioFormat::OPUS" "$SRC/src/IMPDeviceSource.cpp" \
+            || { echo "::error::IMPDeviceSource.cpp: OPUS-only sample-clock gate (revised 0008) missing — STALE 0008"; ok=0; }
+          grep -qF "af.samples = static_cast<uint32_t>(frame_samples)" "$SRC/src/AudioWorker.cpp" \
+            || { echo "::error::AudioWorker.cpp: af.samples plumbing (0008) not applied"; ok=0; }
+          if grep -qF "Size to the reframer's true mono output" "$SRC/src/AudioWorker.cpp"; then
+            echo "::error::AudioWorker.cpp: OLD 0008 AAC reframer-resize present (caused AAC noise) — use the OPUS-only 0008"; ok=0
+          fi
+          # 24) (0009): raise the RTSP cold-boot SPS/PPS bootstrap deadline 10s -> 45s so a
+          #     slow-warming T23 encoder registers ch0 instead of skipping it (DESCRIBE 404 /
+          #     dead stream after reboot/power-cut). Match the explanatory comment so a STALE
+          #     RTSP.cpp (still 10s) is rejected.
+          grep -qF "Cold-boot bootstrap deadline" "$SRC/src/RTSP.cpp" \
+            || { echo "::error::RTSP.cpp: cold-boot SPS/PPS deadline raise (0009) not applied"; ok=0; }
+          # 25) (0010 / C2): fail-fast exit if IMPSystem::createNew() returns null, so a failed
+          #     IMP init never leaves prudynt alive-but-streamless (watchdog-blind).
+          grep -qF "IMPSystem initialisation failed; exiting for supervisor restart" "$SRC/src/main.cpp" \
+            || { echo "::error::main.cpp: IMP-init null-check exit (0010/C2) not applied"; ok=0; }
+          # 26) (0011 / C5): exit if zero RTSP video channels register (closes 0009's residual:
+          #     a streamless prudynt that answers OPTIONS=200 but DESCRIBE=404). addSubsession
+          #     now returns bool; start() raises SIGTERM when nothing registered.
+          grep -qF "No video channel registered (SPS/PPS unavailable)" "$SRC/src/RTSP.cpp" \
+            || { echo "::error::RTSP.cpp: zero-channel fail-fast exit (0011/C5) not applied"; ok=0; }
+          grep -qF "bool RTSP::addSubsession" "$SRC/src/RTSP.cpp" \
+            || { echo "::error::RTSP.cpp: addSubsession bool return (0011/C5) not applied"; ok=0; }
+          # 27) (0012 / C1-durable): apply factory defaults when the config fails to parse, so a
+          #     corrupt/truncated prudynt.json degrades to factory-safe (isp_bypass stays true)
+          #     instead of zero-init brick. Match BOTH changed sites.
+          grep -qF "C1-durable: always run the item loops" "$SRC/src/Config.cpp" \
+            || { echo "::error::Config.cpp: apply-defaults-on-parse-fail load() change (0012/C1-durable) not applied"; ok=0; }
+          grep -qF "C1-durable: do NOT early-return on a null jsonConfig" "$SRC/src/Config.cpp" \
+            || { echo "::error::Config.cpp: handleConfigItem null-fallthrough (0012/C1-durable) not applied"; ok=0; }
+          # 28) (0013 / reader-hardening): tolerate a double-quoted daynight.force_mode so a
+          #     forced day/night mode persisted as "\"night\"" by the agent set-path is honored
+          #     at boot (strips a surrounding quote pair at config load) instead of being
+          #     rejected by the strict validator -> booting day with night optics.
+          grep -qF "0013 (reader-hardening)" "$SRC/src/Config.cpp" \
+            || { echo "::error::Config.cpp: force_mode quote-tolerance (0013) not applied"; ok=0; }
+          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (0001-0003 base; 0004 live reconfig + IDR; 0005 fault-tolerance; 0006 high-freq seamlessness; 0007 physical-privacy software mic mute; 0008 audio RTP sample-clock (OPUS-only); 0009 cold-boot RTSP SPS/PPS deadline; 0010 IMP-init fail-fast; 0011 zero-channel fail-fast; 0012 config apply-defaults-on-parse-fail; 0013 force_mode quote-tolerance)" || exit 1
+
+      - name: Locate the built MIPS prudynt binary
+        id: find
+        run: |
+          # prefer the binary staged into the target rootfs
+          BIN=$(find output -type f -path '*/target/usr/bin/prudynt' 2>/dev/null | head -1)
+          # fall back to the package build dir
+          [ -z "$BIN" ] && BIN=$(find output -type f -path '*prudynt-t-*' -name prudynt 2>/dev/null | grep -v '/host/' | head -1)
+          echo "Found: $BIN"
+          file "$BIN"
+          echo "bin=$BIN" >> "$GITHUB_OUTPUT"
+
+      - name: Upload prudynt binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: prudynt-${{ github.event.inputs.board }}
+          path: ${{ steps.find.outputs.bin }}
+          if-no-files-found: error

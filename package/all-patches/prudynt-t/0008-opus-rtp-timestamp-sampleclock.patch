@@ -1,6 +1,7 @@
-Subject: [PATCH] Steady audio RTP timestamps for OPUS only (fix OPUS/WebRTC jitter)
+Subject: [PATCH] Steady audio RTP timestamps from a sample-clock (fix OPUS/WebRTC jitter)
 Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (branch stable).
-Stacks on: 0001-0007. Applies with git apply -p1 / patch -p1 AFTER them.
+Stacks on: 0001-0007. Applies with git apply -p1 / patch -p1 AFTER them. (Touches globals.hpp
+and AudioWorker.cpp in regions disjoint from 0007's audio_stream/process_frame edits.)
 
 Audio RTP timestamps were stamped from gettimeofday() at delivery (IMPDeviceSource::
 deliverFrame, audio branch), so per-packet RTP timestamp deltas carried capture/scheduling
@@ -9,146 +10,178 @@ OPUS frames @48k clock). WebRTC's NetEQ is intolerant of irregular audio timesta
 stutters. ffmpeg re-encode (clean sample-clock) is smooth -> the payload was fine, only the
 timing was wrong.
 
-Fix (OPUS ONLY): for OPUS frames, stamp from a monotonic SAMPLE counter that advances by each
-frame's exact audio duration, so the per-packet RTP delta is constant. Re-anchor ONLY on a large
-FORWARD wallclock drift (>250ms = a genuine gap: stall / standby-resume / session restart /
-forward NTP step); negative drift (drained queue bursts, backward NTP step) is absorbed by the
-steady counter and does NOT re-anchor. A 5s-throttled LOG_INFO fires on re-anchor so the field
-can confirm it only triggers on real gaps/reconnects, never per-packet.
-
-SCOPE / ISOLATION: the new sample-clock runs ONLY when the encoder format is OPUS. EVERY other
-codec (AAC, PCM, G711, ...) takes the UNCHANGED stock timestamp path (the original gettimeofday +
-monotonic-floor code, now the `else` branch) -- byte-for-byte identical to stock. This patch does
-NOT touch the AudioReframer, the AAC encoder, channel handling, or any audio PAYLOAD. (An earlier
-revision of this patch also resized the AAC reframer buffer; that change is REMOVED -- it caused
-AAC noise and is unrelated to the OPUS timestamp fix.)
+Fix: stamp audio from a monotonic SAMPLE counter that advances by each frame's exact audio
+duration, so the per-packet RTP delta is constant. Re-anchor ONLY on a large FORWARD wallclock
+drift (>250ms = a genuine gap: stall / standby-resume / session restart / forward NTP step);
+negative drift (drained queue bursts, backward NTP step) is absorbed by the steady counter and
+does NOT re-anchor -- preserving the original author's NTP/stale-frame robustness without
+reintroducing per-packet jitter. A 5s-throttled LOG_INFO fires on re-anchor so the field can
+confirm it only triggers on real gaps/reconnects, never per-packet.
 
 ALL arithmetic stays in the CAPTURE clock (sample_rate); live555's SimpleRTPSink converts the
 presentation-time delta to the RTP clock (48000 for OPUS), so a 40ms frame -> +1920 ticks and a
-20ms frame -> +960 automatically. IMPDeviceSource never references 48000.
+20ms frame -> +960 automatically. IMPDeviceSource never references 48000. RTCP Sender Reports
+(re-derived from fPresentationTime every ~5s by live555) keep A/V in sync under slow clock skew.
+
+Also fixes a pre-existing AAC + force_stereo data-flow bug exposed by deriving the timestamp
+from the sample count: the AudioReframer always outputs 1024 MONO samples (2048 bytes), but the
+run-loop sized its buffer by outChnCnt and mislabeled the frame as 2x its real length, so
+process_frame double-dupped the audio AND the per-channel frame_samples (the timestamp step)
+came out 2x too large. The buffer is now sized to the reframer's true mono output. No effect on
+OPUS (no reframer), mono AAC (unchanged), or any non-stereo-forced config.
 
 - globals.hpp: AudioFrame gains `uint32_t samples` (per-channel PCM count, default 0).
-- AudioWorker.cpp: process_audio_frame sets af.samples = frame_samples (after the clamp). It is
-  read ONLY by the OPUS branch in IMPDeviceSource; for non-OPUS frames it is set but unused, so
-  the AAC/PCM/G711 data and code paths are unchanged. (No reframer/buffer change.)
+- AudioWorker.cpp: process_audio_frame sets af.samples = frame_samples (after the clamp); the
+  reframer buffer is sized 1024*sizeof(uint16_t) (mono), not *outChnCnt.
 - IMPDeviceSource.hpp: audio anchor state (audioAnchorUs / audioSamplesSinceAnchor / audioAnchorRate);
   single-instance because USE_AUDIO_STREAM_REPLICATOR shares one upstream source across clients.
-- IMPDeviceSource.cpp: the audio branch gains an `if (format==OPUS) { sample-clock } else { STOCK }`.
-  The else block is the original stock code, verbatim. Video branch untouched.
+- IMPDeviceSource.cpp: the audio branch of deliverFrame replaced with the sample-clock + drift-gated
+  re-anchor + strict-monotonic backstop. Video branch untouched.
 
 diff --git a/src/AudioWorker.cpp b/src/AudioWorker.cpp
 index 67ac027..774cf59 100644
 --- a/src/AudioWorker.cpp
 +++ b/src/AudioWorker.cpp
-@@ -256,6 +256,10 @@ void AudioWorker::process_audio_frame(IMPAudioFrame &frame) {
+@@ -256,6 +256,9 @@ void AudioWorker::process_audio_frame(IMPAudioFrame &frame) {
    if (frame_samples <= 0) {
      frame_samples = 1024;
    }
-+  // Carry the per-channel PCM sample count to the RTP source so the OPUS branch can advance
-+  // the RTP timestamp by this frame's exact duration. Read ONLY by IMPDeviceSource's OPUS
-+  // path; for non-OPUS frames it is set but unused (no behavior change for AAC/PCM/G711).
++  // Carry the per-channel PCM sample count to the RTP source so it advances the audio
++  // RTP timestamp by this frame's exact audio duration (steady deltas — see IMPDeviceSource).
 +  af.samples = static_cast<uint32_t>(frame_samples);
-
+ 
    bool any_recorder_active = false;
    for (int ch = 0; ch < NUM_VIDEO_CHANNELS; ++ch) {
+@@ -447,8 +450,15 @@ void AudioWorker::run() {
+           reframer->addFrame(reinterpret_cast<uint8_t *>(frame.virAddr),
+                              frame.timeStamp);
+           while (reframer->hasMoreFrames()) {
+-            size_t frameLen = 1024 * sizeof(uint16_t) *
+-                              global_audio[encChn]->imp_audio->outChnCnt;
++            // The reframer always outputs 1024 MONO samples (getReframedFrame fetches
++            // outputSamplesPerFrame*sizeof(uint16_t) = 2048 bytes); it does NOT produce
++            // per-output-channel data. process_frame() below does the mono->stereo
++            // duplication when outChnCnt==2. Sizing this buffer by outChnCnt over-
++            // allocated and mislabeled the frame as 2x its real length (len=4096, marked
++            // MONO), so process_frame double-dupped the audio AND process_audio_frame's
++            // per-channel frame_samples (hence the 0008 RTP timestamp step) came out 2x
++            // too large for AAC+force_stereo. Size to the reframer's true mono output.
++            size_t frameLen = 1024 * sizeof(uint16_t);
+             std::vector<uint8_t> frameData(frameLen, 0);
+             int64_t audio_ts_us;
+             reframer->getReframedFrame(frameData.data(), audio_ts_us);
 diff --git a/src/IMPDeviceSource.cpp b/src/IMPDeviceSource.cpp
 index a1a7666..b1a04cb 100644
 --- a/src/IMPDeviceSource.cpp
 +++ b/src/IMPDeviceSource.cpp
-@@ -122,41 +122,93 @@ void IMPDeviceSource<FrameType, Stream>::deliverFrame() {
+@@ -122,41 +122,89 @@ void IMPDeviceSource<FrameType, Stream>::deliverFrame() {
        fFrameSize = nal.data.size();
      }
--
-+
-     /* Use monotonic counter-based timestamps for AAC to produce perfectly
-        steady +1024 RTP PTS increments and avoid gettimeofday jitter. */
+ 
+-    /* Use monotonic counter-based timestamps for AAC to produce perfectly
+-       steady +1024 RTP PTS increments and avoid gettimeofday jitter. */
++    /* OPUS/WebRTC needs perfectly steady RTP timestamps. Stamp audio from a monotonic
++       SAMPLE counter (advance by each frame's exact audio duration) instead of per-frame
++       wallclock, so the per-packet RTP delta is constant. Re-anchor ONLY on a large
++       FORWARD wallclock drift (a genuine gap: stall / standby-resume / session restart /
++       forward NTP step); negative drift (drained queue bursts, backward NTP step) is
++       ABSORBED by the steady counter and must NOT re-anchor (that would reintroduce the
++       per-packet jitter we are fixing). ALL math stays in the CAPTURE clock (sample_rate);
++       live555's SimpleRTPSink converts the presentation-time delta to the RTP clock (48000
++       for OPUS), so a 40ms frame becomes +1920 ticks automatically -- never reference
++       48000 here. */
      if constexpr (std::is_same_v<FrameType, AudioFrame>) {
++      static constexpr int64_t kAudioReanchorFwdUs =
++          250000; // 250 ms: above worst benign burst, well below a real gap
        auto *imp_audio = global_audio[encChn]->imp_audio;
++
        int sampleRate = 16000;
        if (cfg && cfg->audio.input_sample_rate > 0) {
          sampleRate = cfg->audio.input_sample_rate;
        }
-       if (imp_audio) {
-         if (imp_audio->sample_rate > 0) {
-           sampleRate = imp_audio->sample_rate;
-         }
-       }
--
-+
-+      // OPUS/WebRTC needs a perfectly steady RTP clock: stamp from a monotonic SAMPLE
-+      // counter (advance by each frame's exact duration); re-anchor only on a large
-+      // forward wallclock gap. EVERY non-OPUS codec (AAC, PCM, G711, ...) falls through to
-+      // the UNCHANGED stock path in the else below, so this patch cannot affect them. All
-+      // math is in the capture clock; live555 converts to the 48k OPUS RTP clock.
-+      if (imp_audio && imp_audio->format == IMPAudioFormat::OPUS) {
-+        static constexpr int64_t kAudioReanchorFwdUs = 250000;
-+        int orate = sampleRate > 0 ? sampleRate : 16000;
-+        int64_t frameSamples = nal.samples > 0
-+                                   ? static_cast<int64_t>(nal.samples)
-+                                   : static_cast<int64_t>(orate) * 40 / 1000;
-+        if (frameSamples < 1) {
-+          frameSamples = 1;
-+        }
-+        int64_t stepUs = frameSamples * 1000000LL / orate;
-+        if (stepUs < 1) {
-+          stepUs = 1;
-+        }
-+        gettimeofday(&fPresentationTime, NULL);
-+        int64_t nowUs = tv_to_us(fPresentationTime);
-+        if (audioAnchorUs < 0 || orate != audioAnchorRate) {
-+          audioAnchorUs = nowUs;
-+          audioSamplesSinceAnchor = 0;
-+          audioAnchorRate = orate;
-+        }
-+        int64_t pts_us =
-+            audioAnchorUs + audioSamplesSinceAnchor * 1000000LL / orate;
-+        int64_t drift_us = nowUs - pts_us;
-+        if (drift_us > kAudioReanchorFwdUs) {
-+          int64_t candidate = nowUs;
-+          if (audioLastPtsUs >= 0 && candidate <= audioLastPtsUs) {
-+            candidate = audioLastPtsUs + stepUs;
-+          }
-+          audioAnchorUs = candidate;
-+          audioSamplesSinceAnchor = 0;
-+          audioAnchorRate = orate;
-+          pts_us = candidate;
-+          static int64_t last_reanchor_log_us = 0;
-+          if (nowUs - last_reanchor_log_us >= 5000000LL) {
-+            last_reanchor_log_us = nowUs;
-+            LOG_INFO("audio RTP re-anchor (OPUS): fwd drift "
-+                     << drift_us << "us, rate " << orate);
-+          }
-+        }
-+        if (audioLastPtsUs >= 0 && pts_us <= audioLastPtsUs) {
-+          pts_us = audioLastPtsUs + stepUs;
-+        }
-+        fPresentationTime = us_to_tv(pts_us);
-+        audioLastPtsUs = pts_us;
-+        audioSamplesSinceAnchor += frameSamples;
-+      } else {
-       // Always use current wallclock. This keeps fPresentationTime in the
-       // same clock domain as live555's presetNextTimestamp(), so NTP steps
-       // and stale ring-buffer frames never cause RTP timestamp jumps.
-       gettimeofday(&fPresentationTime, NULL);
--
-+
-       int64_t pts_us = tv_to_us(fPresentationTime);
-       int rate_for_tick = sampleRate > 0 ? sampleRate : 16000;
-       // AAC: 1024 samples/frame; non-AAC: ~40ms frames
-       int64_t min_audio_step_us =
-           (1024LL * 1000000LL + rate_for_tick - 1) / rate_for_tick;
-       if (min_audio_step_us < 1) {
-         min_audio_step_us = 1;
-       }
-       if (audioLastPtsUs >= 0) {
-         int64_t delta_pts_us = pts_us - audioLastPtsUs;
-         if (delta_pts_us <= 0) {
-           pts_us = audioLastPtsUs + min_audio_step_us;
-           fPresentationTime = us_to_tv(pts_us);
-         }
-       }
-       audioLastPtsUs = pts_us;
+-      if (imp_audio) {
+-        if (imp_audio->sample_rate > 0) {
+-          sampleRate = imp_audio->sample_rate;
+-        }
++      if (imp_audio && imp_audio->sample_rate > 0) {
++        sampleRate = imp_audio->sample_rate;
 +      }
++      if (sampleRate < 1) {
++        sampleRate = 16000;
++      }
++
++      // Per-frame PCM sample count (capture clock). Format-aware fallback only if the
++      // producer ever fails to set it: AAC frames are 1024 samples, others ~40ms.
++      bool isAac = imp_audio && imp_audio->format == IMPAudioFormat::AAC;
++      int64_t frameSamples =
++          nal.samples > 0
++              ? static_cast<int64_t>(nal.samples)
++              : (isAac ? 1024 : static_cast<int64_t>(sampleRate) * 40 / 1000);
++      if (frameSamples < 1) {
++        frameSamples = 1;
++      }
++      int64_t stepUs = frameSamples * 1000000LL / sampleRate;
++      if (stepUs < 1) {
++        stepUs = 1;
+       }
+ 
+-      // Always use current wallclock. This keeps fPresentationTime in the
+-      // same clock domain as live555's presetNextTimestamp(), so NTP steps
+-      // and stale ring-buffer frames never cause RTP timestamp jumps.
+       gettimeofday(&fPresentationTime, NULL);
++      int64_t nowUs = tv_to_us(fPresentationTime);
+ 
+-      int64_t pts_us = tv_to_us(fPresentationTime);
+-      int rate_for_tick = sampleRate > 0 ? sampleRate : 16000;
+-      // AAC: 1024 samples/frame; non-AAC: ~40ms frames
+-      int64_t min_audio_step_us =
+-          (1024LL * 1000000LL + rate_for_tick - 1) / rate_for_tick;
+-      if (min_audio_step_us < 1) {
+-        min_audio_step_us = 1;
++      // (Re)anchor on the first frame or if the capture rate changed under us.
++      if (audioAnchorUs < 0 || sampleRate != audioAnchorRate) {
++        audioAnchorUs = nowUs;
++        audioSamplesSinceAnchor = 0;
++        audioAnchorRate = sampleRate;
+       }
+-      if (audioLastPtsUs >= 0) {
+-        int64_t delta_pts_us = pts_us - audioLastPtsUs;
+-        if (delta_pts_us <= 0) {
+-          pts_us = audioLastPtsUs + min_audio_step_us;
+-          fPresentationTime = us_to_tv(pts_us);
++
++      // Steady, jitter-free pts from the sample counter.
++      int64_t pts_us =
++          audioAnchorUs + audioSamplesSinceAnchor * 1000000LL / sampleRate;
++      int64_t drift_us =
++          nowUs - pts_us; // >0: wallclock ahead (gap); <0: audio ahead (burst)
++
++      if (drift_us > kAudioReanchorFwdUs) {
++        int64_t candidate = nowUs;
++        if (audioLastPtsUs >= 0 && candidate <= audioLastPtsUs) {
++          candidate = audioLastPtsUs + stepUs; // backward-clock guard
++        }
++        audioAnchorUs = candidate;
++        audioSamplesSinceAnchor = 0;
++        audioAnchorRate = sampleRate;
++        pts_us = candidate;
++        // 5s-throttled: must fire ONLY on real gaps/reconnects, never per-packet.
++        static int64_t last_reanchor_log_us = 0;
++        if (nowUs - last_reanchor_log_us >= 5000000LL) {
++          last_reanchor_log_us = nowUs;
++          LOG_INFO("audio RTP re-anchor: fwd drift " << drift_us << "us, rate "
++                                                     << sampleRate);
+         }
+       }
++
++      // Strict-monotonic backstop (no-op on the steady path).
++      if (audioLastPtsUs >= 0 && pts_us <= audioLastPtsUs) {
++        pts_us = audioLastPtsUs + stepUs;
++      }
++
++      fPresentationTime = us_to_tv(pts_us);
+       audioLastPtsUs = pts_us;
++      audioSamplesSinceAnchor += frameSamples;
      } else {
        // Always use current wallclock for video too.
        gettimeofday(&fPresentationTime, NULL);
@@ -160,14 +193,14 @@ index 6c8485e..f416c2c 100644
    uint64_t audioFrameCount{0};
    int audioClockSampleRate{0};
    int64_t audioLastPtsUs{-1};
-+  // Sample-clock anchor for steady OPUS audio RTP timestamps (0008): advance pts by each
++  // Sample-clock anchor for steady audio RTP timestamps (0008): advance pts by each
 +  // frame's exact audio duration; re-anchor only on a large forward wallclock drift.
 +  // State is single-instance because USE_AUDIO_STREAM_REPLICATOR shares one upstream
 +  // source across all clients -> one steady clock for everyone (do NOT move per-client).
 +  int64_t audioAnchorUs{-1};          // wallclock us of the current anchor
 +  int64_t audioSamplesSinceAnchor{0}; // samples emitted since the anchor
 +  int audioAnchorRate{0};             // capture rate the anchor was built at
-
+ 
    // Video encoder timestamp tracking (avoids gettimeofday jitter)
    bool videoFirstFrame{true};
 diff --git a/src/globals.hpp b/src/globals.hpp
@@ -178,7 +211,7 @@ index 29ab8ca..7f945b5 100644
  struct AudioFrame {
    std::vector<uint8_t> data;
    struct timeval time;
-+  uint32_t samples{0}; // per-channel CAPTURE PCM sample count (pre-encode); drives the OPUS RTP timestamp step
++  uint32_t samples{0}; // per-channel CAPTURE PCM sample count (pre-encode); drives the audio RTP timestamp step
  };
-
+ 
  struct H264NALUnit {
