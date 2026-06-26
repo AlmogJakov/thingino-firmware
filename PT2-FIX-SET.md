@@ -35,12 +35,13 @@ is **not** installed into the firmware image.
 - **Timezone shows UTC.** uClibc-ng rejects the extended DST hour in the stock TZ rule →
   whole TZ discarded → clock in UTC.
 - **A/V defects.** OPUS WebRTC stutter from jittery RTP timestamps; the mic mute restarted
-  the audio worker and broke the stream.
+  the audio worker and broke the stream; and a live audio-codec change (`mic_format` OPUS↔AAC)
+  stuttered/killed audio until a full prudynt restart.
 - **Flash wear / overlay exhaustion.** Config was rewritten on every action and large files
   were edited live, filling the tiny jffs2 config overlay.
 
 ### What was fixed
-- **prudynt binary:** 13 source patches `0001`-`0013` (auto-applied by buildroot's global
+- **prudynt binary:** 14 source patches `0001`-`0014` (auto-applied by buildroot's global
   patch dir; the source is git-fetched at `f4b3228` and never hand-edited).
 - **Rootfs:** ~19 script/asset changes (reboot hardening, day/night persistence + optics +
   colour, physical privacy, timezone, HA/WebUI integration) baked into the **read-only
@@ -100,8 +101,10 @@ is **not** installed into the firmware image.
 | `overlay/usr/bin/motors` | **Added** | - (overlay) | `/usr/bin/motors` (wrapper) | ✅ squashfs |
 | `overlay/usr/sbin/physical-privacy` | **Added** | - (overlay) | `/usr/sbin/physical-privacy` | ✅ squashfs |
 | `overlay/usr/sbin/tz-update` | **Added** | - (overlay) | `/usr/sbin/tz-update` | ✅ squashfs |
-| `package/all-patches/prudynt-t/0001…0013-*.patch` | Added (in branch) | prudynt-t (build patches) | compiled into `/usr/bin/prudynt` | ✅ binary |
+| `package/all-patches/prudynt-t/0001…0014-*.patch` | Added (in branch) | prudynt-t (build patches) | compiled into `/usr/bin/prudynt` | ✅ binary |
 | `PT2-FIX-SET.md` (this file) | **Added** | - | not installed | ❌ repo doc only |
+| `.github/workflows/prudynt-binary.yml` | **Added** | - | not installed (CI) | ❌ builds prudynt binary only |
+| `.github/workflows/pt2-build-artifact.yml` | **Added** | - | not installed (CI) | ❌ builds full PT2 image |
 
 ¹ The prudynt-t package ships `S32prudyntwd` but its install rule is commented out, so the
 stock build has no watchdog. We add it via the overlay (no `.mk` change needed).
@@ -255,14 +258,37 @@ stock build has no watchdog. We add it via the overlay (no `.mk` change needed).
 - **Notes:** hard companions - inert unless all three ship. Validate busybox `date -d @epoch`
   / `-u` on the real unit; otherwise it falls through to the approximate path.
 
-### G. A/V quality
-- **Problem:** OPUS WebRTC stutter; mic mute broke the stream.
-- **Root cause:** RTP timestamps were derived from jittery `gettimeofday` deltas; the old mute
-  restarted the audio worker.
-- **Solution:** `0008` - sample-clock RTP timestamps with asymmetric, forward-only drift-gated
-  re-anchoring (flat 1920 deltas); `0007` - software PCM mute (see §E). `main.js` rewires the
-  WebUI mic button from `mic_enabled` (restart) to `mic_muted` (soft-mute).
-- **Files:** patches `0007`, `0008`; `main.js`.
+### G. A/V quality + live audio codec switching
+- **Problem:** OPUS WebRTC stutter; mic mute broke the stream; and a live audio-codec change
+  (`mic_format` OPUS↔AAC in the web UI) stuttered / killed go2rtc audio until `S31prudynt restart`.
+- **Root cause:** (1) RTP timestamps from jittery `gettimeofday` deltas; (2) the old mute restarted
+  the audio worker; (3) a live `mic_format` change raised `global_restart_audio` (rebuilds the encoder
+  → new-codec bytes on the wire) but **not** `global_restart_rtsp`, so the cached RTSP audio **SDP**
+  stayed stale (live555 freezes `fSDPLines` at the first DESCRIBE) → the client kept depacketizing the
+  old codec → stutter / AAC→OPUS silence. A full restart rebuilt the SDP, which is why it worked.
+- **Solution:**
+  - `0008` - sample-clock RTP timestamps, forward-only drift-gated re-anchoring (flat 1920 deltas),
+    **all codecs**, plus the AAC+`force_stereo` reframer-buffer fix. (An OPUS-only revision of `0008`
+    was explored and **abandoned** - the AAC defect was the codec-switch bug below, not `0008`.)
+  - `0007` - software PCM mute (see §E).
+  - `0014` - on a **real** `mic_format` change, `handle_audio` also raises `global_restart_rtsp`
+    (read-back diff-gated so HA/agent re-sends don't churn RTSP), mirroring the video `format` path, so
+    the RTSP audio subsession + SDP are rebuilt and clients re-DESCRIBE the new codec. No `S31prudynt
+    restart`, no stutter; a fresh RTSP client gets the new codec immediately. (`mic_sample_rate`, the
+    RTP clock, is also SDP-affecting but rarer - left on the stock path; easy follow-up.)
+  - `main.js` rewires the WebUI mic button from `mic_enabled` (restart) to `mic_muted` (soft-mute).
+- **Files:** patches `0007`, `0008`, `0014`; `main.js`.
+- **Known limitation (accepted; downstream of prudynt, no change made):** a **live** HA WebRTC card
+  stays muted after a codec change until it is re-opened. go2rtc locks the WebRTC consumer's audio codec
+  at the initial SDP and does **not** renegotiate a surviving session when the source codec flips (video
+  recovers; audio does not) - confirmed in go2rtc source (`add_consumer.go` one-shot match; `producer.go`
+  reconnect `MatchCodec`). Accepted because a codec change is deliberate and rare. Optional seamless fix
+  (not applied): a codec-stable OPUS track in go2rtc via `ffmpeg:<src>#video=copy#audio=copy#audio=opus`.
+- **Recovery model (life-safety):** the codec change is the **only** non-recovering case, because it is
+  the only event that changes the negotiated codec. Every **involuntary** disruption (reboot, power-cut,
+  network drop, prudynt crash/wedge/restart) keeps the same codec → go2rtc reconnects and re-binds both
+  tracks → audio+video recover. Prerequisite: go2rtc itself must be supervised (auto-restart),
+  complementing prudynt fail-fast (§A) + watchdog (§B).
 
 ### H. Live-reconfig / stream seamlessness (T23)
 - **Problem:** stream-config changes could freeze the VPU or drop the stream.
@@ -461,9 +487,9 @@ is a flash write).
 ---
 
 ## Build & validate (reminder)
-- prudynt C++ ships **only** via patches `0001`-`0013` in `package/all-patches/prudynt-t/`
+- prudynt C++ ships **only** via patches `0001`-`0014` in `package/all-patches/prudynt-t/`
   (auto-applied; source git-fetched at `f4b3228` - never hand-edit source).
-- After build, in the staged image, verify the motors split (§4) and that `0007`/`0013` are in
-  the binary.
+- After build, in the staged image, verify the motors split (§4) and that `0007`/`0013`/`0014`
+  are in the binary (e.g. grep `add_strk_a_rtsp` for `0014`).
 - On device after flash: forced-night boot, `tz-update` date math, total rcK stop < 60 s, and
   the motors interlock.
