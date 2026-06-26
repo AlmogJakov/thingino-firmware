@@ -195,11 +195,11 @@ jobs:
           #     rejected by the strict validator -> booting day with night optics.
           grep -qF "0013 (reader-hardening)" "$SRC/src/Config.cpp" \
             || { echo "::error::Config.cpp: force_mode quote-tolerance (0013) not applied"; ok=0; }
-          # 29) (0014): a live audio codec/rate switch (mic_format / mic_sample_rate) now ALSO
-          #     rebuilds the RTSP audio subsession so its cached SDP regenerates and go2rtc
-          #     re-DESCRIBEs against the new codec -- fixes AAC stutter / AAC->OPUS audio loss
-          #     without an S31prudynt restart. Diff-gated; sets global_restart_rtsp via the new
-          #     add_strk_a_rtsp / add_int_a_rtsp lambdas in handle_audio.
+          # 29) (0014): a live audio CODEC switch (mic_format) now ALSO rebuilds the RTSP audio
+          #     subsession so its cached SDP regenerates and go2rtc re-DESCRIBEs against the new
+          #     codec -- fixes AAC stutter / AAC->OPUS audio loss without an S31prudynt restart.
+          #     Diff-gated; sets global_restart_rtsp via the new add_strk_a_rtsp lambda in
+          #     handle_audio. (mic_sample_rate is a separate, deferred follow-up.)
           grep -qF "add_strk_a_rtsp" "$SRC/src/JsonAPI.cpp" \
             || { echo "::error::JsonAPI.cpp: live audio codec-switch RTSP rebuild (0014) not applied"; ok=0; }
           [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (0001-0003 base; 0004 live reconfig + IDR; 0005 fault-tolerance; 0006 high-freq seamlessness; 0007 physical-privacy software mic mute; 0008 audio RTP sample-clock (all codecs) + AAC force_stereo reframer fix; 0009 cold-boot RTSP SPS/PPS deadline; 0010 IMP-init fail-fast; 0011 zero-channel fail-fast; 0012 config apply-defaults-on-parse-fail; 0013 force_mode quote-tolerance; 0014 live audio codec-switch RTSP rebuild)" || exit 1
