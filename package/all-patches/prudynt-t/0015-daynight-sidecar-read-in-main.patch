@@ -1,40 +1,32 @@
-Subject: [PATCH] main: daynight sidecar read in main() + sigaltstack + startup trace + UNBUFFERED DIAG markers
+Subject: [PATCH] DIAGNOSTIC: arm crash handler before lock-acquire + pin acquire_instance_lock call (capture backtrace)
 Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (stacks on 0001-0014)
 
-DIAGNOSTIC BUILD. The daynight minimal-write feature reads /etc/daynight.state in
-main() (apply_daynight_sidecar, NOT in CFG::load -- moved there to keep CFG::load
-byte-identical to the proven build). But the daemon still SIGSEGVs at startup inside
-libuclibcshim BEFORE any of that code runs -- the buffered Logger hid which step
-faults.
+DIAGNOSTIC BUILD (throwaway). Prior diagnostic proved the startup SIGSEGV is in
+acquire_instance_lock() -- proven Jun-26 code, unrelated to day/night -- which ran
+BEFORE the crash handler was installed, so /tmp/prudynt_crash.log was never written.
+0015's code never executes; its mere presence shifts the binary enough to fault.
 
-This build adds UNBUFFERED markers: a DIAG(x) macro that does a raw write(2, ...)
-(direct syscall, no stdio/Logger buffering) at every early-startup step, plus one
-at the crash-handler entry. The LAST "DIAG:" line on stderr before the segfault
-pins the exact faulting statement:
+This build:
+  1. MOVES the sigaltstack + sigaction crash-handler install to the TOP of main(),
+     BEFORE InstanceLockGuard/acquire (markers A1/A2), so the fault in acquire is
+     now CAUGHT and dumped to /tmp/prudynt_crash.log with the register backtrace
+     (EPC/RA + dladdr symbols) -- the exact libuclibcshim function + call chain.
+  2. Adds unbuffered DIAG markers INSIDE acquire_instance_lock to pin the exact
+     faulting call:
+       acq1 = pre  std::filesystem::create_directories
+       acq2 = post create_directories (so crash between acq1 and acq2 = filesystem)
+       acq3 = post ::open
+       acq4 = lock fully acquired
+Keeps the daynight sidecar read (apply_daynight_sidecar) and the earlier A/D/E/F
+markers. CFG::load()/Config.cpp byte-identical to proven.
 
-  A  = entered main body (post bootstrap log)
-  B  = instance lock acquired
-  B2 = sigaltstack registered
-  C  = signal handlers installed (sigaction done)
-  D  = recover_stale_imp_state() returned
-  D2 = about to call make_shared<CFG>()
-  E  = make_shared<CFG>() returned (CFG::load done)
-  F  = apply_daynight_sidecar() returned
-  HANDLER entered = the crash handler ran (so a missing crash log = file-write issue,
-                    not handler-never-runs)
-
-So: last marker "C" -> crash in recover_stale_imp_state(); "D2" -> crash inside
-CFG::load(); "E" -> crash in apply_daynight_sidecar(); etc. All of A..D are
-PROVEN Jun-26 code, so if the crash lands there it confirms 0015's mere presence
-(binary layout/codegen shift) trips a latent shim fault rather than any new logic.
-
-Also keeps the sigaltstack/SA_ONSTACK crash-handler hardening. Allocation-free
-sidecar read (raw open/read, C buffers, static literals).
+Read it as: last DIAG line before "Segmentation fault" = the faulting statement;
+"HANDLER entered" + a populated /tmp/prudynt_crash.log = the real backtrace.
 
 Verified: git apply --check + patch -p1 both pass against f4b3228 + 0001-0014.
 
 diff --git a/src/main.cpp b/src/main.cpp
-index 2b35d77..7ea0ebe 100644
+index 2b35d77..1b180fe 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -49,6 +49,15 @@
@@ -53,7 +45,32 @@ index 2b35d77..7ea0ebe 100644
  std::mutex mutex_main;
  std::condition_variable global_cv_worker_restart;
  
-@@ -190,6 +199,7 @@ static void safe_write_hex(int fd, unsigned long val) {
+@@ -87,13 +96,16 @@ int instance_lock_fd = -1;
+ bool acquire_instance_lock() {
+   namespace fs = std::filesystem;
+   std::error_code ec;
++  DIAG("acq1: pre create_directories (std::filesystem)");
+   fs::create_directories(kPrudyntRunDir, ec);
++  DIAG("acq2: post create_directories");
+   if (ec) {
+     LOG_WARN("Failed to create run directory " << kPrudyntRunDir << ": "
+                                                << ec.message());
+   }
+ 
+   instance_lock_fd = ::open(kPrudyntLockPath, O_RDWR | O_CREAT, 0644);
++  DIAG("acq3: post open");
+   if (instance_lock_fd < 0) {
+     LOG_ERROR("Unable to open instance lock file " << kPrudyntLockPath << ": "
+                                                    << strerror(errno));
+@@ -139,6 +151,7 @@ bool acquire_instance_lock() {
+       ::fsync(instance_lock_fd);
+     }
+   }
++  DIAG("acq4: lock fully acquired (returning true)");
+   return true;
+ }
+ 
+@@ -190,6 +203,7 @@ static void safe_write_hex(int fd, unsigned long val) {
  
  // Enhanced crash handler with diagnostics
  void crash_signal_handler_extended(int sig, siginfo_t *info, void *context) {
@@ -61,7 +78,7 @@ index 2b35d77..7ea0ebe 100644
    constexpr const char *kCrashReportPath = "/tmp/prudynt_crash.log";
  
    // Open crash report file
-@@ -494,6 +504,58 @@ void start_video(int encChn) {
+@@ -494,6 +508,58 @@ void start_video(int encChn) {
    sh.has_started.acquire();
  }
  
@@ -120,55 +137,60 @@ index 2b35d77..7ea0ebe 100644
  int main(int argc, const char *argv[]) {
    if (Logger::init("INFO")) {
      LOG_ERROR("Logger initialization failed.");
-@@ -504,6 +566,7 @@ int main(int argc, const char *argv[]) {
+@@ -504,6 +570,29 @@ int main(int argc, const char *argv[]) {
    LOG_INFO("Starting Prudynt Video Server.");
    LOG_INFO(
        "Configuration bootstrap deferred until after early startup recovery");
 +  DIAG("A: main body entered");
- 
-   InstanceLockGuard instance_lock;
- 
-@@ -527,21 +590,37 @@ int main(int argc, const char *argv[]) {
-     LOG_ERROR("Prudynt is already running. Exiting.");
-     return 1;
-   }
-+  DIAG("B: lock acquired");
- 
-   // Install crash signal handlers to clean up lock file and collect diagnostics
-   // on abnormal termination
-+  // DIAGNOSTIC: run the crash handler on a dedicated alternate stack
-+  // (SA_ONSTACK). Without this the handler cannot execute when the fault is a
-+  // stack overflow (the kernel can't push the signal frame onto an exhausted
-+  // stack), so no /tmp/prudynt_crash.log is produced and the crash is invisible.
-+  // With an alt stack the handler runs and writes the register/backtrace report
-+  // regardless of fault type.
++
++  // Install crash signal handlers FIRST (moved up) so a fault in the instance-
++  // lock acquire below -- where the daemon was dying -- is caught and dumped to
++  // /tmp/prudynt_crash.log with a backtrace instead of vanishing silently.
 +  static char crash_alt_stack[32768];
 +  stack_t crash_ss;
 +  crash_ss.ss_sp = crash_alt_stack;
 +  crash_ss.ss_size = sizeof(crash_alt_stack);
 +  crash_ss.ss_flags = 0;
 +  sigaltstack(&crash_ss, nullptr);
-+  DIAG("B2: sigaltstack set");
-+
-   struct sigaction sa;
-   memset(&sa, 0, sizeof(sa));
-   sa.sa_sigaction = crash_signal_handler_extended;
-   sigemptyset(&sa.sa_mask);
++  DIAG("A1: sigaltstack set");
++  struct sigaction sa;
++  memset(&sa, 0, sizeof(sa));
++  sa.sa_sigaction = crash_signal_handler_extended;
++  sigemptyset(&sa.sa_mask);
++  sa.sa_flags = SA_SIGINFO | SA_RESETHAND | SA_ONSTACK;
++  sigaction(SIGSEGV, &sa, nullptr);
++  sigaction(SIGABRT, &sa, nullptr);
++  sigaction(SIGILL, &sa, nullptr);
++  sigaction(SIGFPE, &sa, nullptr);
++  sigaction(SIGBUS, &sa, nullptr);
++  DIAG("A2: crash handler armed (before lock acquire)");
+ 
+   InstanceLockGuard instance_lock;
+ 
+@@ -527,21 +616,7 @@ int main(int argc, const char *argv[]) {
+     LOG_ERROR("Prudynt is already running. Exiting.");
+     return 1;
+   }
+-
+-  // Install crash signal handlers to clean up lock file and collect diagnostics
+-  // on abnormal termination
+-  struct sigaction sa;
+-  memset(&sa, 0, sizeof(sa));
+-  sa.sa_sigaction = crash_signal_handler_extended;
+-  sigemptyset(&sa.sa_mask);
 -  sa.sa_flags = SA_SIGINFO | SA_RESETHAND; // Get detailed signal info, reset to
 -                                           // default after first invocation
-+  sa.sa_flags = SA_SIGINFO | SA_RESETHAND | SA_ONSTACK; // detailed info; reset to
-+                                           // default after first; run on altstack
- 
-   sigaction(SIGSEGV, &sa, nullptr); // Segmentation fault
-   sigaction(SIGABRT, &sa, nullptr); // Abort signal
-   sigaction(SIGILL, &sa, nullptr);  // Illegal instruction
-   sigaction(SIGFPE, &sa, nullptr);  // Floating point exception
-   sigaction(SIGBUS, &sa, nullptr);  // Bus error
-+  DIAG("C: signal handlers installed");
+-
+-  sigaction(SIGSEGV, &sa, nullptr); // Segmentation fault
+-  sigaction(SIGABRT, &sa, nullptr); // Abort signal
+-  sigaction(SIGILL, &sa, nullptr);  // Illegal instruction
+-  sigaction(SIGFPE, &sa, nullptr);  // Floating point exception
+-  sigaction(SIGBUS, &sa, nullptr);  // Bus error
++  DIAG("B: lock acquired");
  
    sigemptyset(&shutdown_signal_set);
    sigaddset(&shutdown_signal_set, SIGINT);
-@@ -573,8 +652,22 @@ int main(int argc, const char *argv[]) {
+@@ -573,8 +648,22 @@ int main(int argc, const char *argv[]) {
    };
  
    recover_stale_imp_state();
@@ -191,7 +213,7 @@ index 2b35d77..7ea0ebe 100644
    Logger::setLevel(cfg->general.loglevel);
  
  #if defined(WEBSOCKET_ENABLED)
-@@ -602,9 +695,11 @@ int main(int argc, const char *argv[]) {
+@@ -602,9 +691,11 @@ int main(int argc, const char *argv[]) {
      return 1;
    }
  
