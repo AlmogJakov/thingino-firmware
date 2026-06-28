@@ -1,0 +1,51 @@
+Subject: [PATCH] main: run crash handler on a sigaltstack so it survives stack-overflow faults
+Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (stacks on 0001-0015)
+
+prudynt's SIGSEGV/SIGABRT/... handler (crash_signal_handler_extended) writes a
+register+backtrace report to /tmp/prudynt_crash.log. But it was installed WITHOUT
+an alternate signal stack (no sigaltstack / no SA_ONSTACK), so on a stack-overflow
+fault the kernel cannot push the signal frame onto the exhausted stack -> the
+handler never runs -> no crash report, and the crash is invisible (exactly what we
+saw debugging a startup SIGSEGV: dmesg showed the fault but /tmp/prudynt_crash.log
+was never created).
+
+Fix: allocate a small static alternate stack, register it with sigaltstack(), and
+add SA_ONSTACK to the handler's sa_flags. Now the handler runs and produces the
+diagnostic report regardless of fault type. This is a real, permanent robustness
+improvement (not just for this investigation). One hunk in main(); uses
+<signal.h> (already included).
+
+Verified: git apply --check + patch -p1 both pass against f4b3228 + 0001-0015.
+
+diff --git a/src/main.cpp b/src/main.cpp
+index 2b35d77..e79037a 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -530,12 +530,25 @@ int main(int argc, const char *argv[]) {
+ 
+   // Install crash signal handlers to clean up lock file and collect diagnostics
+   // on abnormal termination
++  // DIAGNOSTIC: run the crash handler on a dedicated alternate stack
++  // (SA_ONSTACK). Without this the handler cannot execute when the fault is a
++  // stack overflow (the kernel can't push the signal frame onto an exhausted
++  // stack), so no /tmp/prudynt_crash.log is produced and the crash is invisible.
++  // With an alt stack the handler runs and writes the register/backtrace report
++  // regardless of fault type.
++  static char crash_alt_stack[32768];
++  stack_t crash_ss;
++  crash_ss.ss_sp = crash_alt_stack;
++  crash_ss.ss_size = sizeof(crash_alt_stack);
++  crash_ss.ss_flags = 0;
++  sigaltstack(&crash_ss, nullptr);
++
+   struct sigaction sa;
+   memset(&sa, 0, sizeof(sa));
+   sa.sa_sigaction = crash_signal_handler_extended;
+   sigemptyset(&sa.sa_mask);
+-  sa.sa_flags = SA_SIGINFO | SA_RESETHAND; // Get detailed signal info, reset to
+-                                           // default after first invocation
++  sa.sa_flags = SA_SIGINFO | SA_RESETHAND | SA_ONSTACK; // detailed info; reset to
++                                           // default after first; run on altstack
+ 
+   sigaction(SIGSEGV, &sa, nullptr); // Segmentation fault
+   sigaction(SIGABRT, &sa, nullptr); // Abort signal

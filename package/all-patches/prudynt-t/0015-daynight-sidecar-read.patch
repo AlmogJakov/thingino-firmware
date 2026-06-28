@@ -1,33 +1,25 @@
-Subject: [PATCH] config: read /etc/daynight.state sidecar (raw open/read) as day/night source of truth
+Subject: [PATCH] config: read /etc/daynight.state sidecar (raw open/read, literal force_mode) as day/night source of truth
 Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (stacks on 0001-0014)
 
 The two MQTT-frequent modes (auto/day/night) persist in a tiny atomic sidecar
-/etc/daynight.state ("mode=auto|day|night") instead of rewriting the whole
-~8.5 KB prudynt.json. CFG::load() reads that sidecar at config-load and sets
-daynight.enabled + daynight.force_mode_cfg from it (after the prudynt.json item
-loops, so it overrides them). IMPSystem::init() (patch 0001) derives the ISP
-running_mode from force_mode_cfg before the pipeline is built, so a forced mode
-sticks; S56ircut reads the same sidecar for the IR-cut/IR-LED optics. A missing/
-unreadable/unrecognized sidecar => auto (safe default). One-time migration from
-the legacy prudynt.json keys is done in the rootfs before launch.
+/etc/daynight.state ("mode=auto|day|night"). CFG::load() reads it at config-load
+and sets daynight.enabled + daynight.force_mode_cfg from it (after the
+prudynt.json item loops, so it overrides them). IMPSystem::init() (patch 0001)
+derives the ISP running_mode from force_mode_cfg before the pipeline is built;
+S56ircut reads the same sidecar for optics. Missing/unreadable/unrecognized => auto.
 
-CRASH FIX: the sidecar is read with RAW POSIX open()/read() -- NOT fopen and NOT
-std::ifstream. On this Sonoff PT2 (T23 / uClibc-ng) prudynt is force-linked
-against libuclibcshim.so (a glibc->uClibc ABI shim) which interposes fopen/fopen64;
-reading the sidecar through libc stdio (std::ifstream's filebuf, or a direct
-fopen) segfaulted inside that shim at prudynt startup, before the stream came up.
-Raw open()/read()/close() bypass the shim and are the same primitives
-DayNightWorker/ImagingControl already use successfully in this binary. The two
-config members are set unconditionally (no strcmp of the prior force_mode_cfg,
-so no deref of a pointer this code does not own; a 1-6 byte per-reload leak is
-negligible).
+Defensive I/O on this T23/uClibc build (libuclibcshim ABI shim): the sidecar is
+read with RAW open()/read() (NOT fopen/std::ifstream), and force_mode_cfg is set
+to STATIC STRING LITERALS -- no strdup/malloc, no strcmp, no free, no ownership.
+force_mode_cfg is a const char* only ever READ downstream and never freed, so a
+literal (static storage) is valid and removes all heap interaction from this path.
 
 Single file (Config.cpp): adds <fcntl.h>/<unistd.h> + the CFG::load read block.
 Verified: git apply --check AND patch -p1 --dry-run both pass against
 f4b3228 + 0001-0014.
 
 diff --git a/src/Config.cpp b/src/Config.cpp
-index 5861a39..06345d5 100644
+index 5861a39..12606c1 100644
 --- a/src/Config.cpp
 +++ b/src/Config.cpp
 @@ -4,6 +4,8 @@
@@ -39,7 +31,7 @@ index 5861a39..06345d5 100644
  #include <filesystem>
  #include <fstream>
  #include <functional>
-@@ -1400,6 +1402,64 @@ void CFG::load() {
+@@ -1400,6 +1402,65 @@ void CFG::load() {
      }
    }
  
@@ -84,20 +76,21 @@ index 5861a39..06345d5 100644
 +      while (*mp >= 'a' && *mp <= 'z')
 +        scMode.push_back(*mp++);
 +    }
-+    // Set both members directly from the sidecar. strdup UNCONDITIONALLY: do NOT
-+    // read the prior force_mode_cfg with strcmp (avoid any deref of a pointer
-+    // whose lifetime this code does not own); the tiny per-reload leak of a 1-6
-+    // byte string is negligible. "night"/"day" => forced; anything else (auto /
-+    // missing / unreadable / garbage) => auto, the safe default.
++    // Assign STATIC string literals -- no strdup/malloc, no strcmp, no free, no
++    // ownership. force_mode_cfg is a const char* only ever READ downstream
++    // (IMPSystem::init, DayNightWorker); nothing frees it, so a literal (static
++    // storage duration) is valid and removes all heap interaction from this path.
++    // "night"/"day" => forced; anything else (auto / missing / unreadable /
++    // garbage) => auto, the safe default.
 +    if (scMode == "night") {
 +      daynight.enabled = false;
-+      daynight.force_mode_cfg = strdup("night");
++      daynight.force_mode_cfg = "night";
 +    } else if (scMode == "day") {
 +      daynight.enabled = false;
-+      daynight.force_mode_cfg = strdup("day");
++      daynight.force_mode_cfg = "day";
 +    } else {
 +      daynight.enabled = true;
-+      daynight.force_mode_cfg = strdup("");
++      daynight.force_mode_cfg = "";
 +    }
 +  }
 +
