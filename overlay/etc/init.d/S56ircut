@@ -6,21 +6,20 @@
 # filter and turns the IR LED on. GPIO only (filter + IR LED); running_mode is
 # prudynt's persisted config, so this never touches the pipeline. Pure GPIO at boot.
 
-PRUDYNT_CONFIG="/etc/prudynt.json"
+DNSTATE="/usr/sbin/daynight-state"   # day/night single source of truth (atomic sidecar)
 
-# Boot to night optics ONLY for a forced-night mode: daynight.enabled=false AND
-# daynight.force_mode="night". Everything else keeps the stock day calibration:
-#   * forced day  (enabled=false, force_mode="day")  -> day
-#   * auto        (enabled=true)                      -> day start; prudynt's
-#       worker then switches on the measured light level. enabled is the real
-#       discriminator — in auto the adapter clears force_mode, but guard on
-#       enabled too so a stale value can never force night.
-#   * privacy / unset / no config                    -> day (safe default)
+# Boot to night optics ONLY when the persisted mode is forced-night. The mode now
+# lives in /etc/daynight.state ("mode=auto|day|night"), read through the SAME
+# helper prudynt (patch 0015) and the agent use, so the boot optics and the ISP
+# color/mono mode can never disagree. Everything else keeps the stock day
+# calibration:
+#   * forced day  (mode=day)             -> day
+#   * auto        (mode=auto)            -> day start; prudynt's worker then
+#       switches on the measured light level
+#   * privacy / missing / unreadable     -> day (safe default; get returns auto)
 persisted_night() {
-	[ -f "$PRUDYNT_CONFIG" ] || return 1
-	command -v jct >/dev/null 2>&1 || return 1
-	[ "$(jct "$PRUDYNT_CONFIG" get daynight.enabled 2>/dev/null | tr -d '"')" = "false" ] || return 1
-	[ "$(jct "$PRUDYNT_CONFIG" get daynight.force_mode 2>/dev/null | tr -d '"')" = "night" ]
+	[ -x "$DNSTATE" ] || return 1
+	[ "$("$DNSTATE" get)" = "night" ]
 }
 
 start() {

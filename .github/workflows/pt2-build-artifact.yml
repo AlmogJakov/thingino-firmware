@@ -54,16 +54,19 @@ jobs:
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Confirm prudynt patches 0001-0014 present (fail fast before build)
+      - name: Confirm prudynt patches 0001-0015 + jct patch present (fail fast before build)
         run: |
           D=package/all-patches/prudynt-t
           [ -d "$D" ] || { echo "::error::$D missing"; exit 1; }
           ls -l "$D"
           miss=0
-          for n in 0001 0002 0003 0004 0005 0006 0007 0008 0009 0010 0011 0012 0013 0014; do
+          for n in 0001 0002 0003 0004 0005 0006 0007 0008 0009 0010 0011 0012 0013 0014 0015; do
             ls "$D"/"$n"-*.patch >/dev/null 2>&1 && echo "PASS: patch $n present" || { echo "::error::missing patch $n-*.patch"; miss=1; }
           done
-          [ "$miss" = 0 ] && echo "ALL 14 PRUDYNT PATCHES PRESENT (0001-0014)" || exit 1
+          [ "$miss" = 0 ] && echo "ALL 15 PRUDYNT PATCHES PRESENT (0001-0015)" || exit 1
+          # jct atomic-write patch (Component A of the minimal-write set)
+          J=package/all-patches/thingino-jct
+          ls "$J"/0001-*.patch >/dev/null 2>&1 && echo "PASS: jct atomic-write patch present" || { echo "::error::missing jct patch $J/0001-*.patch"; exit 1; }
 
       - name: Download sources
         run: BOARD="$BOARD" make source WORKFLOW=1
@@ -88,14 +91,35 @@ jobs:
           if [ -f "$LIST" ]; then
             echo "== .applied_patches_list =="; cat "$LIST"
             miss=0
-            for n in 0001 0002 0003 0004 0005 0006 0007 0008 0009 0010 0011 0012 0013 0014; do
+            for n in 0001 0002 0003 0004 0005 0006 0007 0008 0009 0010 0011 0012 0013 0014 0015; do
               grep -qE "/${n}-.*\.patch$" "$LIST" && echo "PASS: patch $n applied" || { echo "::error::patch $n not in .applied_patches_list"; miss=1; }
             done
-            [ "$miss" = 0 ] && echo "ALL 14 PRUDYNT PATCHES APPLIED (0001-0014)" || exit 1
+            [ "$miss" = 0 ] && echo "ALL 15 PRUDYNT PATCHES APPLIED (0001-0015)" || exit 1
           elif [ -f "$SRC/.stamp_patched" ]; then
             echo "::warning::.applied_patches_list absent; .stamp_patched present (patch phase ran), cannot enumerate per-patch"
           else
             echo "::error::no .applied_patches_list and no .stamp_patched - cannot confirm patches applied"; exit 1
+          fi
+
+      - name: Confirm jct atomic-write patch applied to the source
+        # Same .applied_patches_list mechanism as prudynt. The target jct build dir
+        # is thingino-jct-* (host-thingino-jct-* is excluded by the glob anchor).
+        run: |
+          SRC=""
+          for d in $(find output -type d -name 'thingino-jct-*' 2>/dev/null | grep -v '/host/'); do
+            [ -f "$d/.applied_patches_list" ] && { SRC="$d"; break; }
+          done
+          [ -n "$SRC" ] || SRC=$(find output -type d -name 'thingino-jct-*' 2>/dev/null | grep -v '/host/' | head -1)
+          [ -n "$SRC" ] || { echo "::error::thingino-jct source dir not found under output/"; exit 1; }
+          echo "jct source: $SRC"
+          LIST="$SRC/.applied_patches_list"
+          if [ -f "$LIST" ]; then
+            echo "== jct .applied_patches_list =="; cat "$LIST"
+            grep -qE "/0001-.*\.patch$" "$LIST" && echo "PASS: jct atomic-write patch applied" || { echo "::error::jct patch not in .applied_patches_list"; exit 1; }
+          elif [ -f "$SRC/.stamp_patched" ]; then
+            echo "::warning::jct .applied_patches_list absent; .stamp_patched present (patch phase ran)"
+          else
+            echo "::error::no jct .applied_patches_list and no .stamp_patched"; exit 1
           fi
 
       - name: Collect built images
@@ -143,6 +167,7 @@ jobs:
           for f in \
             usr/sbin/physical-privacy usr/sbin/tz-update usr/sbin/light \
             usr/sbin/daynight usr/sbin/color usr/sbin/imp-control \
+            usr/sbin/daynight-state \
             etc/init.d/S31prudynt etc/init.d/S32prudyntwd etc/init.d/S56ircut \
             etc/init.d/S01timezone etc/init.d/S60physical-privacy etc/ntpd_callback; do
             [ -x "$ROOT/$f" ] && ok "$f executable" || err "$f missing or not executable"

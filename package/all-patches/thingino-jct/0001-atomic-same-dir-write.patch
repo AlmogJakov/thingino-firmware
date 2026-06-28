@@ -1,0 +1,245 @@
+Subject: [PATCH] jct: atomic same-directory config write (drop /tmp EXDEV truncate)
+Target: themactep/jct @ 46e15ef8a8688842bd7ef2d86ed03977360eeaa1 (pinned build commit)
+
+save_config() staged its temp file in /tmp (tmpfs) and rename()d it onto the
+target. On the camera the config files live on a jffs2 overlay, so that rename
+is cross-device -> EXDEV -> the code fell back to fopen(target,"w") (TRUNCATE) +
+byte copy. A power cut between the truncate and the end of the copy left the live
+config 0-byte / partial -> on a Sonoff PT2 a truncated /etc/prudynt.json bricks
+the stream (isp_bypass falls back to false). Every jct caller (prudynt.json,
+send2.json, motors.json) shared this window.
+
+Fix: build the temp in the TARGET's own directory so rename() is an
+intra-filesystem atomic replace; fsync the data before the rename and fsync the
+directory after it for power-loss durability; DELETE the EXDEV copy/truncate
+fallback entirely (a same-dir rename never returns EXDEV, and a real rename
+failure must leave the original untouched, not truncate it). Orphan temps from a
+previous run killed/power-cut between create and rename are reclaimed at the next
+write (".<base>.jcttmp.<pid>" whose pid is no longer alive), so junk never
+accumulates and a concurrent writer's in-flight temp is never removed.
+
+Behaviour is otherwise identical (same serialized content + trailing newline).
+Verified: git apply --check passes against the pinned source.
+
+diff --git a/src/json_config.c b/src/json_config.c
+index 4e5a39a..fefba59 100644
+--- a/src/json_config.c
++++ b/src/json_config.c
+@@ -10,6 +10,9 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h> // for getpid() and unlink()
++#include <dirent.h> // for opendir()/readdir() orphan-temp reclaim
++#include <fcntl.h>  // for open()/O_RDONLY to fsync the directory
++#include <signal.h> // for kill(pid,0) liveness check
+ 
+ /**
+  * Loads JSON data from a file path
+@@ -327,14 +330,64 @@ int save_config(const char *filepath, JsonValue *json) {
+   fprintf(stderr, "DEBUG: save_config - json type=%d\n", json->type);
+ #endif
+ 
+-  // Create temporary file path
++  // Build the temporary file in the SAME directory as the target so the
++  // rename() below is an intra-filesystem (atomic) replace. Staging in /tmp
++  // (tmpfs) made the rename cross-device (EXDEV) on the camera's jffs2 config
++  // overlay, which forced a truncate+copy fallback whose window could leave the
++  // live file 0-byte/partial after a power cut. Same-dir temp + rename is the
++  // classic atomic-write recipe and removes that window entirely.
++  char dirbuf[512];
++  const char *slash = strrchr(filepath, '/');
++  const char *base;
++  if (slash) {
++    size_t dlen = (size_t)(slash - filepath);
++    if (dlen >= sizeof(dirbuf))
++      dlen = sizeof(dirbuf) - 1;
++    memcpy(dirbuf, filepath, dlen);
++    dirbuf[dlen] = '\0';
++    base = slash + 1;
++  } else {
++    dirbuf[0] = '.';
++    dirbuf[1] = '\0';
++    base = filepath;
++  }
++
++  // Reclaim orphan temps left by a previous run killed/power-cut between create
++  // and rename, so junk never accumulates on the overlay. Only remove
++  // ".<base>.jcttmp.<pid>" entries whose pid is no longer alive -> a concurrent
++  // writer's in-flight temp is never touched.
++  char prefix[512];
++  int plen = snprintf(prefix, sizeof(prefix), ".%s.jcttmp.", base);
++  if (plen > 0 && (size_t)plen < sizeof(prefix)) {
++    DIR *d = opendir(dirbuf);
++    if (d) {
++      struct dirent *de;
++      while ((de = readdir(d)) != NULL) {
++        if (strncmp(de->d_name, prefix, (size_t)plen) != 0)
++          continue;
++        const char *pidstr = de->d_name + plen;
++        char *endp = NULL;
++        long opid = strtol(pidstr, &endp, 10);
++        if (pidstr == endp || !endp || *endp != '\0' || opid <= 0)
++          continue;
++        if (kill((pid_t)opid, 0) == 0 || errno != ESRCH)
++          continue; // still alive (or undetermined) -> leave it
++        char orphan[512];
++        if (snprintf(orphan, sizeof(orphan), "%s/%s", dirbuf, de->d_name) <
++            (int)sizeof(orphan))
++          unlink(orphan);
++      }
++      closedir(d);
++    }
++  }
++
+   char temp_filepath[512];
+-  snprintf(temp_filepath, sizeof(temp_filepath),
+-           "/tmp/prudynt_config_temp_%d.json", getpid());
+-#ifdef DEBUG
+-  fprintf(stderr, "DEBUG: save_config - using temporary file: %s\n",
+-          temp_filepath);
+-#endif
++  int tlen = snprintf(temp_filepath, sizeof(temp_filepath), "%s/.%s.jcttmp.%d",
++                      dirbuf, base, getpid());
++  if (tlen <= 0 || (size_t)tlen >= sizeof(temp_filepath)) {
++    fprintf(stderr, "Error: temp file path too long for '%s'\n", filepath);
++    return 0;
++  }
+ 
+   FILE *file = fopen(temp_filepath, "w");
+   if (!file) {
+@@ -344,106 +397,51 @@ int save_config(const char *filepath, JsonValue *json) {
+     return 0;
+   }
+ 
+-#ifdef DEBUG
+-  fprintf(stderr, "DEBUG: save_config - about to call write_json_to_file\n");
+-#endif
+   int success = write_json_to_file(file, json, 0);
+-#ifdef DEBUG
+-  fprintf(stderr, "DEBUG: save_config - write_json_to_file returned %d\n",
+-          success);
+-#endif
+ 
+   // Add a final newline
+-  if (success) {
++  if (success)
+     success = (fprintf(file, "\n") > 0);
+-#ifdef DEBUG
+-    fprintf(stderr, "DEBUG: save_config - added final newline, success=%d\n",
+-            success);
+-#endif
++
++  // Flush userspace + kernel buffers to stable storage BEFORE the rename so the
++  // renamed file is guaranteed to contain the full data after a power cut.
++  if (success) {
++    if (fflush(file) != 0 || fsync(fileno(file)) != 0) {
++      fprintf(stderr, "Error: Failed to flush temporary file '%s': %s\n",
++              temp_filepath, strerror(errno));
++      success = 0;
++    }
+   }
+ 
+-  fclose(file);
++  if (fclose(file) != 0)
++    success = 0;
+ 
+   if (!success) {
+     fprintf(stderr,
+             "Error: Failed to write complete JSON to temporary file '%s'.\n",
+             temp_filepath);
+-    unlink(temp_filepath); // Remove the failed temporary file
++    unlink(temp_filepath); // never leave a partial temp behind
+     return 0;
+   }
+ 
+-  // Atomically replace the original file with the temporary file
+-#ifdef DEBUG
+-  fprintf(stderr, "DEBUG: save_config - attempting to rename '%s' to '%s'\n",
+-          temp_filepath, filepath);
+-#endif
++  // Atomic replace. Same-directory temp => same filesystem => rename() cannot
++  // fail with EXDEV, so there is no copy/truncate fallback (that fallback was
++  // the power-loss corruption window). Any rename failure leaves the original
++  // file untouched; drop the temp and report failure.
+   if (rename(temp_filepath, filepath) != 0) {
+-    if (errno == EXDEV) {
+-      // Cross-device link error - need to copy and delete instead
+-#ifdef DEBUG
+-      fprintf(stderr,
+-              "DEBUG: Cross-device rename failed, trying copy method\n");
+-#endif
+-
+-      FILE *src = fopen(temp_filepath, "r");
+-      if (!src) {
+-        fprintf(stderr,
+-                "Error: Failed to open temporary file for copying: %s\n",
+-                strerror(errno));
+-        unlink(temp_filepath);
+-        return 0;
+-      }
+-
+-      FILE *dst = fopen(filepath, "w");
+-      if (!dst) {
+-        fprintf(stderr,
+-                "Error: Failed to open destination file for copying: %s\n",
+-                strerror(errno));
+-        fclose(src);
+-        unlink(temp_filepath);
+-        return 0;
+-      }
+-
+-      // Copy the file contents
+-      char buffer[4096];
+-      size_t bytes;
+-      int copy_success = 1;
+-      while ((bytes = fread(buffer, 1, sizeof(buffer), src)) > 0) {
+-        if (fwrite(buffer, 1, bytes, dst) != bytes) {
+-          fprintf(stderr, "Error: Failed to write during copy: %s\n",
+-                  strerror(errno));
+-          copy_success = 0;
+-          break;
+-        }
+-      }
+-
+-      fclose(src);
+-      fclose(dst);
+-
+-      if (!copy_success) {
+-        unlink(temp_filepath);
+-        return 0;
+-      }
++    fprintf(stderr, "Error: Failed to rename temporary file '%s' to '%s': %s\n",
++            temp_filepath, filepath, strerror(errno));
++    unlink(temp_filepath);
++    return 0;
++  }
+ 
+-      // Remove the temporary file
+-      unlink(temp_filepath);
+-#ifdef DEBUG
+-      fprintf(stderr, "DEBUG: save_config - successfully copied temp file to "
+-                      "destination\n");
+-#endif
+-    } else {
+-      fprintf(stderr,
+-              "Error: Failed to rename temporary file '%s' to '%s': %s\n",
+-              temp_filepath, filepath, strerror(errno));
+-      unlink(temp_filepath); // Clean up the temporary file
+-      return 0;
+-    }
+-  } else {
+-#ifdef DEBUG
+-    fprintf(
+-        stderr,
+-        "DEBUG: save_config - successfully renamed temp file to destination\n");
+-#endif
++  // Persist the directory entry (the rename itself) so the replace survives a
++  // power cut, not just the file data. Best-effort: a failure here does not undo
++  // the successful rename.
++  int dfd = open(dirbuf, O_RDONLY);
++  if (dfd >= 0) {
++    fsync(dfd);
++    close(dfd);
+   }
+ 
+ #ifdef DEBUG

@@ -41,18 +41,36 @@ is **not** installed into the firmware image.
   were edited live, filling the tiny jffs2 config overlay.
 
 ### What was fixed
-- **prudynt binary:** 14 source patches `0001`-`0014` (auto-applied by buildroot's global
-  patch dir; the source is git-fetched at `f4b3228` and never hand-edited).
-- **Rootfs:** ~19 script/asset changes (reboot hardening, day/night persistence + optics +
+- **prudynt binary:** 15 source patches `0001`-`0015` (auto-applied by buildroot's global
+  patch dir; the source is git-fetched at `f4b3228` and never hand-edited). `0015` makes
+  `CFG::load()` read the day/night mode from the `/etc/daynight.state` sidecar (see below).
+- **jct (config tool):** a 1-patch fork (`package/all-patches/thingino-jct/`) makes every
+  config write **atomic** - same-directory temp + `fsync` + `rename`, with the old
+  `/tmp`→`/etc` EXDEV truncate-and-copy fallback (a power-loss corruption window) removed.
+- **Minimal-write day/night persistence:** the two MQTT-frequent modes (auto/day/night and
+  physical-privacy's day/night freeze) no longer rewrite the whole ~8.5 KB `prudynt.json`.
+  They persist in a tiny, atomically-written sidecar `/etc/daynight.state`
+  (`mode=auto|day|night`) - the single source of truth read by prudynt (`0015`), `S56ircut`,
+  `physical-privacy`, the agent adapter and HA state, all via the shared
+  `/usr/sbin/daynight-state` helper. See §7.
+- **Rootfs:** ~20 script/asset changes (reboot hardening, day/night persistence + optics +
   colour, physical privacy, timezone, HA/WebUI integration) baked into the **read-only
-  squashfs**, plus a one-line **write-on-change** guard in the agent adapter and a one-rule
-  `.mk` change for the motors interlock.
+  squashfs**, plus the `daynight-state` helper, the write-on-change guard in the agent
+  adapter, and a one-rule `.mk` change for the motors interlock.
 - Everything ships in the firmware image; **nothing depends on live overlay edits** anymore.
 
 ### What was intentionally deferred
 - **Full agent-adapter writer redesign** beyond the write-on-change guard and the
-  `force_mode` bare-write fix (both **done** - see §3-I and §3-C). The remaining parts -
-  auto-branch conditional sync, executor-invocation changes, power-cut sync - stay deferred.
+  `force_mode` bare-write fix (both **done** - see §3-I and §3-C). Power-cut safety and the
+  per-toggle flash churn for the frequent day/night path are now **done** via the jct atomic
+  write + the `/etc/daynight.state` sidecar (§7); other rarely-changed keys still ride jct
+  (now atomic). Executor-invocation changes stay deferred.
+- **No separate persistence for `color` / `ircut` / IR-LED — by design, not a gap.** Only the
+  day/night mode and the physical-privacy state are persisted. `color`, `ircut` and the 850 nm
+  LED are **derived runtime effects** of the selected auto/day/night mode (day ⇒ ir-cut on,
+  color on, 850 off; night ⇒ ir-cut off, color off, 850 on), exactly as before this change.
+  The HA `color`/`ircut` toggles stay runtime-only and are intentionally **not** wired to the
+  sidecar (doing so would couple them to the day/night select). Behavior unchanged.
 - **Default-setting changes** beyond the existing per-camera `prudynt.json` (see §6).
 - **Deeper comment stripping** of the baked scripts (space-moot on the squashfs; risky on
   life-safety logic - only large pure-prose headers were trimmed).
@@ -90,7 +108,7 @@ is **not** installed into the firmware image.
 | `package/thingino-ha/files/json-config-ha.cgi` | Modified (3 lines) | thingino-ha | `/var/www/x/json-config-ha.cgi` | ✅ squashfs |
 | `package/thingino-webui/files/www/a/main.js` | Modified | thingino-webui | `/var/www/a/main.js` | ✅ squashfs |
 | `package/thingino-webui/files/www/x/json-imp.cgi` | Replaced | thingino-webui | `/var/www/x/json-imp.cgi` | ✅ squashfs |
-| `package/thingino-agent/files/thingino-agent-adapter-prudynt` | Modified (1 guard) | thingino-agent | `/usr/libexec/thingino-agent/adapters/prudynt.sh` | ✅ squashfs |
+| `package/thingino-agent/files/thingino-agent-adapter-prudynt` | Modified (write-on-change guard + day/night→sidecar read/write) | thingino-agent | `/usr/libexec/thingino-agent/adapters/prudynt.sh` | ✅ squashfs |
 | `package/thingino-motors/thingino-motors.mk` | Modified (1 rule) | thingino-motors | real CLI → `/usr/bin/motors-bin` | ✅ build rule |
 | `overlay/etc/init.d/S56ircut` | Replaced | - (overlay) | `/etc/init.d/S56ircut` | ✅ squashfs |
 | `overlay/etc/init.d/S01timezone` | Replaced | - (overlay) | `/etc/init.d/S01timezone` | ✅ squashfs |
@@ -101,7 +119,10 @@ is **not** installed into the firmware image.
 | `overlay/usr/bin/motors` | **Added** | - (overlay) | `/usr/bin/motors` (wrapper) | ✅ squashfs |
 | `overlay/usr/sbin/physical-privacy` | **Added** | - (overlay) | `/usr/sbin/physical-privacy` | ✅ squashfs |
 | `overlay/usr/sbin/tz-update` | **Added** | - (overlay) | `/usr/sbin/tz-update` | ✅ squashfs |
-| `package/all-patches/prudynt-t/0001…0014-*.patch` | Added (in branch) | prudynt-t (build patches) | compiled into `/usr/bin/prudynt` | ✅ binary |
+| `overlay/usr/sbin/daynight-state` | **Added** | - (overlay) | `/usr/sbin/daynight-state` | ✅ squashfs |
+| `package/all-patches/prudynt-t/0001…0015-*.patch` | Added (in branch) | prudynt-t (build patches) | compiled into `/usr/bin/prudynt` | ✅ binary |
+| `package/all-patches/thingino-jct/0001-atomic-same-dir-write.patch` | **Added** | thingino-jct (build patch) | compiled into `/usr/bin/jct` | ✅ binary |
+| `tests/test-daynight-state.sh` | **Added** | - | not installed | ❌ repo test only |
 | `PT2-FIX-SET.md` (this file) | **Added** | - | not installed | ❌ repo doc only |
 | `.github/workflows/prudynt-binary.yml` | **Added** | - | not installed (CI) | ❌ builds prudynt binary only |
 | `.github/workflows/pt2-build-artifact.yml` | **Added** | - | not installed (CI) | ❌ builds full PT2 image |
@@ -378,13 +399,14 @@ the ~14 KB ELF (`7f454c46`).
 - **~8.5 KB per write.** The device `/etc/prudynt.json` is ~8.5 KB (8585 B), so changing one
   key (`motion.enabled`, `daynight.force_mode`, ...) rewrites the **whole ~8.5 KB** file. (jct
   re-serializes with its own indentation/sorted keys, so the size is approximate, not byte-identical.)
-- **Not actually atomic on this device.** `save_config` writes a temp file to
-  `/tmp/prudynt_config_temp_<pid>.json` (tmpfs) then `rename()`s it onto `/etc/prudynt.json`
-  (jffs2). Because those are **different filesystems**, the rename returns `EXDEV` and jct falls
-  back to `fopen("/etc/prudynt.json","w")` (**truncate**) + a `fread`/`fwrite` byte copy. The
-  intended atomic-rename guarantee therefore **does not hold here**.
-- **Power-loss corruption window.** Between the truncate-to-zero and the copy completing, a
-  power cut leaves `/etc/prudynt.json` 0-byte or partial - the corrupt-config scenario.
+- **Now atomic (jct fork, `package/all-patches/thingino-jct/0001-…`).** *Stock* jct wrote a
+  temp to `/tmp/prudynt_config_temp_<pid>.json` (tmpfs) then `rename()`d onto `/etc` (jffs2);
+  the cross-filesystem rename returned `EXDEV` and fell back to `fopen("…","w")` (**truncate**)
+  + byte copy - a power-loss window that could leave the file 0-byte/partial. The fork stages
+  the temp in the **target's own directory** (`.<name>.jcttmp.<pid>`), `fsync`s it, and
+  `rename()`s in-place (same filesystem → truly atomic, no EXDEV, no truncate fallback), then
+  `fsync`s the directory; orphan temps from a power cut are reclaimed (pid-aware) on the next
+  write. So every jct write is now atomic-or-old, never partial.
 - **JFFS2 churn.** jffs2 is log-structured: each ~8.5 KB rewrite appends ~8.5 KB of new nodes
   and marks the old ones obsolete; GC reclaims them **lazily** (on pressure / reboot). So a
   burst of redundant writes can quickly pressure the small (~224 KB) overlay before GC runs -
@@ -402,8 +424,8 @@ The table below is every remaining write path in the changed files.
 | `daynight` executor | every day/night switch incl. **automatic** dusk↔dawn | automatic | **No** - reads config, drives GPIO + runtime `prudyntctl` |
 | `color` → `/tmp/colormode.txt` | every day/night switch | automatic | **No** - tmpfs (RAM), idempotent |
 | `ha-state`, `ha-discovery` | periodic / on change | automatic | **No** - publishes to **MQTT** (network) |
-| adapter `persist_value` (`daynight.force_mode`, `daynight.enabled`) | **manual** Auto/Day/Night button (web/HA → `thingino-agentctl`) | **write-on-change** | only when the mode actually changes |
-| `physical-privacy` state + freeze | **manual** Physical Privacy button | **write-on-change** | state JSON + key persist, `sync` only if it wrote |
+| `daynight-state set` (sidecar `/etc/daynight.state`) | **manual/MQTT** Auto/Day/Night (web/HA/agent) | **write-on-change, atomic** | a single ~11 B atomic write (same-dir temp+`mv`+`sync`), only on change - **no** 8.5 KB `prudynt.json` rewrite |
+| `physical-privacy` state + day/night freeze | **manual** Physical Privacy button | **write-on-change, atomic** | ~100 B state JSON + the ~11 B sidecar, `sync` only if it wrote |
 | adapter `persist_value` (`motion.enabled`) | **manual** HA Motion switch | **write-on-change** | only when the value actually changes |
 | `tz-update` → `/etc/TZ` | boot + NTP callback | **write-on-change** | ~1 write/year at DST rollover |
 | `S31prudynt` C1 restore | boot, **only if** config detected corrupt | **recovery-only** | rare (anti-brick) |
@@ -486,10 +508,46 @@ is a flash write).
 
 ---
 
+## 7. Minimal-write day/night persistence (sidecar)
+
+**Why.** Auto/Day/Night and physical-privacy are the **MQTT-frequent** modes and have
+reboot/power-outage recovery, so persisting them must be tiny and power-safe - not the
+full ~8.5 KB non-atomic `prudynt.json` rewrite the other (rare) settings use.
+
+**Design (single source of truth).** `/etc/daynight.state` holds one line
+`mode=auto|day|night`. The shared helper `/usr/sbin/daynight-state` owns the format, the
+**atomic write-on-change** writer (same-dir temp + `mv` + `sync`, fail-closed, pid-aware
+orphan reclaim), and a one-time `migrate`:
+
+| role | who | how |
+|---|---|---|
+| read at boot (color/mono + worker gate) | prudynt `CFG::load()` (**patch 0015**) | reads `/etc/daynight.state` directly; overrides `daynight.enabled`+`force_mode_cfg`; **sidecar wins even if `prudynt.json` is corrupt**; missing/garbage → auto |
+| read at boot (IR-cut/IR-LED optics) | `S56ircut` | `daynight-state get` (same source as prudynt → optics & ISP can't disagree) |
+| write (manual/MQTT) | agent adapter, `physical-privacy` freeze/restore | `daynight-state set` (runtime via prudyntctl stays separate) |
+| read (HA state / API) | `ha-state`, adapter status + per-setting GET | `daynight-state get` / sidecar-derived helpers |
+| one-time upgrade migration | `S31prudynt start()` → `daynight-state migrate` | derives the sidecar from the legacy `prudynt.json` keys **before** prudynt launches (no late correction); afterwards those keys are **dead** (never read/written) |
+
+**Net per toggle:** one ~11 B atomic write instead of one-or-two ~8.5 KB non-atomic rewrites.
+The legacy `daynight.enabled`/`daynight.force_mode` keys remain in `prudynt.json` but are
+inert. Tests: `tests/test-daynight-state.sh` (30 cases: upgrade migration, corrupt→auto,
+corrupt-prudynt.json→sidecar-wins, S56==prudynt parity, atomicity, pid-aware reclaim).
+Reviewed by an adversarial QA pass; the confirmed read-side/leak findings were fixed.
+
+**Scope (by design):** only the day/night mode and physical-privacy are persisted. `color`,
+`ircut` and the 850 nm LED stay **derived runtime effects** of the day/night mode (unchanged
+from before); the HA `color`/`ircut` toggles remain runtime-only and are intentionally not
+persisted - see §1.
+
+---
+
 ## Build & validate (reminder)
-- prudynt C++ ships **only** via patches `0001`-`0014` in `package/all-patches/prudynt-t/`
-  (auto-applied; source git-fetched at `f4b3228` - never hand-edit source).
-- After build, in the staged image, verify the motors split (§4) and that `0007`/`0013`/`0014`
-  are in the binary (e.g. grep `add_strk_a_rtsp` for `0014`).
-- On device after flash: forced-night boot, `tz-update` date math, total rcK stop < 60 s, and
-  the motors interlock.
+- prudynt C++ ships **only** via patches `0001`-`0015` in `package/all-patches/prudynt-t/`
+  and the jct atomic-write patch in `package/all-patches/thingino-jct/` (auto-applied; sources
+  git-fetched at `f4b3228` / jct `46e15ef` - never hand-edit source).
+- After build, in the staged image, verify the motors split (§4); that `0007`/`0013`/`0014`/`0015`
+  are in the binary (grep `add_strk_a_rtsp` for `0014`, `/etc/daynight.state` for `0015`); and
+  that `/usr/sbin/daynight-state` is present + executable. CI also asserts the jct patch applied.
+- Offline: run `sh tests/test-daynight-state.sh` (30/30).
+- On device after flash: forced-night boot (optics == colour mode), Day↔Night↔Auto via MQTT
+  with **no** `prudynt.json` size change, physical-privacy enter/exit keeps the mode, a
+  power-cut mid-toggle leaves a valid mode, `tz-update` date math, rcK stop < 60 s, motors interlock.

@@ -266,6 +266,14 @@ start() {
 	#     silently fall back to false. Runs on EVERY start (cold boot AND
 	#     post-restart). Bounded by JCT_TIMEOUT; fail-safe = leave file as-is.
 	validate_and_restore_config
+	# Day/night persistence lives in the /etc/daynight.state sidecar (single source
+	# of truth). One-time migration: on first boot after an upgrade the sidecar may
+	# not exist yet -> derive it from the legacy prudynt.json keys. Runs AFTER C1
+	# (so it reads a healed config) and BEFORE start_daemon, so prudynt reads the
+	# sidecar at config-load and comes up directly in the persisted mode -- there is
+	# no late boot-script correction and no visible wrong-mode window. No-op (just a
+	# pid-aware temp reclaim) once the sidecar exists.
+	[ -x /usr/sbin/daynight-state ] && /usr/sbin/daynight-state migrate >/dev/null 2>&1
 	start_daemon
 	status=$?
 	if [ "$status" -eq 0 ]; then

@@ -3,6 +3,27 @@
 THINGINO_AGENT_PRUDYNT_CONFIG="${THINGINO_AGENT_PRUDYNT_CONFIG:-/etc/prudynt.json}"
 THINGINO_AGENT_SEND2_CONFIG="${THINGINO_AGENT_SEND2_CONFIG:-/etc/send2.json}"
 
+# The persisted auto/day/night mode lives in the tiny atomic sidecar
+# /etc/daynight.state (single source of truth), NOT in prudynt.json, so MQTT
+# day/night toggles no longer rewrite the whole ~8.5 KB config. The runtime
+# change is still applied via prudyntctl; this only replaces the PERSIST step.
+# The legacy prudynt.json daynight.* keys are dead after migration.
+THINGINO_AGENT_DAYNIGHT_STATE="${THINGINO_AGENT_DAYNIGHT_STATE:-/usr/sbin/daynight-state}"
+
+thingino_agent_prudynt_daynight_state_get() { # -> auto|day|night
+	if [ -x "$THINGINO_AGENT_DAYNIGHT_STATE" ]; then
+		"$THINGINO_AGENT_DAYNIGHT_STATE" get
+	else
+		printf 'auto'
+	fi
+}
+
+thingino_agent_prudynt_daynight_state_set() { # auto|day|night (fire-and-forget)
+	[ -x "$THINGINO_AGENT_DAYNIGHT_STATE" ] &&
+		"$THINGINO_AGENT_DAYNIGHT_STATE" set "$1" >/dev/null 2>&1
+	return 0
+}
+
 thingino_agent_adapter_prudynt_detect() {
 	[ -f "$THINGINO_AGENT_PRUDYNT_CONFIG" ] ||
 		command -v prudyntctl >/dev/null 2>&1 ||
@@ -441,11 +462,17 @@ thingino_agent_prudynt_motion_active() {
 }
 
 thingino_agent_prudynt_daynight_enabled() {
-	thingino_agent_json_value_or "$(thingino_agent_prudynt_raw daynight.enabled)" false
+	# Derived from the sidecar (single source of truth): auto => enabled true.
+	[ "$(thingino_agent_prudynt_daynight_state_get)" = "auto" ] && printf 'true' || printf 'false'
 }
 
 thingino_agent_prudynt_daynight_force_mode() {
-	thingino_agent_json_value_or "$(thingino_agent_prudynt_raw daynight.force_mode)" null
+	# Derived from the sidecar: day/night => that (JSON string); auto => null.
+	_fm=$(thingino_agent_prudynt_daynight_state_get)
+	case "$_fm" in
+		day | night) printf '"%s"' "$_fm" ;;
+		*) printf 'null' ;;
+	esac
 }
 
 thingino_agent_prudynt_daynight_running_mode() {
@@ -478,14 +505,8 @@ EOF
 }
 
 thingino_agent_prudynt_daynight_target_mode() {
-	enabled=$(thingino_agent_prudynt_daynight_enabled)
-	if [ "$enabled" = "true" ]; then
-		printf 'auto'
-	else
-		mode=$(thingino_agent_prudynt_text daynight.force_mode)
-		[ -n "$mode" ] || mode=$(thingino_agent_prudynt_daynight_running_mode)
-		printf '%s' "$mode"
-	fi
+	# The sidecar already holds exactly auto|day|night (the persisted target).
+	thingino_agent_prudynt_daynight_state_get
 }
 
 thingino_agent_prudynt_privacy_enabled() {
@@ -1289,10 +1310,12 @@ thingino_agent_adapter_prudynt_get_setting() {
 			thingino_agent_print_setting_leaf enabled "$(thingino_agent_prudynt_send2_motion_enabled "$service")"
 			;;
 		daynight/enabled)
-			thingino_agent_print_setting_leaf enabled "$(thingino_agent_prudynt_raw daynight.enabled)"
+			# Read from the sidecar (single source of truth), NOT the dead prudynt.json keys.
+			thingino_agent_print_setting_leaf enabled "$(thingino_agent_prudynt_daynight_enabled)"
 			;;
 		daynight/force-mode)
-			printf '{"force_mode":%s}\n' "$(thingino_agent_json_string_or_null "$(thingino_agent_prudynt_text daynight.force_mode)")"
+			# daynight_force_mode already emits a JSON value ("day"/"night"/null) from the sidecar.
+			printf '{"force_mode":%s}\n' "$(thingino_agent_prudynt_daynight_force_mode)"
 			;;
 		privacy/enabled)
 			thingino_agent_print_setting_leaf enabled "$(thingino_agent_prudynt_privacy_enabled)"
@@ -1563,21 +1586,35 @@ thingino_agent_adapter_prudynt_set_setting() {
 			value=$(thingino_agent_prudynt_setting_value "$body_file" enabled) || return 1
 			thingino_agent_prudynt_validate_bool "$value" || return 1
 			thingino_agent_prudynt_apply_payload "{\"daynight\":{\"enabled\":$value}}" || return 1
-			thingino_agent_prudynt_persist_value daynight.enabled "$value"
+			if [ "$value" = "true" ]; then
+				thingino_agent_prudynt_daynight_state_set auto
+			else
+				# Disabling auto pins the CURRENT live mode as the forced mode in the
+				# sidecar, so a reboot comes up showing the same picture.
+				_m=$(thingino_agent_prudynt_daynight_state_get)
+				[ "$_m" = "auto" ] && _m=$(thingino_agent_prudynt_daynight_running_mode)
+				case "$_m" in night) _m=night ;; *) _m=day ;; esac
+				thingino_agent_prudynt_daynight_state_set "$_m"
+			fi
 			thingino_agent_print_setting_update "$path" enabled "$value"
 			;;
 		daynight/force-mode)
 			value=$(thingino_agent_prudynt_setting_value "$body_file" force_mode) || return 1
+			# json_config_value does NOT strip quotes, so jct returns force_mode as
+			# "day"/"night" (quoted). Normalize to a bare token before validating + using.
+			value=$(printf '%s' "$value" | tr -d '"')
 			case "$value" in
-				"day" | "night") ;;
+				day | night) ;;
 				*)
 					echo "force_mode must be day or night" >&2
 					return 1
 					;;
 			esac
-			thingino_agent_prudynt_apply_payload "{\"daynight\":{\"force_mode\":$value}}" || return 1
-			thingino_agent_prudynt_persist_value daynight.force_mode "$value"
-			thingino_agent_print_setting_update "$path" force_mode "$value"
+			# Force the mode at runtime AND disable auto (matches the MQTT verb and the
+			# enabled=false the sidecar persists), so live behaviour == persisted state.
+			thingino_agent_prudynt_apply_payload "{\"daynight\":{\"enabled\":false,\"force_mode\":\"$value\"}}" || return 1
+			thingino_agent_prudynt_daynight_state_set "$value"
+			thingino_agent_print_setting_update "$path" force_mode "\"$value\""
 			;;
 		privacy/enabled)
 			value=$(thingino_agent_prudynt_setting_value "$body_file" enabled) || return 1
@@ -1808,8 +1845,16 @@ thingino_agent_adapter_prudynt_apply_config() {
 	thingino_agent_prudynt_persist_if_present "$source_file" motion.send2storage
 	thingino_agent_prudynt_persist_if_present "$source_file" motion.send2telegram
 	thingino_agent_prudynt_persist_if_present "$source_file" motion.send2webhook
-	thingino_agent_prudynt_persist_if_present "$source_file" daynight.enabled
-	thingino_agent_prudynt_persist_if_present "$source_file" daynight.force_mode
+	# day/night persists to the /etc/daynight.state sidecar (single source of
+	# truth), NOT to prudynt.json. Derive the mode from the imported config and
+	# write it through the helper; legacy prudynt.json daynight.* keys are dead.
+	_dn_en=$(thingino_agent_json_config_value "$source_file" daynight.enabled | tr -d '" ')
+	_dn_fm=$(thingino_agent_json_config_value "$source_file" daynight.force_mode | tr -d '" ')
+	if [ "$_dn_en" = "false" ] && { [ "$_dn_fm" = "day" ] || [ "$_dn_fm" = "night" ]; }; then
+		thingino_agent_prudynt_daynight_state_set "$_dn_fm"
+	elif [ "$_dn_en" = "true" ]; then
+		thingino_agent_prudynt_daynight_state_set auto
+	fi
 	thingino_agent_prudynt_persist_if_present "$source_file" recorder.autostart
 	thingino_agent_prudynt_persist_if_present "$source_file" recorder.channel
 	thingino_agent_prudynt_persist_if_present "$source_file" recorder.device_path
@@ -2004,16 +2049,14 @@ thingino_agent_adapter_prudynt_daynight() {
 	case "$mode" in
 		auto)
 			thingino_agent_prudynt_apply_payload '{"daynight":{"enabled":true}}' || return 1
-			thingino_agent_prudynt_persist_value daynight.enabled true
+			thingino_agent_prudynt_daynight_state_set auto
 			printf '{"status":"accepted","mode":"auto"}\n'
 			;;
 		day | night)
 			thingino_agent_prudynt_apply_payload "{\"daynight\":{\"enabled\":false,\"force_mode\":\"$mode\"}}" || return 1
-			thingino_agent_prudynt_persist_value daynight.enabled false
-			# Persist BARE ("night", not "\"night\""): jct adds the JSON quoting itself.
-			# Passing it pre-quoted stored "force_mode":"\"night\"" which prudynt's strict
-			# validator rejected at boot. (apply_payload above still quotes it for prudyntctl.)
-			thingino_agent_prudynt_persist_value daynight.force_mode "$mode"
+			# Persist to the atomic sidecar instead of two ~8.5 KB prudynt.json
+			# rewrites; "set day|night" encodes enabled=false + force_mode together.
+			thingino_agent_prudynt_daynight_state_set "$mode"
 			printf '{"status":"accepted","mode":%s}\n' "$(thingino_agent_json_string "$mode")"
 			;;
 		*)

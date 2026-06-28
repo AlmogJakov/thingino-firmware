@@ -13,9 +13,9 @@ export PHYSPRIV_INTERNAL=1
 STATE="/etc/physical-privacy-state.json"
 ARMED="/run/physical-privacy.armed"
 LOCK="/run/physical-privacy.lock"
-PRUDYNT_CONFIG="/etc/prudynt.json"
 MOTORS_CONFIG="/etc/motors.json"
 JCT="/usr/bin/jct"
+DNSTATE="/usr/sbin/daynight-state"   # day/night single source of truth (atomic sidecar)
 DEFAULT_POSE_TILT=2152      # privacy pose: lens tilted down/away
 DEFAULT_HOME_TILT=1152      # fallback tilt (motors.json pos_0) if unreadable
 POS_TOL=50                  # tilt steps: "reached target" tolerance
@@ -75,14 +75,10 @@ get_tilt()  { _motors -p 2>/dev/null | tr -dc '0-9,-' | sed 's/.*,//'; }   # "PA
 home_tilt() { hp=$("$JCT" "$MOTORS_CONFIG" get motors.pos_0 2>/dev/null | tr -d '"'); printf '%s' "${hp##*,}"; }
 
 dn_mode() {  # current day/night intent (the TARGET): auto | day | night
-	# Read the LEAF keys, NEVER the whole daynight object: `jct get daynight` includes a
-	# nested "schedule":{"enabled":...}, so a substring match on '"enabled":true' would
-	# mis-read a forced camera that has the day/night SCHEDULE enabled as "auto" — which
-	# would clobber the forced mode on privacy exit. This matches S56ircut / ha-state / the
-	# agent, all of which read daynight.enabled directly and are immune to the nested key.
-	[ "$("$JCT" "$PRUDYNT_CONFIG" get daynight.enabled 2>/dev/null | tr -d '" ')" = "true" ] && { printf 'auto'; return; }
-	[ "$("$JCT" "$PRUDYNT_CONFIG" get daynight.force_mode 2>/dev/null | tr -d '" ')" = "night" ] && { printf 'night'; return; }
-	printf 'day'
+	# Single source of truth: the /etc/daynight.state sidecar (auto|day|night),
+	# read through the shared helper so privacy, prudynt and S56ircut never disagree.
+	# (missing helper -> auto, the safe default used everywhere.)
+	if [ -x "$DNSTATE" ]; then "$DNSTATE" get; else printf 'auto'; fi
 }
 
 dn_live() {  # current LIVE visual mode (what the engine is actually showing): day | night
@@ -150,54 +146,34 @@ seek_tilt() { # target_tilt
 	return 0
 }
 
-# Persist a prudynt.json key ONLY when it actually changes. A `jct set` rewrites
-# the whole ~8.5KB prudynt.json and jffs2 keeps the old copy as an obsolete node
-# until GC -> needless flash churn/wear on a 224KB overlay. Skipping unchanged
-# writes makes a re-assert (e.g. auto when already auto) cost ZERO flash. The
-# RUNTIME change (prudyntctl, in RAM) always runs below, so live behaviour is
-# unchanged. Returns 0 if it wrote, 1 if already at target, 2 if the write FAILED (logged).
-jset() {
-	[ "$("$JCT" "$PRUDYNT_CONFIG" get "$1" 2>/dev/null | tr -d '" ')" = "$2" ] && return 1
-	"$JCT" "$PRUDYNT_CONFIG" set "$1" "$2" >/dev/null 2>&1 && return 0
-	log "jset: failed to persist $1=$2 (config write error; runtime applied, reboot may differ)"
-	return 2
-}
-
-# day/night applied DIRECTLY (runtime + persisted + executor). Bypasses
-# thingino-agentctl / json-imp / ha-commands, so it never trips our own
+# day/night applied DIRECTLY (runtime + persisted via the sidecar + executor).
+# Bypasses thingino-agentctl / json-imp / ha-commands so it never trips our own
 # interlock. Mirrors the day/night adapter so a reboot lands the same mode.
-# prudyntctl = runtime (RAM, no flash); jset = persist ONLY on change; sync only
-# if we persisted -> minimal flash writes for endurance.
+# prudyntctl = runtime (RAM, no flash); daynight-state = the tiny atomic sidecar
+# persist (write-on-change, no ~8.5KB prudynt.json rewrite, sync inside helper).
 set_daynight() { # auto|day|night
-	_wrote=0
 	case "$1" in
 		auto)
 			echo '{"daynight":{"enabled":true}}' | prudyntctl json - >/dev/null 2>&1
-			jset daynight.enabled true && _wrote=1
-			jset daynight.force_mode "" && _wrote=1
+			"$DNSTATE" set auto >/dev/null 2>&1
 			;;
 		day | night)
 			echo "{\"daynight\":{\"enabled\":false,\"force_mode\":\"$1\"}}" | prudyntctl json - >/dev/null 2>&1
-			jset daynight.enabled false && _wrote=1
-			jset daynight.force_mode "$1" && _wrote=1
+			"$DNSTATE" set "$1" >/dev/null 2>&1
 			[ -x /sbin/daynight ] && /sbin/daynight "$1" >/dev/null 2>&1
 			;;
 		*) return 0 ;;
 	esac
-	[ "$_wrote" = 1 ] && sync   # flush to flash only if we actually persisted a change
 }
 
 # Freeze the day/night engine on the given LIVE mode (day|night): disable auto and
-# pin force_mode, at runtime (prudyntctl, RAM) + persisted only-on-change. Unlike
+# pin force_mode, at runtime (prudyntctl, RAM) + persisted to the sidecar. Unlike
 # set_daynight it does NOT run the executor: the optics are already in this mode,
 # and re-running it would re-light the IR we are about to kill. Pinning force_mode
 # to the live mode means the engine sees no change and never re-actuates an LED.
 freeze_daynight() { # day|night
 	echo "{\"daynight\":{\"enabled\":false,\"force_mode\":\"$1\"}}" | prudyntctl json - >/dev/null 2>&1
-	_wrote=0
-	jset daynight.enabled false && _wrote=1
-	jset daynight.force_mode "$1" && _wrote=1
-	[ "$_wrote" = 1 ] && sync
+	"$DNSTATE" set "$1" >/dev/null 2>&1
 }
 
 # Drive an emitter (ir|white|…) on|off with read-back verification — a single `light`
@@ -349,7 +325,15 @@ do_off() {
 	    if write_off "$(st_pose_tilt)"; then      # ONLY disarm if the guard was actually lifted
 	      disarm                                  # active=false + armed cleared, together
 	      [ "$LIVE" = "night" ] && light_verified ir on # verified IR restore (bypasses daynight dedup)
-	      [ "$MODE" = "auto" ] && set_daynight auto      # re-enable auto if it was auto (self-heals)
+	      # Re-assert the PRE-PRIVACY snapshot mode for ALL cases, not just auto: an
+      # unguarded agent/MQTT day/night toggle can mutate the sidecar while privacy
+      # is active, so exit must restore the snapshot or a forced mode is silently
+      # lost. freeze_daynight (not set_daynight) for forced modes avoids re-running
+      # the executor (IR already restored just above); both are write-on-change.
+      case "$MODE" in
+        auto) set_daynight auto ;;
+        day | night) freeze_daynight "$MODE" ;;
+      esac
 	      mic_restore                                    # unmute audio (only once privacy verifiably lifted)
 	    else
 	      # State write FAILED (overlay full). Keep BOTH active=true AND armed so motors +

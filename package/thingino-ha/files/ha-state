@@ -62,13 +62,10 @@ fi
 # Day/Night select — reflects the TARGET mode (what was selected): "auto" when
 # prudynt's day/night engine is enabled, otherwise the forced mode (day/night).
 if ha_entity_enabled daynight; then
-	dn_enabled=$(jct "$PRUDYNT_CONFIG" get daynight.enabled 2>/dev/null | tr -d '"')
-	if [ "$dn_enabled" = "true" ]; then
-		target=auto
-	else
-		target=$(jct "$PRUDYNT_CONFIG" get daynight.force_mode 2>/dev/null | tr -d '"')
-		[ "$target" = "day" ] || [ "$target" = "night" ] || target=day
-	fi
+	# Single source of truth: the /etc/daynight.state sidecar (auto|day|night),
+	# via the shared helper. The legacy prudynt.json daynight keys are dead.
+	target=$(/usr/sbin/daynight-state get 2>/dev/null)
+	[ "$target" = "auto" ] || [ "$target" = "day" ] || [ "$target" = "night" ] || target=auto
 	ha_pub_state daynight "$target" "$FORCE"
 fi
 
@@ -194,7 +191,8 @@ fi
 # Read-only (jct get), publish-on-change, no flash writes.
 if ha_entity_enabled shabbat; then
 	mo=$(jct "$PRUDYNT_CONFIG" get motion.enabled 2>/dev/null | tr -d '"')
-	dn=$(jct "$PRUDYNT_CONFIG" get daynight.enabled 2>/dev/null | tr -d '"')
+	# day/night "forced" (not auto) now comes from the sidecar, not prudynt.json.
+	[ "$(/usr/sbin/daynight-state get 2>/dev/null)" = "auto" ] && dn=true || dn=false
 	if [ "$mo" = "false" ] && [ "$dn" = "false" ]; then
 		ha_pub_state shabbat ON "$FORCE"
 	else

@@ -1,0 +1,107 @@
+#!/bin/sh
+# daynight-state - single source of truth for the persisted auto/day/night mode.
+#
+# Stores ONE line in /etc/daynight.state:  mode=auto|day|night
+#   auto  -> daynight.enabled=true,  force_mode=""      (engine auto-switches)
+#   day   -> daynight.enabled=false, force_mode="day"   (forced day)
+#   night -> daynight.enabled=false, force_mode="night" (forced night)
+#
+# Replaces the per-change ~8.5KB rewrite of /etc/prudynt.json for the two
+# MQTT-frequent modes: this file is tiny and written atomically (same-dir temp +
+# rename + sync), so a power cut never leaves a partial/0-byte state and flash
+# wear collapses. prudynt reads /etc/daynight.state DIRECTLY at config load
+# (patch 0015); S56ircut, physical-privacy and the agent adapter read/write it
+# through THIS helper, so the on-disk format has exactly one authority.
+#
+# The legacy prudynt.json daynight keys are read ONLY by `migrate` (once, when
+# the sidecar is missing). Afterwards the sidecar is authoritative; the old keys
+# are dead and are never written or read again.
+#
+# Usage: daynight-state get | set <auto|day|night> | migrate
+#   get      prints auto|day|night (missing/garbage file -> auto, the safe default)
+#   set M    write-on-change atomic write; rc 0=wrote 1=unchanged 2=invalid/failed
+#   migrate  if the sidecar is missing, create it from prudynt.json (else no-op)
+
+STATE="/etc/daynight.state"
+PRUDYNT_CONFIG="/etc/prudynt.json"
+JCT="/usr/bin/jct"
+
+log() { logger -t daynight-state "$*" 2>/dev/null; }
+
+# Atomic, power-safe write (mirrors physical-privacy _w): temp in the SAME dir
+# (/etc) so the rename is intra-jffs2 atomic (no EXDEV), sync for durability,
+# and on ANY failure delete the temp + return non-zero (never leak a partial).
+_write() { # mode
+	tmp="${STATE}.tmp.$$"
+	if printf 'mode=%s\n' "$1" >"$tmp" 2>/dev/null && mv -f "$tmp" "$STATE"; then
+		sync
+		return 0
+	fi
+	rm -f "$tmp" 2>/dev/null
+	log "WRITE FAILED (overlay full?) mode=$1 - state NOT persisted"
+	return 1
+}
+
+get() {
+	[ -f "$STATE" ] || { printf 'auto'; return 0; }
+	# Mirror prudynt CFG::load() 0015 parse EXACTLY so the helper and prudynt can
+	# never disagree: first line containing mode=, skip a leading quote/space, take
+	# the [a-z] run. Tolerates quotes/whitespace/CRLF a hand-edited file might add.
+	_line=$(grep -m1 'mode=' "$STATE" 2>/dev/null)
+	_v=${_line#*mode=}
+	_v=$(printf '%s' "$_v" | sed 's/^["[:space:]]*//')
+	_m=$(printf '%s' "$_v" | grep -o '^[a-z]*' | head -1)
+	case "$_m" in
+		auto | day | night) printf '%s' "$_m" ;;
+		*) printf 'auto' ;;
+	esac
+}
+
+set_mode() { # auto|day|night
+	case "$1" in
+		auto | day | night) ;;
+		*) echo "daynight-state: invalid mode '$1' (auto|day|night)" >&2; return 2 ;;
+	esac
+	[ "$(get)" = "$1" ] && return 1
+	_write "$1" && return 0
+	return 2
+}
+
+migrate() {
+	# Reclaim orphan temps left by a power cut / SIGKILL between create and rename.
+	# pid-aware so a CONCURRENT writer's in-flight temp is never removed (migrate
+	# also runs on watchdog restarts while the agent may be writing): only delete
+	# "${STATE}.tmp.<pid>" whose pid is no longer alive.
+	for _orph in "${STATE}".tmp.*; do
+		[ -e "$_orph" ] || continue
+		_op=${_orph##*.}
+		case "$_op" in '' | *[!0-9]*) continue ;; esac
+		kill -0 "$_op" 2>/dev/null && continue
+		rm -f "$_orph" 2>/dev/null
+	done
+	[ -f "$STATE" ] && return 0
+	en=""; fm=""
+	if [ -f "$PRUDYNT_CONFIG" ] && [ -x "$JCT" ]; then
+		_t=""; command -v timeout >/dev/null 2>&1 && _t="timeout 5"
+		en=$($_t "$JCT" "$PRUDYNT_CONFIG" get daynight.enabled 2>/dev/null | tr -d '" ')
+		fm=$($_t "$JCT" "$PRUDYNT_CONFIG" get daynight.force_mode 2>/dev/null | tr -d '" ')
+	fi
+	if [ "$en" = "false" ] && { [ "$fm" = "day" ] || [ "$fm" = "night" ]; }; then
+		m="$fm"
+	else
+		m="auto"
+	fi
+	if _write "$m"; then
+		log "migrated /etc/daynight.state from prudynt.json: mode=$m"
+		return 0
+	fi
+	return 2
+}
+
+case "$1" in
+	get)     get ;;
+	set)     set_mode "$2"; exit $? ;;
+	migrate) migrate; exit $? ;;
+	*)       echo "Usage: $0 {get|set <auto|day|night>|migrate}" >&2; exit 1 ;;
+esac
+exit 0
