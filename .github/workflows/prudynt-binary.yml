@@ -218,6 +218,10 @@ jobs:
           #     faults and still writes /tmp/prudynt_crash.log (diagnostic robustness).
           grep -qF "sigaltstack(&crash_ss" "$SRC/src/main.cpp" \
             || { echo "::error::main.cpp: crash-handler sigaltstack (0015) not applied"; ok=0; }
+          # 32) (0015): self-identifying startup trace -- a fresh binary prints
+          #     "startup-trace:" lines (look for "sidecar-in-main"); pins the crash step.
+          grep -qF "startup-trace:" "$SRC/src/main.cpp" \
+            || { echo "::error::main.cpp: startup-trace logging (0015) not applied"; ok=0; }
           [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (0001-0003 base; 0004 live reconfig + IDR; 0005 fault-tolerance; 0006 high-freq seamlessness; 0007 physical-privacy software mic mute; 0008 audio RTP sample-clock (all codecs) + AAC force_stereo reframer fix; 0009 cold-boot RTSP SPS/PPS deadline; 0010 IMP-init fail-fast; 0011 zero-channel fail-fast; 0012 config apply-defaults-on-parse-fail; 0013 force_mode quote-tolerance; 0014 live audio codec-switch RTSP rebuild; 0015 daynight.state sidecar read in main() + crash-handler sigaltstack)" || exit 1
 
       - name: Locate the built MIPS prudynt binary

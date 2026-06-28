@@ -1,4 +1,4 @@
-Subject: [PATCH] main: read /etc/daynight.state sidecar in main() (not CFG::load) + run crash handler on a sigaltstack
+Subject: [PATCH] main: read /etc/daynight.state sidecar in main() (not CFG::load) + crash-handler sigaltstack + startup trace
 Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (stacks on 0001-0014)
 
 The two MQTT-frequent modes (auto/day/night) persist in a tiny atomic sidecar
@@ -7,46 +7,39 @@ The two MQTT-frequent modes (auto/day/night) persist in a tiny atomic sidecar
 reboot WITHOUT the full ~8.5KB non-atomic prudynt.json rewrite.
 
 WHY IN main() AND NOT IN CFG::load():
-An earlier revision read the sidecar INSIDE CFG::load() (after the prudynt.json
-item loops). That crashed prudynt at startup with a SIGSEGV inside libuclibcshim
-(the T23 glibc->uClibc ABI shim), faulting at the TOP OF THE STACK -- and it
-crashed identically with every I/O form tried (ifstream / fopen / raw open) and
-even with the sidecar file absent. The C++ logic itself is sound and memory-safe:
-force_mode_cfg already takes a .rodata string literal as its item-table default,
-so assigning "day"/"night"/"" literals is the existing ownership contract and
-nothing ever frees it. The crash was a code-emission / frame effect -- folding
-the read (and its locals) into the already-enormous CFG::load() perturbed that
-function's stack-frame / unwind layout enough to trip the ABI shim on re-entry.
-Moving the read into a SEPARATE noinline function with its OWN frame, called from
-main() right after the config is constructed, keeps CFG::load() byte-identical to
-the proven build and resolves the crash while preserving the direct-read design.
-(noinline matters: at -O2 a once-called static would be inlined into main(),
-re-introducing the same frame perturbation there; noinline guarantees isolation.)
+An earlier revision read the sidecar INSIDE the enormous CFG::load() (Config.cpp).
+That crashed prudynt at startup with a SIGSEGV inside libuclibcshim (the T23
+glibc->uClibc ABI shim), faulting at the TOP OF THE STACK, identically across
+ifstream/fopen/raw-open and even with the file absent. The C++ logic is sound
+(force_mode_cfg already takes a .rodata literal as its default and nothing frees
+it). Moving the read into a SEPARATE noinline function with its OWN frame, called
+from main() right after the config is constructed, keeps CFG::load() byte-identical
+to the proven build. (noinline matters: at -O2 a once-called static would inline
+into main() and re-introduce the same frame perturbation there.)
 
 Timing is correct: the override runs after CFG::load() (so it wins over any
-prudynt.json value) and before IMPSystem::createNew() (patch 0001) derives the ISP
-running_mode from force_mode_cfg at main.cpp:605 -- nothing between make_shared and
-that point reads running_mode/force_mode_cfg. The read is allocation-free (raw
-open/read, C buffers, static literals) so it adds no malloc/free or std::string
-cleanup region.
+prudynt.json value) and before IMPSystem::createNew() derives the ISP running_mode
+from force_mode_cfg. Allocation-free (raw open/read, C buffers, static literals).
 
-Also folds in the crash-handler hardening (previously a separate diagnostic): the
-SIGSEGV/SIGABRT/... handler now runs on a sigaltstack (SA_ONSTACK) so it survives
-a stack-overflow fault and can still write /tmp/prudynt_crash.log. This is a
-permanent robustness improvement and the safety net should any startup fault
-recur -- the next crash, if any, produces a register+backtrace report instead of
-being invisible.
+Crash-handler hardening: the SIGSEGV/... handler now runs on a sigaltstack
+(SA_ONSTACK) so it survives a stack-overflow fault and can still write
+/tmp/prudynt_crash.log (a register+backtrace report) instead of dying silently.
+
+Startup trace: a few INFO-level "startup-trace:" lines bracket the config load,
+the sidecar apply, and IMP init, so the last line printed before any crash
+pinpoints the failing step -- and makes a fresh build unmistakable vs a stale
+artifact (grep "sidecar-in-main"). Cheap; harmless to leave in.
 
 Verified: git apply --check + patch -p1 both pass against f4b3228 + 0001-0014.
 
 diff --git a/src/main.cpp b/src/main.cpp
-index 2b35d77..00db3c2 100644
+index 2b35d77..a338d99 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -494,6 +494,58 @@ void start_video(int encChn) {
    sh.has_started.acquire();
  }
-
+ 
 +// Read the persisted day/night mode from the /etc/daynight.state sidecar and
 +// apply it to the already-loaded config. Deliberately a SEPARATE function with
 +// its OWN small stack frame, called from main() AFTER CFG::load() has run --
@@ -103,7 +96,7 @@ index 2b35d77..00db3c2 100644
    if (Logger::init("INFO")) {
      LOG_ERROR("Logger initialization failed.");
 @@ -530,12 +582,25 @@ int main(int argc, const char *argv[]) {
-
+ 
    // Install crash signal handlers to clean up lock file and collect diagnostics
    // on abnormal termination
 +  // DIAGNOSTIC: run the crash handler on a dedicated alternate stack
@@ -127,17 +120,36 @@ index 2b35d77..00db3c2 100644
 -                                           // default after first invocation
 +  sa.sa_flags = SA_SIGINFO | SA_RESETHAND | SA_ONSTACK; // detailed info; reset to
 +                                           // default after first; run on altstack
-
+ 
    sigaction(SIGSEGV, &sa, nullptr); // Segmentation fault
    sigaction(SIGABRT, &sa, nullptr); // Abort signal
-@@ -575,6 +640,10 @@ int main(int argc, const char *argv[]) {
+@@ -574,7 +639,17 @@ int main(int argc, const char *argv[]) {
+ 
    recover_stale_imp_state();
-
+ 
++  // Startup trace: pinpoints which step crashes if the daemon still dies, and
++  // makes this build unmistakable vs a stale artifact (look for "sidecar-in-main"
++  // in the log). Cheap, INFO-level; harmless to leave in.
++  LOG_INFO("startup-trace: loading prudynt.json (sidecar-in-main build)");
    cfg = std::make_shared<CFG>();
++  LOG_INFO("startup-trace: prudynt.json loaded; applying daynight sidecar");
 +  // Override day/night from the persisted sidecar BEFORE anything consumes it
 +  // (IMPSystem::init derives running_mode from force_mode_cfg). Done here, not in
 +  // CFG::load(), to keep that function's frame/ABI identical to the proven build.
 +  apply_daynight_sidecar(cfg);
++  LOG_INFO("startup-trace: daynight sidecar applied; setting log level");
    Logger::setLevel(cfg->general.loglevel);
-
+ 
  #if defined(WEBSOCKET_ENABLED)
+@@ -602,9 +677,11 @@ int main(int argc, const char *argv[]) {
+     return 1;
+   }
+ 
++  LOG_INFO("startup-trace: initializing IMP system");
+   if (!imp_system) {
+     imp_system = IMPSystem::createNew();
+   }
++  LOG_INFO("startup-trace: IMP system initialized");
+ 
+   // C2: fail-fast on IMP init failure. IMPSystem::createNew() returns null when
+   // any IMP bring-up step fails (IMP_ISP_Open, add/enable sensor,
