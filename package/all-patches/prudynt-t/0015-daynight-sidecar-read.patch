@@ -1,48 +1,45 @@
-Subject: [PATCH] config: read /etc/daynight.state sidecar as the day/night source of truth
+Subject: [PATCH] config: read /etc/daynight.state sidecar (raw open/read) as day/night source of truth
 Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (stacks on 0001-0014)
 
-The two MQTT-frequent modes (auto/day/night) used to persist as daynight.enabled
-+ daynight.force_mode inside /etc/prudynt.json, so every toggle rewrote the whole
-~8.5 KB file (jffs2 wear) through a non-atomic jct write. They now persist in a
-tiny, atomically-written sidecar /etc/daynight.state ("mode=auto|day|night").
+The two MQTT-frequent modes (auto/day/night) persist in a tiny atomic sidecar
+/etc/daynight.state ("mode=auto|day|night") instead of rewriting the whole
+~8.5 KB prudynt.json. CFG::load() reads that sidecar at config-load and sets
+daynight.enabled + daynight.force_mode_cfg from it (after the prudynt.json item
+loops, so it overrides them). IMPSystem::init() (patch 0001) derives the ISP
+running_mode from force_mode_cfg before the pipeline is built, so a forced mode
+sticks; S56ircut reads the same sidecar for the IR-cut/IR-LED optics. A missing/
+unreadable/unrecognized sidecar => auto (safe default). One-time migration from
+the legacy prudynt.json keys is done in the rootfs before launch.
 
-CFG::load() reads that sidecar at config-load and derives daynight.enabled +
-daynight.force_mode_cfg from it, AFTER the prudynt.json item loops (so it
-overrides them) and UNCONDITIONALLY of jsonConfig: the sidecar is a SEPARATE
-file, so if a power cut truncates prudynt.json (0012 then applies factory
-defaults) the surviving sidecar still restores the persisted mode. A missing /
-unreadable / unrecognized sidecar falls back to auto (the safe default); prudynt
-never reads the legacy prudynt.json daynight keys once a one-time migration has
-created the sidecar (the rootfs runs `daynight-state migrate` before launch).
-Because IMPSystem::init() (patch 0001) derives the ISP running_mode from
-force_mode_cfg BEFORE the pipeline is built, setting it here makes a forced
-colour/mono mode actually stick on the sc2336p; there is no late boot re-apply.
+CRASH FIX: the sidecar is read with RAW POSIX open()/read() -- NOT fopen and NOT
+std::ifstream. On this Sonoff PT2 (T23 / uClibc-ng) prudynt is force-linked
+against libuclibcshim.so (a glibc->uClibc ABI shim) which interposes fopen/fopen64;
+reading the sidecar through libc stdio (std::ifstream's filebuf, or a direct
+fopen) segfaulted inside that shim at prudynt startup, before the stream came up.
+Raw open()/read()/close() bypass the shim and are the same primitives
+DayNightWorker/ImagingControl already use successfully in this binary. The two
+config members are set unconditionally (no strcmp of the prior force_mode_cfg,
+so no deref of a pointer this code does not own; a 1-6 byte per-reload leak is
+negligible).
 
-The sidecar is read with plain C stdio (fopen/fgets) -- NOT std::ifstream:
-constructing a C++ filebuf at this point segfaults inside the T23 uClibc compat
-shim (libuclibcshim). fopen is the same primitive libjct and OSD.cpp use. The
-strdup is strcmp-guarded (CFG::load re-runs on every prudynt.json reload via
-ConfigWatcher and force_mode_cfg is never freed). The parser skips a leading
-quote + any whitespace, identical to the rootfs helper, so prudynt and the shell
-can never disagree.
-
-Two hunks (the <cstdio> include + the CFG::load block); uses <cstdio>/<cstring>/
-<string>. Verified: git apply --check AND patch -p1 --dry-run both pass against
+Single file (Config.cpp): adds <fcntl.h>/<unistd.h> + the CFG::load read block.
+Verified: git apply --check AND patch -p1 --dry-run both pass against
 f4b3228 + 0001-0014.
 
 diff --git a/src/Config.cpp b/src/Config.cpp
-index 5861a39..e42a157 100644
+index 5861a39..06345d5 100644
 --- a/src/Config.cpp
 +++ b/src/Config.cpp
-@@ -4,6 +4,7 @@
+@@ -4,6 +4,8 @@
  #include <algorithm>
  #include <cmath>
  #include <cstdint>
-+#include <cstdio>
++#include <fcntl.h>
++#include <unistd.h>
  #include <filesystem>
  #include <fstream>
  #include <functional>
-@@ -1400,6 +1401,57 @@ void CFG::load() {
+@@ -1400,6 +1402,64 @@ void CFG::load() {
      }
    }
  
@@ -62,19 +59,22 @@ index 5861a39..e42a157 100644
 +  // BEFORE the pipeline is built (patch 0001), setting it here is what makes the
 +  // persisted mode stick on this sensor -- there is no late boot-script re-apply.
 +  {
-+    // Read the sidecar with plain C stdio (fopen/fgets), NOT std::ifstream:
-+    // constructing a C++ filebuf here -- the first one in the process -- segfaults
-+    // inside the uClibc compat shim on this T23 build. fopen is the same primitive
-+    // libjct and OSD.cpp use successfully. Parse "mode=auto|day|night" from the
-+    // first line, skipping a leading quote/whitespace, identical to the rootfs
-+    // helper's sed so prudynt and the shell can never disagree on a value.
++    // Read the sidecar with RAW POSIX open()/read() -- NOT fopen and NOT
++    // std::ifstream. Both libc-stdio forms (filebuf->fopen, and direct fopen)
++    // segfault inside the T23 uClibc compat shim (libuclibcshim interposes
++    // fopen); raw open/read bypasses the shim and is the same primitive
++    // DayNightWorker/ImagingControl already use successfully on this build.
 +    char scbuf[64];
-+    scbuf[0] = '\0';
-+    if (FILE *scf = fopen("/etc/daynight.state", "r")) {
-+      if (!fgets(scbuf, sizeof(scbuf), scf))
-+        scbuf[0] = '\0';
-+      fclose(scf);
++    ssize_t scn = -1;
++    int scfd = ::open("/etc/daynight.state", O_RDONLY);
++    if (scfd >= 0) {
++      scn = ::read(scfd, scbuf, sizeof(scbuf) - 1);
++      ::close(scfd);
 +    }
++    scbuf[(scn > 0) ? (size_t)scn : 0] = '\0';
++    // Parse "mode=auto|day|night" from the buffer, skipping a leading quote/
++    // whitespace -- identical tolerance to the rootfs helper so prudynt and the
++    // shell can never disagree on a value.
 +    std::string scMode;
 +    if (const char *mp = std::strstr(scbuf, "mode=")) {
 +      mp += 5;
@@ -84,17 +84,21 @@ index 5861a39..e42a157 100644
 +      while (*mp >= 'a' && *mp <= 'z')
 +        scMode.push_back(*mp++);
 +    }
-+    // Map to the two config members. strdup ONLY on an actual change: CFG::load()
-+    // re-runs on every prudynt.json reload (ConfigWatcher), and force_mode_cfg is
-+    // never freed, so an unconditional strdup would leak the prior string each
-+    // reload -- mirror the 0013 / JSON-API strcmp-guard discipline. "auto" /
-+    // missing / corrupt / unrecognized => enabled + empty force_mode (safe default).
-+    const char *want =
-+        (scMode == "day") ? "day" : (scMode == "night") ? "night" : "";
-+    daynight.enabled = (want[0] == '\0');
-+    if (!daynight.force_mode_cfg ||
-+        std::strcmp(daynight.force_mode_cfg, want) != 0)
-+      daynight.force_mode_cfg = strdup(want);
++    // Set both members directly from the sidecar. strdup UNCONDITIONALLY: do NOT
++    // read the prior force_mode_cfg with strcmp (avoid any deref of a pointer
++    // whose lifetime this code does not own); the tiny per-reload leak of a 1-6
++    // byte string is negligible. "night"/"day" => forced; anything else (auto /
++    // missing / unreadable / garbage) => auto, the safe default.
++    if (scMode == "night") {
++      daynight.enabled = false;
++      daynight.force_mode_cfg = strdup("night");
++    } else if (scMode == "day") {
++      daynight.enabled = false;
++      daynight.force_mode_cfg = strdup("day");
++    } else {
++      daynight.enabled = true;
++      daynight.force_mode_cfg = strdup("");
++    }
 +  }
 +
    if (!daynight.loglevel || daynight.loglevel[0] == '\0') {
