@@ -202,16 +202,23 @@ jobs:
           #     handle_audio. (mic_sample_rate is a separate, deferred follow-up.)
           grep -qF "add_strk_a_rtsp" "$SRC/src/JsonAPI.cpp" \
             || { echo "::error::JsonAPI.cpp: live audio codec-switch RTSP rebuild (0014) not applied"; ok=0; }
-          # 30) (0015): day/night persists in the /etc/daynight.state sidecar; CFG::load()
-          #     reads it directly and overrides daynight.enabled + force_mode_cfg (single
+          # 30) (0015): day/night persists in the /etc/daynight.state sidecar; main()
+          #     reads it directly via apply_daynight_sidecar() (a SEPARATE function, NOT
+          #     inside the huge CFG::load() -- folding it there tripped the uClibc ABI
+          #     shim at startup) and overrides daynight.enabled + force_mode_cfg (single
           #     source of truth, no ~8.5KB prudynt.json rewrite for the MQTT-frequent mode).
+          grep -qF "apply_daynight_sidecar" "$SRC/src/main.cpp" \
+            || { echo "::error::main.cpp: daynight.state sidecar reader (0015) not applied"; ok=0; }
+          grep -qF "/etc/daynight.state" "$SRC/src/main.cpp" \
+            || { echo "::error::main.cpp: daynight.state sidecar path (0015) not applied"; ok=0; }
+          # 30b) (0015): and the read must NOT have leaked back into CFG::load() (that crashed).
           grep -qF "/etc/daynight.state" "$SRC/src/Config.cpp" \
-            || { echo "::error::Config.cpp: daynight.state sidecar read (0015) not applied"; ok=0; }
-          # 31) (0016): crash handler runs on a sigaltstack so it survives stack-overflow
+            && { echo "::error::Config.cpp still reads daynight.state (0015 must live in main.cpp, not CFG::load)"; ok=0; }
+          # 31) (0015): crash handler runs on a sigaltstack so it survives stack-overflow
           #     faults and still writes /tmp/prudynt_crash.log (diagnostic robustness).
           grep -qF "sigaltstack(&crash_ss" "$SRC/src/main.cpp" \
-            || { echo "::error::main.cpp: crash-handler sigaltstack (0016) not applied"; ok=0; }
-          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (0001-0003 base; 0004 live reconfig + IDR; 0005 fault-tolerance; 0006 high-freq seamlessness; 0007 physical-privacy software mic mute; 0008 audio RTP sample-clock (all codecs) + AAC force_stereo reframer fix; 0009 cold-boot RTSP SPS/PPS deadline; 0010 IMP-init fail-fast; 0011 zero-channel fail-fast; 0012 config apply-defaults-on-parse-fail; 0013 force_mode quote-tolerance; 0014 live audio codec-switch RTSP rebuild; 0015 daynight.state sidecar single source of truth; 0016 crash-handler sigaltstack)" || exit 1
+            || { echo "::error::main.cpp: crash-handler sigaltstack (0015) not applied"; ok=0; }
+          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (0001-0003 base; 0004 live reconfig + IDR; 0005 fault-tolerance; 0006 high-freq seamlessness; 0007 physical-privacy software mic mute; 0008 audio RTP sample-clock (all codecs) + AAC force_stereo reframer fix; 0009 cold-boot RTSP SPS/PPS deadline; 0010 IMP-init fail-fast; 0011 zero-channel fail-fast; 0012 config apply-defaults-on-parse-fail; 0013 force_mode quote-tolerance; 0014 live audio codec-switch RTSP rebuild; 0015 daynight.state sidecar read in main() + crash-handler sigaltstack)" || exit 1
 
       - name: Locate the built MIPS prudynt binary
         id: find

@@ -1,0 +1,143 @@
+Subject: [PATCH] main: read /etc/daynight.state sidecar in main() (not CFG::load) + run crash handler on a sigaltstack
+Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (stacks on 0001-0014)
+
+The two MQTT-frequent modes (auto/day/night) persist in a tiny atomic sidecar
+/etc/daynight.state ("mode=auto|day|night"), written by the rootfs helper
+/usr/sbin/daynight-state. prudynt reads it directly so the selected mode survives
+reboot WITHOUT the full ~8.5KB non-atomic prudynt.json rewrite.
+
+WHY IN main() AND NOT IN CFG::load():
+An earlier revision read the sidecar INSIDE CFG::load() (after the prudynt.json
+item loops). That crashed prudynt at startup with a SIGSEGV inside libuclibcshim
+(the T23 glibc->uClibc ABI shim), faulting at the TOP OF THE STACK -- and it
+crashed identically with every I/O form tried (ifstream / fopen / raw open) and
+even with the sidecar file absent. The C++ logic itself is sound and memory-safe:
+force_mode_cfg already takes a .rodata string literal as its item-table default,
+so assigning "day"/"night"/"" literals is the existing ownership contract and
+nothing ever frees it. The crash was a code-emission / frame effect -- folding
+the read (and its locals) into the already-enormous CFG::load() perturbed that
+function's stack-frame / unwind layout enough to trip the ABI shim on re-entry.
+Moving the read into a SEPARATE noinline function with its OWN frame, called from
+main() right after the config is constructed, keeps CFG::load() byte-identical to
+the proven build and resolves the crash while preserving the direct-read design.
+(noinline matters: at -O2 a once-called static would be inlined into main(),
+re-introducing the same frame perturbation there; noinline guarantees isolation.)
+
+Timing is correct: the override runs after CFG::load() (so it wins over any
+prudynt.json value) and before IMPSystem::createNew() (patch 0001) derives the ISP
+running_mode from force_mode_cfg at main.cpp:605 -- nothing between make_shared and
+that point reads running_mode/force_mode_cfg. The read is allocation-free (raw
+open/read, C buffers, static literals) so it adds no malloc/free or std::string
+cleanup region.
+
+Also folds in the crash-handler hardening (previously a separate diagnostic): the
+SIGSEGV/SIGABRT/... handler now runs on a sigaltstack (SA_ONSTACK) so it survives
+a stack-overflow fault and can still write /tmp/prudynt_crash.log. This is a
+permanent robustness improvement and the safety net should any startup fault
+recur -- the next crash, if any, produces a register+backtrace report instead of
+being invisible.
+
+Verified: git apply --check + patch -p1 both pass against f4b3228 + 0001-0014.
+
+diff --git a/src/main.cpp b/src/main.cpp
+index 2b35d77..00db3c2 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -494,6 +494,58 @@ void start_video(int encChn) {
+   sh.has_started.acquire();
+ }
+
++// Read the persisted day/night mode from the /etc/daynight.state sidecar and
++// apply it to the already-loaded config. Deliberately a SEPARATE function with
++// its OWN small stack frame, called from main() AFTER CFG::load() has run --
++// NOT folded into CFG::load(). Adding this read (and its locals) into the very
++// large CFG::load() perturbed that function's frame/unwind layout enough to trip
++// the T23 uClibc ABI shim at startup (SIGSEGV inside libuclibcshim, faulting at
++// the top of the stack), even though the C++ logic itself is sound. Kept
++// allocation-free: raw open/read (no fopen/filebuf), C buffers (no std::string),
++// and static string literals (no malloc/free) -- force_mode_cfg already takes a
++// .rodata literal as its default, so this matches the existing ownership.
++// noinline is deliberate: it guarantees this read gets its OWN stack frame at -O2
++// (a once-called static would otherwise be inlined into main()), keeping the
++// frame/unwind perturbation that crashed CFG::load() out of main() too.
++__attribute__((noinline)) static void
++apply_daynight_sidecar(const std::shared_ptr<CFG> &c) {
++  if (!c)
++    return;
++  char buf[64];
++  ssize_t n = -1;
++  int fd = ::open("/etc/daynight.state", O_RDONLY);
++  if (fd >= 0) {
++    n = ::read(fd, buf, sizeof(buf) - 1);
++    ::close(fd);
++  }
++  buf[(n > 0) ? (size_t)n : 0] = '\0';
++
++  // locate mode=<value>, skip an optional quote/space, read the lowercase token
++  char mode[8];
++  size_t mi = 0;
++  const char *mp = std::strstr(buf, "mode=");
++  if (mp) {
++    mp += 5;
++    while (*mp == '"' || *mp == ' ' || *mp == '\t' || *mp == '\r' ||
++           *mp == '\n')
++      ++mp;
++    while (mi < sizeof(mode) - 1 && *mp >= 'a' && *mp <= 'z')
++      mode[mi++] = *mp++;
++  }
++  mode[mi] = '\0';
++
++  if (std::strcmp(mode, "night") == 0) {
++    c->daynight.enabled = false;
++    c->daynight.force_mode_cfg = "night";
++  } else if (std::strcmp(mode, "day") == 0) {
++    c->daynight.enabled = false;
++    c->daynight.force_mode_cfg = "day";
++  } else {
++    c->daynight.enabled = true;
++    c->daynight.force_mode_cfg = "";
++  }
++}
++
+ int main(int argc, const char *argv[]) {
+   if (Logger::init("INFO")) {
+     LOG_ERROR("Logger initialization failed.");
+@@ -530,12 +582,25 @@ int main(int argc, const char *argv[]) {
+
+   // Install crash signal handlers to clean up lock file and collect diagnostics
+   // on abnormal termination
++  // DIAGNOSTIC: run the crash handler on a dedicated alternate stack
++  // (SA_ONSTACK). Without this the handler cannot execute when the fault is a
++  // stack overflow (the kernel can't push the signal frame onto an exhausted
++  // stack), so no /tmp/prudynt_crash.log is produced and the crash is invisible.
++  // With an alt stack the handler runs and writes the register/backtrace report
++  // regardless of fault type.
++  static char crash_alt_stack[32768];
++  stack_t crash_ss;
++  crash_ss.ss_sp = crash_alt_stack;
++  crash_ss.ss_size = sizeof(crash_alt_stack);
++  crash_ss.ss_flags = 0;
++  sigaltstack(&crash_ss, nullptr);
++
+   struct sigaction sa;
+   memset(&sa, 0, sizeof(sa));
+   sa.sa_sigaction = crash_signal_handler_extended;
+   sigemptyset(&sa.sa_mask);
+-  sa.sa_flags = SA_SIGINFO | SA_RESETHAND; // Get detailed signal info, reset to
+-                                           // default after first invocation
++  sa.sa_flags = SA_SIGINFO | SA_RESETHAND | SA_ONSTACK; // detailed info; reset to
++                                           // default after first; run on altstack
+
+   sigaction(SIGSEGV, &sa, nullptr); // Segmentation fault
+   sigaction(SIGABRT, &sa, nullptr); // Abort signal
+@@ -575,6 +640,10 @@ int main(int argc, const char *argv[]) {
+   recover_stale_imp_state();
+
+   cfg = std::make_shared<CFG>();
++  // Override day/night from the persisted sidecar BEFORE anything consumes it
++  // (IMPSystem::init derives running_mode from force_mode_cfg). Done here, not in
++  // CFG::load(), to keep that function's frame/ABI identical to the proven build.
++  apply_daynight_sidecar(cfg);
+   Logger::setLevel(cfg->general.loglevel);
+
+ #if defined(WEBSOCKET_ENABLED)
