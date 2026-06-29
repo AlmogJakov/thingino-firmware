@@ -202,14 +202,29 @@ jobs:
           #     handle_audio. (mic_sample_rate is a separate, deferred follow-up.)
           grep -qF "add_strk_a_rtsp" "$SRC/src/JsonAPI.cpp" \
             || { echo "::error::JsonAPI.cpp: live audio codec-switch RTSP rebuild (0014) not applied"; ok=0; }
-          # NOTE: day/night persistence is handled entirely in the rootfs (the
-          # /etc/daynight.state sidecar + S31prudynt's pre-start sync-to-config into
-          # prudynt.json); prudynt is intentionally UNMODIFIED for it beyond the proven
-          # 0001 force_mode handling. No daynight.state guard here: the startup crash was
-          # a regressed libuclibcshim.so, NOT prudynt, and the proven prudynt legitimately
-          # contains the prudynt_daynight_state Prometheus metric (a bare 'daynight.state'
-          # check would false-match it).
-          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (0001-0003 base; 0004 live reconfig + IDR; 0005 fault-tolerance; 0006 high-freq seamlessness; 0007 physical-privacy software mic mute; 0008 audio RTP sample-clock (all codecs) + AAC force_stereo reframer fix; 0009 cold-boot RTSP SPS/PPS deadline; 0010 IMP-init fail-fast; 0011 zero-channel fail-fast; 0012 config apply-defaults-on-parse-fail; 0013 force_mode quote-tolerance; 0014 live audio codec-switch RTSP rebuild)" || exit 1
+          # 30) (0015 / direct-read): CFG::load overlays the persisted day/night mode by
+          #     reading the /etc/daynight.state sidecar DIRECTLY (single source of truth),
+          #     so the sidecar is the final word on every load/reload with NO prudynt.json
+          #     daynight write. Allocation-free (static literals, no strdup) + POSIX
+          #     open/read/close only. Match the LITERAL sidecar path (distinct from the
+          #     prudynt_daynight_state Prometheus metric) and the 0015 marker comment.
+          grep -qF "/etc/daynight.state" "$SRC/src/Config.cpp" \
+            || { echo "::error::Config.cpp: 0015 direct-read sidecar overlay (/etc/daynight.state) not applied"; ok=0; }
+          grep -qF "0015 (direct-read)" "$SRC/src/Config.cpp" \
+            || { echo "::error::Config.cpp: 0015 direct-read marker comment missing — STALE/partial 0015"; ok=0; }
+          # 30b) NO debug scaffolding may ship: a prior diagnostic build leaked startup
+          #      trace markers; refuse any that crept back into the prudynt source.
+          DBG=$(grep -rnoE 'DIAG:|startup-trace|HANDLER entered|\bacq1\b|\bacq2\b' "$SRC/src" 2>/dev/null | head -20)
+          if [ -n "$DBG" ]; then
+            echo "::error::debug scaffolding markers found in prudynt source:"; echo "$DBG"; ok=0
+          fi
+          # NOTE: day/night persistence is the tiny atomic /etc/daynight.state sidecar
+          # (single source of truth). With 0015 prudynt reads it DIRECTLY at config-load,
+          # so S31prudynt NO LONGER syncs it into prudynt.json (the per-boot 8.5KB rewrite
+          # is gone). The startup crash was a regressed libuclibcshim.so, NOT prudynt; the
+          # binary legitimately contains the prudynt_daynight_state Prometheus metric, so we
+          # match the LITERAL path /etc/daynight.state (above), never a bare 'daynight.state'.
+          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (0001-0003 base; 0004 live reconfig + IDR; 0005 fault-tolerance; 0006 high-freq seamlessness; 0007 physical-privacy software mic mute; 0008 audio RTP sample-clock (all codecs) + AAC force_stereo reframer fix; 0009 cold-boot RTSP SPS/PPS deadline; 0010 IMP-init fail-fast; 0011 zero-channel fail-fast; 0012 config apply-defaults-on-parse-fail; 0013 force_mode quote-tolerance; 0014 live audio codec-switch RTSP rebuild; 0015 daynight direct-read sidecar)" || exit 1
 
       - name: Collect prudynt + the libuclibcshim.so it links (and guard the shim sha)
         id: find
@@ -234,6 +249,13 @@ jobs:
             echo "::error::libuclibcshim.so sha '$shimsha' != pinned-good $GOOD_SHIM -- shim was rebuilt/changed (unverified, was what crashed prudynt); refusing. Re-pin only after verifying prudynt boots."; exit 1
           fi
           echo "shim OK: pinned proven-good ($shimsha)"
+          # Confirm the 0015 direct-read overlay actually baked into the SHIPPED binary
+          # (the literal sidecar path; distinct from the prudynt_daynight_state metric).
+          if grep -aqF "/etc/daynight.state" artifact/prudynt; then
+            echo "0015 OK: shipped prudynt references /etc/daynight.state (direct-read overlay present)"
+          else
+            echo "::error::shipped prudynt does NOT reference /etc/daynight.state — 0015 overlay missing from binary"; exit 1
+          fi
           ls -l artifact/
 
       - name: Upload prudynt + libuclibcshim.so

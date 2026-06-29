@@ -1,0 +1,65 @@
+diff --git a/src/Config.cpp b/src/Config.cpp
+index 5861a39..c5824a6 100644
+--- a/src/Config.cpp
++++ b/src/Config.cpp
+@@ -12,6 +12,9 @@
+ #include <json_config.h>
+ #include <vector>
+ 
++#include <fcntl.h>  // 0015 direct-read: POSIX open() for /etc/daynight.state
++#include <unistd.h> // 0015 direct-read: POSIX read()/close()
++
+ #if defined(WEBSOCKET_ENABLED)
+ #define WEBSOCKET_TOKEN_LENGTH 32
+ #endif
+@@ -1400,6 +1403,50 @@ void CFG::load() {
+     }
+   }
+ 
++  // 0015 (direct-read): /etc/daynight.state is the single source of truth for the
++  // persisted auto/day/night mode. Overlay it HERE -- after the item loops and the
++  // 0013 quote-strip -- so the sidecar is the FINAL word on every CFG::load(), both at
++  // boot and on every ConfigWatcher reload (a one-shot main() overlay would be reverted
++  // by the next reload). Allocation-free and free-free: force_mode_cfg is assigned a
++  // STATIC string literal -- no strdup here, so 0015 adds nothing to leak; force_mode_cfg
++  // is never freed anywhere, and the lock-free readers (IMPSystem/DayNightWorker/JsonAPI)
++  // only ever observe a complete, valid pointer (atomic word write). POSIX open/read/close
++  // only -- no iostream, no heavy startup work, one open/read/close. A missing /
++  // unreadable / malformed sidecar leaves mode=auto (the safe default); this code never
++  // throws, blocks, allocates, frees, or writes prudynt.json. Mirrors the existing
++  // auto-case semantics (force_mode_cfg == "" means "no force"), which the char-item
++  // default path already produces via strdup("").
++  {
++    char sbuf[64];
++    ssize_t sn = -1;
++    int sfd = ::open("/etc/daynight.state", O_RDONLY);
++    if (sfd >= 0) {
++      sn = ::read(sfd, sbuf, sizeof(sbuf) - 1);
++      ::close(sfd);
++    }
++    sbuf[(sn > 0) ? (size_t)sn : 0] = '\0';
++    char smode[8];
++    size_t si = 0;
++    if (const char *sp = std::strstr(sbuf, "mode=")) {
++      sp += 5; // skip "mode="
++      while (*sp == '"' || *sp == ' ' || *sp == '\t' || *sp == '\r' || *sp == '\n')
++        ++sp;
++      while (si < sizeof(smode) - 1 && *sp >= 'a' && *sp <= 'z')
++        smode[si++] = *sp++;
++    }
++    smode[si] = '\0';
++    if (std::strcmp(smode, "night") == 0) {
++      daynight.enabled = false;
++      daynight.force_mode_cfg = "night";
++    } else if (std::strcmp(smode, "day") == 0) {
++      daynight.enabled = false;
++      daynight.force_mode_cfg = "day";
++    } else { // "auto", empty, or anything unrecognized -> safe default
++      daynight.enabled = true;
++      daynight.force_mode_cfg = "";
++    }
++  }
++
+   if (!daynight.loglevel || daynight.loglevel[0] == '\0') {
+     daynight.loglevel = (general.loglevel && general.loglevel[0] != '\0')
+                             ? general.loglevel
