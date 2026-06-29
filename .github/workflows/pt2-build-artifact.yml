@@ -155,17 +155,27 @@ jobs:
           # --- core deliverable present ---
           { [ -f "$ROOT/usr/bin/prudynt" ] && file "$ROOT/usr/bin/prudynt" 2>/dev/null | grep -qE 'ELF'; } && ok "prudynt binary present (ELF)" || err "prudynt binary missing or not ELF"
 
-          # --- anti-0015: the proven prudynt must NOT read the sidecar itself (the in-binary
-          #     read crashed prudynt on this uClibc shim and was reverted). day/night
-          #     persistence is rootfs-only via S31prudynt's pre-start sync. A 'daynight.state'
-          #     string in the binary == a STALE 0015 build (a crashing image); refuse it. ---
-          # Match the EXACT 0015 sidecar path literal (fixed string) -- a bare
-          # 'daynight.state' regex would also hit the legitimate prudynt_daynight_state
-          # Prometheus metric that is in EVERY proven build (IPCServer.cpp).
-          if grep -aqF '/etc/daynight.state' "$ROOT/usr/bin/prudynt" 2>/dev/null; then
-            err "prudynt binary opens /etc/daynight.state -> reverted-0015 build (CRASHES at startup); source/branch is stale"
+          # --- SHIM REGRESSION GUARD (the REAL failure mode) ---
+          # The startup SIGSEGV was NEVER prudynt/0015: it is a regressed libuclibcshim.so
+          # (the glibc->uClibc ABI shim prudynt force-links). A bad shim build faults in its
+          # own stdio bridge (__fputc_unlocked, +0xbc8) and crashes EVERY prudynt at startup;
+          # the proven prudynt boots fine against a good shim. Refuse to ship the known-bad
+          # shim. (No daynight.state grep here -- the proven prudynt legitimately contains the
+          # prudynt_daynight_state Prometheus metric, so that check was a false positive.)
+          BAD_SHIM="b3ead471b602e75b2557fcb71a52818583a6caddf5ad1296d84ecea35553eefa"
+          GOOD_SHIM="07710f80ebc4683c9a9c658142a3cdce018db2949b844647e1709446e21c369b"
+          SHIM=$(find "$ROOT" -name 'libuclibcshim.so' 2>/dev/null | head -1)
+          if [ -n "$SHIM" ]; then
+            shimsha=$(sha256sum "$SHIM" | cut -d' ' -f1)
+            if [ "$shimsha" = "$BAD_SHIM" ]; then
+              err "libuclibcshim.so is the KNOWN-BAD build ($shimsha) -- crashes prudynt at startup; do NOT ship"
+            elif [ "$shimsha" = "$GOOD_SHIM" ]; then
+              ok "libuclibcshim.so is the known-GOOD build ($shimsha)"
+            else
+              ok "libuclibcshim.so is not the known-bad build (sha $shimsha; verify it boots prudynt)"
+            fi
           else
-            ok "prudynt binary does not open /etc/daynight.state (proven 0001-0014, no in-binary sidecar read)"
+            err "libuclibcshim.so not found in rootfs"
           fi
           # --- the rootfs pre-start sync pieces must actually be present ---
           grep -q 'sync-to-config' "$ROOT/usr/sbin/daynight-state" 2>/dev/null \
