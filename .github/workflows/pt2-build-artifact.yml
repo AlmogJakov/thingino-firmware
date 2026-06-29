@@ -159,10 +159,13 @@ jobs:
           #     read crashed prudynt on this uClibc shim and was reverted). day/night
           #     persistence is rootfs-only via S31prudynt's pre-start sync. A 'daynight.state'
           #     string in the binary == a STALE 0015 build (a crashing image); refuse it. ---
-          if grep -aq 'daynight.state' "$ROOT/usr/bin/prudynt" 2>/dev/null; then
-            err "prudynt binary contains 'daynight.state' -> reverted-0015 build (CRASHES at startup); source/branch is stale"
+          # Match the EXACT 0015 sidecar path literal (fixed string) -- a bare
+          # 'daynight.state' regex would also hit the legitimate prudynt_daynight_state
+          # Prometheus metric that is in EVERY proven build (IPCServer.cpp).
+          if grep -aqF '/etc/daynight.state' "$ROOT/usr/bin/prudynt" 2>/dev/null; then
+            err "prudynt binary opens /etc/daynight.state -> reverted-0015 build (CRASHES at startup); source/branch is stale"
           else
-            ok "prudynt binary has NO daynight.state (proven 0001-0014, no in-binary sidecar read)"
+            ok "prudynt binary does not open /etc/daynight.state (proven 0001-0014, no in-binary sidecar read)"
           fi
           # --- the rootfs pre-start sync pieces must actually be present ---
           grep -q 'sync-to-config' "$ROOT/usr/sbin/daynight-state" 2>/dev/null \

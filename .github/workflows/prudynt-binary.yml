@@ -236,11 +236,14 @@ jobs:
         run: |
           BIN="${{ steps.find.outputs.bin }}"
           [ -n "$BIN" ] && [ -f "$BIN" ] || { echo "::error::no prudynt binary located"; exit 1; }
-          if grep -aq "daynight.state" "$BIN"; then
-            echo "::error::built prudynt contains 'daynight.state' -> reverted-0015 binary (CRASHES at startup). Source/branch is stale; refusing to upload."
+          # Match the EXACT 0015 sidecar path literal ("/etc/daynight.state", fixed string)
+          # -- NOT a bare "daynight.state" regex, which would also hit the legitimate
+          # prudynt_daynight_state Prometheus metric present in every (proven) build.
+          if grep -aqF "/etc/daynight.state" "$BIN"; then
+            echo "::error::built prudynt opens /etc/daynight.state -> reverted-0015 binary (CRASHES at startup). Source/branch is stale; refusing to upload."
             exit 1
           fi
-          echo "PASS: prudynt binary has NO daynight.state (proven 0001-0014; no in-binary sidecar read)"
+          echo "PASS: prudynt binary does not open /etc/daynight.state (proven 0001-0014; no in-binary sidecar read)"
 
       - name: Upload prudynt binary
         uses: actions/upload-artifact@v4
