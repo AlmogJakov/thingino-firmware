@@ -186,9 +186,10 @@ if ha_entity_enabled overlay_used; then
 	[ -n "$used" ] && ha_pub_state overlay_used "$used" "$FORCE"
 fi
 
-# Shabbat Ready — ON only when motion detection is OFF (motion.enabled=false) AND
-# day/night is FORCED, not auto (daynight.enabled=false). Either unmet -> OFF.
-# Read-only (jct get), publish-on-change, no flash writes.
+# Shabbat Ready — ON only when BOTH hold: motion detection is OFF (motion.enabled=false)
+# AND day/night is NOT auto (a forced day/night mode). Either unmet -> OFF. A broken/missing
+# sidecar reads as forced 'day' (NOT auto), so it can turn Shabbat ON ONLY when motion is
+# also off -- never unconditionally. Read-only (jct get), publish-on-change, no flash writes.
 if ha_entity_enabled shabbat; then
 	mo=$(jct "$PRUDYNT_CONFIG" get motion.enabled 2>/dev/null | tr -d '"')
 	# day/night "forced" (not auto) now comes from the sidecar, not prudynt.json.

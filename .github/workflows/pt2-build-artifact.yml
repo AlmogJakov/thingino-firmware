@@ -159,8 +159,9 @@ jobs:
             [ -x "$ROOT/$f" ] && ok "$f executable" || err "$f missing or not executable"
           done
 
-          # --- documentation must NOT be baked into the rootfs ---
+          # --- documentation + offline tests must NOT be baked into the rootfs ---
           find "$ROOT" -name 'PT2-FIX-SET.md' | grep -q . && err "PT2-FIX-SET.md was installed into the rootfs" || ok "PT2-FIX-SET.md not in rootfs"
+          find "$ROOT" -name 'test-daynight-state.sh' | grep -q . && err "test-daynight-state.sh (repo-only offline test) was installed into the rootfs" || ok "test-daynight-state.sh not in rootfs (repo-only test, never baked)"
 
           # --- core deliverable present ---
           { [ -f "$ROOT/usr/bin/prudynt" ] && file "$ROOT/usr/bin/prudynt" 2>/dev/null | grep -qE 'ELF'; } && ok "prudynt binary present (ELF)" || err "prudynt binary missing or not ELF"
