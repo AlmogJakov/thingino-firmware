@@ -14,7 +14,7 @@ thingino_agent_prudynt_daynight_state_get() { # -> auto|day|night
 	if [ -x "$THINGINO_AGENT_DAYNIGHT_STATE" ]; then
 		"$THINGINO_AGENT_DAYNIGHT_STATE" get
 	else
-		printf 'auto'
+		printf 'day'
 	fi
 }
 

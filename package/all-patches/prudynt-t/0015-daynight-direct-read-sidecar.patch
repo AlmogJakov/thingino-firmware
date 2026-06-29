@@ -1,5 +1,5 @@
 diff --git a/src/Config.cpp b/src/Config.cpp
-index 5861a39..c5824a6 100644
+index 5861a39..be904ba 100644
 --- a/src/Config.cpp
 +++ b/src/Config.cpp
 @@ -12,6 +12,9 @@
@@ -12,7 +12,7 @@ index 5861a39..c5824a6 100644
  #if defined(WEBSOCKET_ENABLED)
  #define WEBSOCKET_TOKEN_LENGTH 32
  #endif
-@@ -1400,6 +1403,50 @@ void CFG::load() {
+@@ -1400,6 +1403,55 @@ void CFG::load() {
      }
    }
  
@@ -20,15 +20,17 @@ index 5861a39..c5824a6 100644
 +  // persisted auto/day/night mode. Overlay it HERE -- after the item loops and the
 +  // 0013 quote-strip -- so the sidecar is the FINAL word on every CFG::load(), both at
 +  // boot and on every ConfigWatcher reload (a one-shot main() overlay would be reverted
-+  // by the next reload). Allocation-free and free-free: force_mode_cfg is assigned a
-+  // STATIC string literal -- no strdup here, so 0015 adds nothing to leak; force_mode_cfg
-+  // is never freed anywhere, and the lock-free readers (IMPSystem/DayNightWorker/JsonAPI)
-+  // only ever observe a complete, valid pointer (atomic word write). POSIX open/read/close
-+  // only -- no iostream, no heavy startup work, one open/read/close. A missing /
-+  // unreadable / malformed sidecar leaves mode=auto (the safe default); this code never
-+  // throws, blocks, allocates, frees, or writes prudynt.json. Mirrors the existing
-+  // auto-case semantics (force_mode_cfg == "" means "no force"), which the char-item
-+  // default path already produces via strdup("").
++  // by the next reload). 0015 itself allocates/frees NOTHING (force_mode_cfg is a STATIC
++  // literal here). force_mode_cfg is a config char-item the layer never frees BY DESIGN (the
++  // lock-free readers IMPSystem/DayNightWorker/JsonAPI hold no lock, so a free() could UAF);
++  // the heap strdup that handleConfigItem/0013 install for it is therefore orphaned here --
++  // the SAME pre-existing per-load char-item leak that happens with or without 0015 (no new
++  // rate, just one constant ~16B copy). Readers only ever observe a complete, valid pointer
++  // (atomic word write). POSIX open/read/close only -- one open/read/close, no iostream. mode=auto keeps
++  // auto (force_mode_cfg == "" means "no force"); a missing / unreadable / malformed
++  // sidecar falls back to FORCED DAY -- the chosen safe default for broken persistence,
++  // matching daynight-state's get + migrate. This code never throws, blocks, allocates,
++  // frees, or writes prudynt.json.
 +  {
 +    char sbuf[64];
 +    ssize_t sn = -1;
@@ -54,9 +56,12 @@ index 5861a39..c5824a6 100644
 +    } else if (std::strcmp(smode, "day") == 0) {
 +      daynight.enabled = false;
 +      daynight.force_mode_cfg = "day";
-+    } else { // "auto", empty, or anything unrecognized -> safe default
++    } else if (std::strcmp(smode, "auto") == 0) {
 +      daynight.enabled = true;
 +      daynight.force_mode_cfg = "";
++    } else { // missing / unreadable / malformed -> FORCED DAY (safe fallback)
++      daynight.enabled = false;
++      daynight.force_mode_cfg = "day";
 +    }
 +  }
 +

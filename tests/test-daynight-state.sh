@@ -7,8 +7,8 @@
 # NO LONGER syncs the sidecar into prudynt.json. (The 0015 startup crash that once
 # forced the rootfs-sync workaround was a miscompiled libuclibcshim.so, since fixed
 # by pinning the proven-good shim -- not 0015 itself.) These tests cover the HELPER:
-#   1) missing-sidecar upgrade migration (seed from prudynt.json once)
-#   2) corrupt/invalid sidecar => auto
+#   1) migrate ensures a valid sidecar (seeds forced DAY on missing/corrupt)
+#   2) corrupt/invalid/missing sidecar => forced DAY (legit auto preserved)
 #   3) set: write-on-change / validation / atomicity
 #   4) sync-to-config mapping -- LEGACY/UNWIRED verb (off the boot path under 0015),
 #      kept as a rollback aid; tested here so the escape hatch still works
@@ -70,7 +70,7 @@ sidecar_parse() {
       m=$(printf '%s' "$v" | grep -o '^[a-z]*')
     fi
   fi
-  case "$m" in day) echo day ;; night) echo night ;; *) echo auto ;; esac
+  case "$m" in auto) echo auto ;; day) echo day ;; night) echo night ;; *) echo day ;; esac
 }
 
 PASS=0; FAIL=0
@@ -80,35 +80,41 @@ eq()  { [ "$2" = "$3" ] && ok "$1" || bad "$1" "$2" "$3"; }
 wr()  { printf '%s' "$1" > "$STATE"; }
 rmstate() { rm -f "$STATE"; }
 
-echo "== Scenario 1: missing sidecar upgrade migration =="
-rmstate; printf '{"daynight":{"enabled":false,"force_mode":"night"}}\n' > "$PJSON"
+echo "== Scenario 1: migrate ensures a valid sidecar (seed forced DAY) =="
+# migrate no longer reads prudynt.json (those keys are dead under 0015); a MISSING
+# sidecar is seeded to forced DAY -- the safe fallback for broken persistence.
+rmstate
 "$HELPER" migrate
-eq "migrate(forced-night) -> sidecar=night" "$(cat "$STATE" 2>/dev/null)" "mode=night"
-eq "  helper get == night" "$("$HELPER" get)" "night"
-rmstate; printf '{"daynight":{"enabled":true,"force_mode":""}}\n' > "$PJSON"
-"$HELPER" migrate; eq "migrate(auto) -> auto" "$("$HELPER" get)" "auto"
-rmstate; printf '{"image":{"isp_bypass":true}}\n' > "$PJSON"
-"$HELPER" migrate; eq "migrate(no daynight keys) -> auto" "$("$HELPER" get)" "auto"
-# migrate seeds ONLY when the sidecar is missing (first boot after upgrade)
+eq "migrate(missing) -> sidecar=day" "$(cat "$STATE" 2>/dev/null)" "mode=day"
+eq "  helper get == day" "$("$HELPER" get)" "day"
+# migrate REPAIRS a corrupt sidecar to forced day too.
+wr 'this is garbage not our format'
+"$HELPER" migrate
+eq "migrate(corrupt) -> sidecar=day" "$(cat "$STATE" 2>/dev/null)" "mode=day"
+# migrate is a NO-OP (leaves a valid sidecar untouched), incl. a legit auto.
 "$HELPER" set night >/dev/null
-printf '{"daynight":{"enabled":true,"force_mode":""}}\n' > "$PJSON"
 "$HELPER" migrate
-eq "migrate is a no-op when sidecar already present" "$("$HELPER" get)" "night"
+eq "migrate no-op when sidecar=night" "$("$HELPER" get)" "night"
+"$HELPER" set auto >/dev/null
+"$HELPER" migrate
+eq "migrate no-op when sidecar=auto (auto preserved)" "$("$HELPER" get)" "auto"
 
-echo "== Scenario 2: corrupt/invalid sidecar => auto =="
-wr 'this is garbage not our format'; eq "garbage -> get auto" "$("$HELPER" get)" "auto"
-eq "garbage -> parse auto" "$(sidecar_parse "$STATE")" "auto"
-wr ''; eq "empty -> get auto" "$("$HELPER" get)" "auto"
-wr 'mode='; eq "mode= (no value) -> get auto" "$("$HELPER" get)" "auto"
-wr 'mode=bogus'; eq "mode=bogus -> get auto" "$("$HELPER" get)" "auto"
+echo "== Scenario 2: corrupt/invalid sidecar => forced DAY =="
+wr 'this is garbage not our format'; eq "garbage -> get day" "$("$HELPER" get)" "day"
+eq "garbage -> parse day" "$(sidecar_parse "$STATE")" "day"
+wr ''; eq "empty -> get day" "$("$HELPER" get)" "day"
+wr 'mode='; eq "mode= (no value) -> get day" "$("$HELPER" get)" "day"
+wr 'mode=bogus'; eq "mode=bogus -> get day" "$("$HELPER" get)" "day"
 
-echo "== Scenario 3: get parse tolerance (CRLF / quotes / missing) =="
+echo "== Scenario 3: get parse tolerance (CRLF / quotes / auto / missing) =="
 printf 'mode=night\r\n' > "$STATE"
 eq "CRLF night: get==night" "$("$HELPER" get)" "night"
 printf 'mode="night"\n' > "$STATE"
 eq "quoted night: get==night" "$("$HELPER" get)" "night"
+wr 'mode=auto'
+eq "auto preserved: get==auto" "$("$HELPER" get)" "auto"
 rmstate
-eq "missing: get==auto" "$("$HELPER" get)" "auto"
+eq "missing: get==day (forced fallback)" "$("$HELPER" get)" "day"
 
 echo "== set semantics: write-on-change + validation + atomicity =="
 rmstate

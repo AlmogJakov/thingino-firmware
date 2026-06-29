@@ -270,10 +270,11 @@ start() {
 	# the SINGLE source of truth. prudynt reads it DIRECTLY at config-load (patch 0015
 	# overlays CFG::load), so there is NO sidecar->prudynt.json sync here: the per-boot
 	# 8.5KB prudynt.json rewrite is gone, and the sidecar stays the final word on every
-	# load AND every ConfigWatcher reload. We still MIGRATE on the first boot after an
-	# upgrade to seed the sidecar from any legacy daynight keys still in prudynt.json
-	# (and to reclaim an orphaned temp from a power cut); it is a no-op once the sidecar
-	# exists. Runs AFTER C1 (healed config) and BEFORE start_daemon.
+	# load AND every ConfigWatcher reload. We still run MIGRATE before launch: it ENSURES a
+	# valid sidecar -- seeding forced 'day' (the safe default) when the sidecar is missing or
+	# corrupt, and reclaiming an orphaned temp from a power cut; it is a no-op once a valid
+	# sidecar exists. (The legacy prudynt.json daynight keys are dead and are NOT consulted.)
+	# Runs AFTER C1 (healed config) and BEFORE start_daemon.
 	if [ -x /usr/sbin/daynight-state ]; then
 		/usr/sbin/daynight-state migrate >/dev/null 2>&1
 	fi

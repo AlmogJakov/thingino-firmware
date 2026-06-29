@@ -77,8 +77,8 @@ home_tilt() { hp=$("$JCT" "$MOTORS_CONFIG" get motors.pos_0 2>/dev/null | tr -d 
 dn_mode() {  # current day/night intent (the TARGET): auto | day | night
 	# Single source of truth: the /etc/daynight.state sidecar (auto|day|night),
 	# read through the shared helper so privacy, prudynt and S56ircut never disagree.
-	# (missing helper -> auto, the safe default used everywhere.)
-	if [ -x "$DNSTATE" ]; then "$DNSTATE" get; else printf 'auto'; fi
+	# (missing helper -> day, the forced safe default used everywhere for broken state.)
+	if [ -x "$DNSTATE" ]; then "$DNSTATE" get; else printf 'day'; fi
 }
 
 dn_live() {  # current LIVE visual mode (what the engine is actually showing): day | night

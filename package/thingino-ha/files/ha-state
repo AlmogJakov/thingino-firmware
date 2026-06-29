@@ -65,7 +65,7 @@ if ha_entity_enabled daynight; then
 	# Single source of truth: the /etc/daynight.state sidecar (auto|day|night),
 	# via the shared helper. The legacy prudynt.json daynight keys are dead.
 	target=$(/usr/sbin/daynight-state get 2>/dev/null)
-	[ "$target" = "auto" ] || [ "$target" = "day" ] || [ "$target" = "night" ] || target=auto
+	[ "$target" = "auto" ] || [ "$target" = "day" ] || [ "$target" = "night" ] || target=day
 	ha_pub_state daynight "$target" "$FORCE"
 fi
 

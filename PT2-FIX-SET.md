@@ -537,18 +537,21 @@ orphan reclaim) and a one-time `migrate`. prudynt reads the sidecar **directly**
 
 | role | who | how |
 |---|---|---|
-| read at boot + every reload (color/mono + worker gate) | prudynt `CFG::load()` (**patch 0015**) | a zero-allocation overlay POSIX-reads `/etc/daynight.state` and sets `daynight.force_mode_cfg` / `daynight.enabled` from it (static literals; missing/garbage → auto). The sidecar is the **final word** on every config load AND every ConfigWatcher reload - read **directly**, no `prudynt.json` round-trip |
+| read at boot + every reload (color/mono + worker gate) | prudynt `CFG::load()` (**patch 0015**) | a zero-allocation overlay POSIX-reads `/etc/daynight.state` and sets `daynight.force_mode_cfg` / `daynight.enabled` from it (static literals; `auto` preserved; missing/corrupt → forced `day`). The sidecar is the **final word** on every config load AND every ConfigWatcher reload - read **directly**, no `prudynt.json` round-trip |
 | read at boot (IR-cut/IR-LED optics) | `S56ircut` | `daynight-state get` (same sidecar prudynt reads → optics & ISP can't disagree) |
 | write (manual/MQTT runtime toggle) | agent adapter, `physical-privacy` freeze/restore | `daynight-state set` only (live apply via `prudyntctl json -`; **no** `prudynt.json` rewrite - this is the flash-wear win) |
 | read (HA state / API) | `ha-state`, adapter status + per-setting GET | `daynight-state get` / sidecar-derived helpers |
-| one-time upgrade migration | `S31prudynt start()` → `daynight-state migrate` | seeds the sidecar from the legacy `prudynt.json` keys **only if the sidecar is missing** (first boot after upgrade); afterwards those keys are **dead** (never read, never written) |
+| ensure a valid sidecar at boot | `S31prudynt start()` → `daynight-state migrate` | leaves a valid sidecar untouched; seeds forced **`day`** when it is **missing or corrupt** (self-heal); reclaims an orphaned temp. Does **not** read `prudynt.json` — the legacy daynight keys are **dead** |
 
 The `0015` overlay maps the sidecar to prudynt's members the same way `IMPSystem::init` consumes
 them (`force_mode` applied **regardless of** `enabled`): `auto` → `force_mode_cfg=""` +
 `enabled=true`; `day` → `force_mode_cfg="day"` + `enabled=false`; `night` → `force_mode_cfg="night"`
 + `enabled=false`. It allocates nothing (static string literals) and frees nothing, so it adds no
-memory leak and cannot use-after-free the lock-free readers; a missing/unreadable/garbage sidecar
-falls back to `auto` and never crashes.
+memory leak and cannot use-after-free the lock-free readers. A missing / unreadable / malformed
+sidecar falls back to **forced `day`** (`force_mode_cfg="day"` + `enabled=false`) and never crashes
+— the chosen safe default for broken persistence, applied identically by the overlay, the
+`daynight-state get` helper, and `migrate` (which self-heals a missing/corrupt sidecar to `day` at
+boot). A legitimate `mode=auto` is preserved as auto.
 
 **Net per runtime toggle:** one ~11 B atomic sidecar write - **no `prudynt.json` write at all**, at
 runtime or boot. The legacy `daynight.enabled`/`daynight.force_mode` keys are **dead** after the

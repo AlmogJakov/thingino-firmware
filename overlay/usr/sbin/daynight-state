@@ -5,6 +5,8 @@
 #   auto  -> daynight.enabled=true,  force_mode=""      (engine auto-switches)
 #   day   -> daynight.enabled=false, force_mode="day"   (forced day)
 #   night -> daynight.enabled=false, force_mode="night" (forced night)
+# A MISSING or CORRUPT/malformed sidecar falls back to FORCED DAY (the chosen safe
+# default for broken persistence) -- the same fallback prudynt's 0015 overlay uses.
 #
 # Replaces the per-change ~8.5KB rewrite of /etc/prudynt.json for the two
 # MQTT-frequent modes: this file is tiny and written atomically (same-dir temp +
@@ -16,18 +18,18 @@
 #
 # prudynt reads /etc/daynight.state DIRECTLY at config-load (patch 0015 overlays
 # CFG::load), so the sidecar IS the boot mode -- no prudynt.json sync needed, no
-# post-start correction. `migrate` seeds the sidecar FROM the legacy prudynt.json
-# daynight keys once, when the sidecar is missing (first boot after upgrade);
-# afterwards the sidecar is the sole source of truth and those keys are dead.
+# post-start correction. `migrate` ENSURES the sidecar holds a valid mode at boot:
+# if it is missing or corrupt it seeds FORCED DAY (a valid sidecar is left untouched).
+# The legacy prudynt.json daynight keys are dead -- they are NOT consulted.
 # `sync-to-config` is a LEGACY/UNWIRED helper from the old rootfs-sync design:
 # it is no longer on the boot path (S31prudynt runs only `migrate`), and CI fails
 # the build if S31 ever calls it again. It is kept solely as a manual escape hatch
 # / rollback aid -- re-wiring it in S31 reverts to the pre-0015 sync model.
 #
 # Usage: daynight-state get | set <auto|day|night> | migrate | sync-to-config
-#   get             prints auto|day|night (missing/garbage -> auto, safe default)
+#   get             prints auto|day|night (missing/corrupt -> day, forced safe default)
 #   set M           write-on-change atomic write; rc 0=wrote 1=unchanged 2=fail
-#   migrate         seed the sidecar from prudynt.json if it is missing (else no-op)
+#   migrate         ensure a valid sidecar; seed forced 'day' if missing/corrupt (else no-op)
 #   sync-to-config  LEGACY/UNWIRED (not on the boot path): write the sidecar mode
 #                   into prudynt.json's daynight keys, write-on-change; rc 0=wrote
 #                   1=already in sync 2=cannot sync
@@ -52,21 +54,28 @@ _write() { # mode
 	return 1
 }
 
-get() {
-	[ -f "$STATE" ] || { printf 'auto'; return 0; }
-	# Robust sidecar parse: first line containing mode=, skip a leading quote/space,
-	# take the [a-z] run. Tolerates quotes/whitespace/CRLF a hand-edited file might
-	# add. MUST stay byte-compatible with prudynt's own CFG::load reader (patch 0015),
-	# which parses the same file identically: strstr("mode="), skip quote/space,
-	# [a-z] run, else auto.
+# _parse: print the VALID persisted mode (auto|day|night), or NOTHING if the sidecar is
+# missing / unreadable / malformed. Robust: first line containing mode=, skip a leading
+# quote/space, take the [a-z] run; tolerates quotes/whitespace/CRLF a hand-edited file
+# might add. Mirrors prudynt's own CFG::load reader (patch 0015) for the canonical
+# `mode=<word>` line THIS helper writes -- both agree on auto|day|night and both fall back
+# to forced day on anything else (they may differ only on pathological hand-edits no writer
+# emits, which both treat as broken anyway).
+_parse() {
+	[ -f "$STATE" ] || return 0
 	_line=$(grep -m1 'mode=' "$STATE" 2>/dev/null)
 	_v=${_line#*mode=}
 	_v=$(printf '%s' "$_v" | sed 's/^["[:space:]]*//')
 	_m=$(printf '%s' "$_v" | grep -o '^[a-z]*' | head -1)
-	case "$_m" in
-		auto | day | night) printf '%s' "$_m" ;;
-		*) printf 'auto' ;;
-	esac
+	case "$_m" in auto | day | night) printf '%s' "$_m" ;; esac
+}
+
+get() {
+	# A valid persisted mode wins; a missing / corrupt / malformed sidecar falls back to
+	# FORCED DAY (the chosen safe default for broken persistence -- same as prudynt's 0015
+	# overlay and migrate). Legit mode=auto is preserved, NOT treated as broken.
+	_g=$(_parse)
+	[ -n "$_g" ] && printf '%s' "$_g" || printf 'day'
 }
 
 set_mode() { # auto|day|night
@@ -74,7 +83,11 @@ set_mode() { # auto|day|night
 		auto | day | night) ;;
 		*) echo "daynight-state: invalid mode '$1' (auto|day|night)" >&2; return 2 ;;
 	esac
-	[ "$(get)" = "$1" ] && return 1
+	# Write-on-change compares the REAL on-disk content (_parse), NOT get(): get() maps a
+	# missing/corrupt sidecar to the "day" fallback, so comparing get() would make
+	# `set day` on a missing/corrupt file look "unchanged" and skip the write. _parse is
+	# empty for missing/corrupt, so set always (re)writes and persists in those cases.
+	[ "$(_parse)" = "$1" ] && return 1
 	_write "$1" && return 0
 	return 2
 }
@@ -91,20 +104,15 @@ migrate() {
 		kill -0 "$_op" 2>/dev/null && continue
 		rm -f "$_orph" 2>/dev/null
 	done
-	[ -f "$STATE" ] && return 0
-	en=""; fm=""
-	if [ -f "$PRUDYNT_CONFIG" ] && [ -x "$JCT" ]; then
-		_t=""; command -v timeout >/dev/null 2>&1 && _t="timeout 5"
-		en=$($_t "$JCT" "$PRUDYNT_CONFIG" get daynight.enabled 2>/dev/null | tr -d '" ')
-		fm=$($_t "$JCT" "$PRUDYNT_CONFIG" get daynight.force_mode 2>/dev/null | tr -d '" ')
-	fi
-	if [ "$en" = "false" ] && { [ "$fm" = "day" ] || [ "$fm" = "night" ]; }; then
-		m="$fm"
-	else
-		m="auto"
-	fi
-	if _write "$m"; then
-		log "migrated /etc/daynight.state from prudynt.json: mode=$m"
+	# The sidecar is the single source of truth; the legacy prudynt.json daynight keys
+	# are dead (0015 reads the sidecar directly) and are NOT consulted. If the sidecar
+	# already holds a valid auto|day|night, leave it untouched (idempotent -- no write).
+	# Otherwise -- missing OR corrupt/malformed -- seed the safe fallback FORCED DAY so a
+	# wiped or garbage sidecar self-heals to a known mode (matching get() and prudynt's
+	# 0015 overlay).
+	[ -n "$(_parse)" ] && return 0
+	if _write day; then
+		log "daynight-state: sidecar missing/invalid -> seeded forced day"
 		return 0
 	fi
 	return 2
