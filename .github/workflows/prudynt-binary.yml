@@ -211,20 +211,31 @@ jobs:
           # check would false-match it).
           [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (0001-0003 base; 0004 live reconfig + IDR; 0005 fault-tolerance; 0006 high-freq seamlessness; 0007 physical-privacy software mic mute; 0008 audio RTP sample-clock (all codecs) + AAC force_stereo reframer fix; 0009 cold-boot RTSP SPS/PPS deadline; 0010 IMP-init fail-fast; 0011 zero-channel fail-fast; 0012 config apply-defaults-on-parse-fail; 0013 force_mode quote-tolerance; 0014 live audio codec-switch RTSP rebuild)" || exit 1
 
-      - name: Locate the built MIPS prudynt binary
+      - name: Collect prudynt + the libuclibcshim.so it links (and guard the shim sha)
         id: find
         run: |
-          # prefer the binary staged into the target rootfs
+          # prefer the binaries staged into the target rootfs
           BIN=$(find output -type f -path '*/target/usr/bin/prudynt' 2>/dev/null | head -1)
-          # fall back to the package build dir
           [ -z "$BIN" ] && BIN=$(find output -type f -path '*prudynt-t-*' -name prudynt 2>/dev/null | grep -v '/host/' | head -1)
-          echo "Found: $BIN"
-          file "$BIN"
-          echo "bin=$BIN" >> "$GITHUB_OUTPUT"
+          [ -n "$BIN" ] || { echo "::error::prudynt binary not found"; exit 1; }
+          SHIM=$(find output -type f -path '*/target/usr/lib/libuclibcshim.so' 2>/dev/null | head -1)
+          [ -z "$SHIM" ] && SHIM=$(find output -type f -name libuclibcshim.so 2>/dev/null | grep -v '/host/' | head -1)
+          echo "prudynt: $BIN"; file "$BIN"
+          echo "shim:    $SHIM"; [ -n "$SHIM" ] && { file "$SHIM"; sha256sum "$SHIM"; }
+          mkdir -p artifact
+          cp "$BIN" artifact/prudynt
+          [ -n "$SHIM" ] && cp "$SHIM" artifact/libuclibcshim.so
+          # The startup crash was a MISCOMPILED libuclibcshim.so (buildroot 2026.02.1 gcc
+          # + -flto). Refuse to ship the known-bad shim so a regressed toolchain build is
+          # caught here, not on the camera. (We dropped -flto; this verifies it took.)
+          if [ -n "$SHIM" ] && [ "$(sha256sum "$SHIM" | cut -d' ' -f1)" = "b3ead471b602e75b2557fcb71a52818583a6caddf5ad1296d84ecea35553eefa" ]; then
+            echo "::error::libuclibcshim.so is the KNOWN-BAD build (b3ead471) -- still miscompiled (crashes prudynt). The -flto removal did not take or another flag/toolchain issue remains."; exit 1
+          fi
+          ls -l artifact/
 
-      - name: Upload prudynt binary
+      - name: Upload prudynt + libuclibcshim.so
         uses: actions/upload-artifact@v4
         with:
           name: prudynt-${{ github.event.inputs.board }}
-          path: ${{ steps.find.outputs.bin }}
+          path: artifact/*
           if-no-files-found: error
