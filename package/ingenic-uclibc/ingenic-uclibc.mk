@@ -6,7 +6,14 @@ INGENIC_UCLIBC_INSTALL_STAGING = YES
 INGENIC_UCLIBC_LICENSE = MIT
 INGENIC_UCLIBC_LICENSE_FILES = LICENSE
 
-INGENIC_UCLIBC_CFLAGS = -Os -ffunction-sections -fdata-sections -flto \
+# NOTE: -flto removed. libuclibcshim.so is a hand-written glibc/musl->uClibc ABI
+# bridge (uclibc_shim.c) that pokes raw FILE-struct offsets and interposes libc
+# symbols. Building it with -flto on the buildroot 2026.02.1 gcc miscompiled it
+# (SIGSEGV inside the shim's __fputc_unlocked at startup -> every prudynt crashed;
+# good shim sha 07710f80 from the older toolchain, bad sha b3ead471 from new+LTO).
+# LTO buys ~nothing on a single 1-file .so but breaks this ABI-sensitive code, so
+# it is intentionally OFF here. Do NOT re-add -flto without verifying prudynt boots.
+INGENIC_UCLIBC_CFLAGS = -Os -ffunction-sections -fdata-sections \
 	-fno-asynchronous-unwind-tables -fmerge-all-constants -fno-ident
 
 define INGENIC_UCLIBC_BUILD_CMDS
