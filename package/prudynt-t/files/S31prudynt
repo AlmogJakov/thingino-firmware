@@ -266,14 +266,24 @@ start() {
 	#     silently fall back to false. Runs on EVERY start (cold boot AND
 	#     post-restart). Bounded by JCT_TIMEOUT; fail-safe = leave file as-is.
 	validate_and_restore_config
-	# Day/night persistence lives in the /etc/daynight.state sidecar (single source
-	# of truth). One-time migration: on first boot after an upgrade the sidecar may
-	# not exist yet -> derive it from the legacy prudynt.json keys. Runs AFTER C1
-	# (so it reads a healed config) and BEFORE start_daemon, so prudynt reads the
-	# sidecar at config-load and comes up directly in the persisted mode -- there is
-	# no late boot-script correction and no visible wrong-mode window. No-op (just a
-	# pid-aware temp reclaim) once the sidecar exists.
-	[ -x /usr/sbin/daynight-state ] && /usr/sbin/daynight-state migrate >/dev/null 2>&1
+	# Day/night persistence lives in the tiny atomic /etc/daynight.state sidecar
+	# (single source of truth; runtime toggles write IT, not prudynt.json). prudynt
+	# is UNMODIFIED and reads the legacy daynight keys from prudynt.json at config-
+	# load, so we PRE-START SYNC the sidecar into that proven path before launch:
+	#   1. migrate        -- seed the sidecar from prudynt.json on the first boot
+	#                        after an upgrade (no-op, just a pid-aware temp reclaim,
+	#                        once the sidecar exists);
+	#   2. sync-to-config -- write the sidecar mode back into prudynt.json's daynight
+	#                        keys, WRITE-ON-CHANGE (no rewrite when already in sync);
+	#                        auto clears force_mode, day/night set it -- mirroring
+	#                        prudynt's own boot logic so there is no wrong-mode boot.
+	# Both run AFTER C1 (healed config) and BEFORE start_daemon, so prudynt comes up
+	# directly in the persisted mode through its proven config path -- no late
+	# boot-script correction and no visible wrong-mode window.
+	if [ -x /usr/sbin/daynight-state ]; then
+		/usr/sbin/daynight-state migrate >/dev/null 2>&1
+		/usr/sbin/daynight-state sync-to-config >/dev/null 2>&1
+	fi
 	start_daemon
 	status=$?
 	if [ "$status" -eq 0 ]; then

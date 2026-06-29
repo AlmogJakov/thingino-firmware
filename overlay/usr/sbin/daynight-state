@@ -9,18 +9,25 @@
 # Replaces the per-change ~8.5KB rewrite of /etc/prudynt.json for the two
 # MQTT-frequent modes: this file is tiny and written atomically (same-dir temp +
 # rename + sync), so a power cut never leaves a partial/0-byte state and flash
-# wear collapses. prudynt reads /etc/daynight.state DIRECTLY at config load
-# (patch 0015); S56ircut, physical-privacy and the agent adapter read/write it
-# through THIS helper, so the on-disk format has exactly one authority.
+# wear collapses. Runtime toggles change the LIVE daemon via prudyntctl and
+# persist ONLY here (no prudynt.json write). S56ircut, physical-privacy and the
+# agent adapter read/write the sidecar through THIS helper, so the on-disk format
+# has exactly one authority.
 #
-# The legacy prudynt.json daynight keys are read ONLY by `migrate` (once, when
-# the sidecar is missing). Afterwards the sidecar is authoritative; the old keys
-# are dead and are never written or read again.
+# prudynt itself is UNMODIFIED: it reads the legacy daynight keys from
+# /etc/prudynt.json at config-load (the proven path). So `sync-to-config` writes
+# the sidecar mode INTO those keys (write-on-change) just before each prudynt
+# launch -- S31prudynt calls it before start_daemon -- and prudynt boots straight
+# into the persisted mode. No prudynt code change, no post-start correction.
+# `migrate` seeds the sidecar FROM those keys once, when the sidecar is missing
+# (first boot after upgrade); afterwards the sidecar is the source of truth.
 #
-# Usage: daynight-state get | set <auto|day|night> | migrate
-#   get      prints auto|day|night (missing/garbage file -> auto, the safe default)
-#   set M    write-on-change atomic write; rc 0=wrote 1=unchanged 2=invalid/failed
-#   migrate  if the sidecar is missing, create it from prudynt.json (else no-op)
+# Usage: daynight-state get | set <auto|day|night> | migrate | sync-to-config
+#   get             prints auto|day|night (missing/garbage -> auto, safe default)
+#   set M           write-on-change atomic write; rc 0=wrote 1=unchanged 2=fail
+#   migrate         seed the sidecar from prudynt.json if it is missing (else no-op)
+#   sync-to-config  write the sidecar mode into prudynt.json's daynight keys,
+#                   write-on-change; rc 0=wrote 1=already in sync 2=cannot sync
 
 STATE="/etc/daynight.state"
 PRUDYNT_CONFIG="/etc/prudynt.json"
@@ -44,9 +51,10 @@ _write() { # mode
 
 get() {
 	[ -f "$STATE" ] || { printf 'auto'; return 0; }
-	# Mirror prudynt CFG::load() 0015 parse EXACTLY so the helper and prudynt can
-	# never disagree: first line containing mode=, skip a leading quote/space, take
-	# the [a-z] run. Tolerates quotes/whitespace/CRLF a hand-edited file might add.
+	# Robust sidecar parse: first line containing mode=, skip a leading quote/space,
+	# take the [a-z] run. Tolerates quotes/whitespace/CRLF a hand-edited file might
+	# add. (sync-to-config feeds this mode into prudynt.json; prudynt never parses
+	# this file itself.)
 	_line=$(grep -m1 'mode=' "$STATE" 2>/dev/null)
 	_v=${_line#*mode=}
 	_v=$(printf '%s' "$_v" | sed 's/^["[:space:]]*//')
@@ -98,10 +106,68 @@ migrate() {
 	return 2
 }
 
+# Pre-start sync: make the legacy prudynt.json daynight keys match the sidecar,
+# writing ONLY the keys that differ. S31prudynt calls this before launching the
+# (proven, unmodified) prudynt so it boots straight into the persisted mode via
+# its existing config-load path -- no post-start correction, no wrong-mode window.
+#
+# Mapping mirrors the agent adapter AND prudynt's boot logic. IMPSystem::init
+# applies daynight.force_mode REGARDLESS of daynight.enabled (force_mode drives
+# color/mono at boot; an empty force_mode keeps the configured running_mode and
+# lets the worker decide), so AUTO MUST clear force_mode or prudynt would boot
+# into a stale forced mode:
+#   auto  -> force_mode="",      enabled=true
+#   day   -> force_mode="day",   enabled=false
+#   night -> force_mode="night", enabled=false
+#
+# rc 0=wrote >=1 key  1=already in sync (no write)  2=cannot sync / write failed
+sync_to_config() {
+	[ -f "$PRUDYNT_CONFIG" ] && [ -x "$JCT" ] || return 2
+	_t=""; command -v timeout >/dev/null 2>&1 && _t="timeout 5"
+	_m=$(get)
+	case "$_m" in
+		day)   _want_fm="day";   _want_en="false" ;;
+		night) _want_fm="night"; _want_en="false" ;;
+		*)     _want_fm="";      _want_en="true"  ;;
+	esac
+	# jct may print strings quoted or bare (version-dependent) and bools bare; strip
+	# quotes+spaces so the comparison is robust either way against the bare wanted
+	# values.
+	_cur_fm=$($_t "$JCT" "$PRUDYNT_CONFIG" get daynight.force_mode 2>/dev/null | tr -d '" ')
+	_cur_en=$($_t "$JCT" "$PRUDYNT_CONFIG" get daynight.enabled 2>/dev/null | tr -d '" ')
+	[ "$_cur_fm" = "$_want_fm" ] && [ "$_cur_en" = "$_want_en" ] && return 1
+
+	_wrote=0
+	# force_mode FIRST: it alone drives the boot running_mode, so even if a power
+	# cut lands between the two writes the next boot re-runs this and prudynt only
+	# ever launches after a completed sync; enabled gates the runtime auto-switch.
+	if [ "$_cur_fm" != "$_want_fm" ]; then
+		$_t "$JCT" "$PRUDYNT_CONFIG" set daynight.force_mode "$_want_fm" >/dev/null 2>&1 && _wrote=1
+	fi
+	if [ "$_cur_en" != "$_want_en" ]; then
+		$_t "$JCT" "$PRUDYNT_CONFIG" set daynight.enabled "$_want_en" >/dev/null 2>&1 && _wrote=1
+	fi
+
+	if [ "$_wrote" != 1 ]; then
+		log "pre-start sync: prudynt.json daynight write FAILED (overlay full?) mode=$_m"
+		return 2
+	fi
+	sync
+	# Confirm the one tricky op -- clearing force_mode to "" for auto -- actually
+	# took, so a silent jct empty-value quirk can't leave prudynt booting forced.
+	if [ "$_m" = auto ] && [ "$_cur_fm" != "" ]; then
+		_rb=$($_t "$JCT" "$PRUDYNT_CONFIG" get daynight.force_mode 2>/dev/null | tr -d '" ')
+		[ -n "$_rb" ] && log "pre-start sync WARNING: force_mode not cleared (got '$_rb'); prudynt may boot forced"
+	fi
+	log "pre-start sync: prudynt.json daynight <- sidecar (mode=$_m)"
+	return 0
+}
+
 case "$1" in
-	get)     get ;;
-	set)     set_mode "$2"; exit $? ;;
-	migrate) migrate; exit $? ;;
-	*)       echo "Usage: $0 {get|set <auto|day|night>|migrate}" >&2; exit 1 ;;
+	get)            get ;;
+	set)            set_mode "$2"; exit $? ;;
+	migrate)        migrate; exit $? ;;
+	sync-to-config) sync_to_config; exit $? ;;
+	*)              echo "Usage: $0 {get|set <auto|day|night>|migrate|sync-to-config}" >&2; exit 1 ;;
 esac
 exit 0
