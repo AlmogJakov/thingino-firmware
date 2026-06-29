@@ -202,6 +202,14 @@ jobs:
           #     handle_audio. (mic_sample_rate is a separate, deferred follow-up.)
           grep -qF "add_strk_a_rtsp" "$SRC/src/JsonAPI.cpp" \
             || { echo "::error::JsonAPI.cpp: live audio codec-switch RTSP rebuild (0014) not applied"; ok=0; }
+          # 30) GUARD (anti-0015): the reverted in-binary daynight.state read MUST be
+          #     ABSENT from the source. It crashed prudynt at startup (uClibc-shim ABI
+          #     fault); day/night persistence is rootfs-only now. A hit here = a STALE /
+          #     wrong checkout still carrying 0015 -> fail the build, never ship it.
+          for fchk in Config.cpp main.cpp; do
+            grep -qF "/etc/daynight.state" "$SRC/src/$fchk" \
+              && { echo "::error::$fchk contains /etc/daynight.state -- reverted-0015 leaked into the source (stale checkout); refusing"; ok=0; }
+          done
           # NOTE: day/night persistence is handled entirely in the rootfs (the
           # /etc/daynight.state sidecar + S31prudynt's pre-start sync-to-config into
           # prudynt.json). prudynt itself is intentionally UNMODIFIED for it -- an
@@ -219,6 +227,20 @@ jobs:
           echo "Found: $BIN"
           file "$BIN"
           echo "bin=$BIN" >> "$GITHUB_OUTPUT"
+
+      - name: Guard - built prudynt must NOT contain the reverted 0015 (daynight.state)
+        # The in-binary 0015 sidecar read crashed prudynt at startup on this uClibc shim
+        # and was reverted; day/night persistence is rootfs-only. If the built binary
+        # still carries the "daynight.state" string, the branch/source was STALE (an old
+        # 0015 commit) -- fail loudly so a crashing binary is never uploaded/flashed.
+        run: |
+          BIN="${{ steps.find.outputs.bin }}"
+          [ -n "$BIN" ] && [ -f "$BIN" ] || { echo "::error::no prudynt binary located"; exit 1; }
+          if grep -aq "daynight.state" "$BIN"; then
+            echo "::error::built prudynt contains 'daynight.state' -> reverted-0015 binary (CRASHES at startup). Source/branch is stale; refusing to upload."
+            exit 1
+          fi
+          echo "PASS: prudynt binary has NO daynight.state (proven 0001-0014; no in-binary sidecar read)"
 
       - name: Upload prudynt binary
         uses: actions/upload-artifact@v4

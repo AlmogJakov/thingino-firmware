@@ -155,6 +155,21 @@ jobs:
           # --- core deliverable present ---
           { [ -f "$ROOT/usr/bin/prudynt" ] && file "$ROOT/usr/bin/prudynt" 2>/dev/null | grep -qE 'ELF'; } && ok "prudynt binary present (ELF)" || err "prudynt binary missing or not ELF"
 
+          # --- anti-0015: the proven prudynt must NOT read the sidecar itself (the in-binary
+          #     read crashed prudynt on this uClibc shim and was reverted). day/night
+          #     persistence is rootfs-only via S31prudynt's pre-start sync. A 'daynight.state'
+          #     string in the binary == a STALE 0015 build (a crashing image); refuse it. ---
+          if grep -aq 'daynight.state' "$ROOT/usr/bin/prudynt" 2>/dev/null; then
+            err "prudynt binary contains 'daynight.state' -> reverted-0015 build (CRASHES at startup); source/branch is stale"
+          else
+            ok "prudynt binary has NO daynight.state (proven 0001-0014, no in-binary sidecar read)"
+          fi
+          # --- the rootfs pre-start sync pieces must actually be present ---
+          grep -q 'sync-to-config' "$ROOT/usr/sbin/daynight-state" 2>/dev/null \
+            && ok "daynight-state has sync-to-config verb" || err "daynight-state missing sync-to-config verb"
+          grep -q 'daynight-state sync-to-config' "$ROOT/etc/init.d/S31prudynt" 2>/dev/null \
+            && ok "S31prudynt runs pre-start sync-to-config before start_daemon" || err "S31prudynt missing pre-start sync-to-config"
+
           # --- strongest anti-loop net: NO /rom/usr/bin/motors anywhere in the rootfs ---
           HITS=$(grep -rIl '/rom/usr/bin/motors' "$ROOT" 2>/dev/null || true)
           [ -z "$HITS" ] && ok "no /rom/usr/bin/motors anywhere in rootfs" || err "/rom/usr/bin/motors referenced in: $(echo "$HITS" | sed "s#$ROOT/##g" | tr '\n' ' ')"
