@@ -14,20 +14,23 @@
 # agent adapter read/write the sidecar through THIS helper, so the on-disk format
 # has exactly one authority.
 #
-# prudynt itself is UNMODIFIED: it reads the legacy daynight keys from
-# /etc/prudynt.json at config-load (the proven path). So `sync-to-config` writes
-# the sidecar mode INTO those keys (write-on-change) just before each prudynt
-# launch -- S31prudynt calls it before start_daemon -- and prudynt boots straight
-# into the persisted mode. No prudynt code change, no post-start correction.
-# `migrate` seeds the sidecar FROM those keys once, when the sidecar is missing
-# (first boot after upgrade); afterwards the sidecar is the source of truth.
+# prudynt reads /etc/daynight.state DIRECTLY at config-load (patch 0015 overlays
+# CFG::load), so the sidecar IS the boot mode -- no prudynt.json sync needed, no
+# post-start correction. `migrate` seeds the sidecar FROM the legacy prudynt.json
+# daynight keys once, when the sidecar is missing (first boot after upgrade);
+# afterwards the sidecar is the sole source of truth and those keys are dead.
+# `sync-to-config` is a LEGACY/UNWIRED helper from the old rootfs-sync design:
+# it is no longer on the boot path (S31prudynt runs only `migrate`), and CI fails
+# the build if S31 ever calls it again. It is kept solely as a manual escape hatch
+# / rollback aid -- re-wiring it in S31 reverts to the pre-0015 sync model.
 #
 # Usage: daynight-state get | set <auto|day|night> | migrate | sync-to-config
 #   get             prints auto|day|night (missing/garbage -> auto, safe default)
 #   set M           write-on-change atomic write; rc 0=wrote 1=unchanged 2=fail
 #   migrate         seed the sidecar from prudynt.json if it is missing (else no-op)
-#   sync-to-config  write the sidecar mode into prudynt.json's daynight keys,
-#                   write-on-change; rc 0=wrote 1=already in sync 2=cannot sync
+#   sync-to-config  LEGACY/UNWIRED (not on the boot path): write the sidecar mode
+#                   into prudynt.json's daynight keys, write-on-change; rc 0=wrote
+#                   1=already in sync 2=cannot sync
 
 STATE="/etc/daynight.state"
 PRUDYNT_CONFIG="/etc/prudynt.json"
@@ -53,8 +56,9 @@ get() {
 	[ -f "$STATE" ] || { printf 'auto'; return 0; }
 	# Robust sidecar parse: first line containing mode=, skip a leading quote/space,
 	# take the [a-z] run. Tolerates quotes/whitespace/CRLF a hand-edited file might
-	# add. (sync-to-config feeds this mode into prudynt.json; prudynt never parses
-	# this file itself.)
+	# add. MUST stay byte-compatible with prudynt's own CFG::load reader (patch 0015),
+	# which parses the same file identically: strstr("mode="), skip quote/space,
+	# [a-z] run, else auto.
 	_line=$(grep -m1 'mode=' "$STATE" 2>/dev/null)
 	_v=${_line#*mode=}
 	_v=$(printf '%s' "$_v" | sed 's/^["[:space:]]*//')

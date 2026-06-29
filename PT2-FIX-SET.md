@@ -41,28 +41,31 @@ is **not** installed into the firmware image.
   were edited live, filling the tiny jffs2 config overlay.
 
 ### What was fixed
-- **prudynt binary:** 14 source patches `0001`-`0014` (auto-applied by buildroot's global
-  patch dir; the source is git-fetched at `f4b3228` and never hand-edited). prudynt is
-  **unmodified for day/night persistence** - it reads the legacy `daynight.force_mode` /
-  `daynight.enabled` keys from `/etc/prudynt.json` at boot exactly as patch `0001` always did.
-  (An earlier `0015` that made `CFG::load()` read the `/etc/daynight.state` sidecar itself was
-  **reverted**: merely adding the code tripped a uClibc-shim ABI fault in a basic libc `open()`
-  during instance-lock acquire, *before* its own code ran, crash-looping prudynt at startup. The
-  rootfs `sync-to-config` step feeds the sidecar mode into `prudynt.json` before launch instead.)
+- **prudynt binary:** 15 source patches `0001`-`0015` (auto-applied by buildroot's global
+  patch dir; the source is git-fetched at `f4b3228` and never hand-edited). For day/night
+  persistence, patch `0015` makes `CFG::load()` read the `/etc/daynight.state` sidecar
+  **directly** (a zero-allocation static-literal overlay) and set `daynight.enabled` /
+  `force_mode_cfg` from it, so the sidecar is the single source of truth on every config load
+  AND every ConfigWatcher reload. (An earlier attempt at `0015` was wrongly blamed for a
+  startup crash and reverted in favor of a rootfs `sync-to-config` workaround; the real cause
+  was a **miscompiled `libuclibcshim.so`** - fixed by pinning the proven-good shim - so `0015`
+  was safe to re-introduce. See §7.)
 - **jct (config tool):** stock jct - **the atomic-write fork was dropped**
   (`package/all-patches/thingino-jct/` no longer exists). `prudynt.json` writes use stock jct.
   The day/night sidecar's atomicity comes from the `/usr/sbin/daynight-state` helper's **own**
-  `_write` (same-dir temp + `mv` + `sync`), not from any jct fork. A power cut during a (rare,
-  boot-time) `prudynt.json` jct write is healed by `S31prudynt`'s C1 `validate_and_restore_config`
-  (restores the ROM copy), after which `sync-to-config` re-applies the sidecar mode.
+  `_write` (same-dir temp + `mv` + `sync`), not from any jct fork. A power cut during a (rare)
+  `prudynt.json` jct write is healed by `S31prudynt`'s C1 `validate_and_restore_config`
+  (restores the ROM copy); the day/night mode is unaffected - it lives in the sidecar, which
+  prudynt reads directly.
 - **Minimal-write day/night persistence:** the two MQTT-frequent modes (auto/day/night and
   physical-privacy's day/night freeze) no longer rewrite the whole ~8.5 KB `prudynt.json` on a
   runtime toggle. They persist in a tiny, atomically-written sidecar `/etc/daynight.state`
-  (`mode=auto|day|night`) - the single source of truth read by `S56ircut`, `physical-privacy`,
-  the agent adapter and HA state, all via the shared `/usr/sbin/daynight-state` helper. At boot,
-  `S31prudynt`'s `sync-to-config` writes the sidecar mode into `prudynt.json`'s daynight keys
-  (write-on-change) so prudynt boots straight into the persisted mode through its proven
-  config-load path - prudynt itself does **not** read the sidecar. See §7.
+  (`mode=auto|day|night`) - the single source of truth read by **prudynt itself** (patch `0015`)
+  and, on the shell side, by `S56ircut`, `physical-privacy`, the agent adapter and HA state via
+  the shared `/usr/sbin/daynight-state` helper. At boot, `S31prudynt` runs only
+  `daynight-state migrate` (seed the sidecar from the legacy `prudynt.json` keys on the first
+  boot after an upgrade); there is **no** sidecar->`prudynt.json` sync, so the per-boot 8.5 KB
+  rewrite is gone and prudynt boots straight into the persisted mode by reading the sidecar. See §7.
 - **Rootfs:** ~20 script/asset changes (reboot hardening, day/night persistence + optics +
   colour, physical privacy, timezone, HA/WebUI integration) baked into the **read-only
   squashfs**, plus the `daynight-state` helper, the write-on-change guard in the agent
@@ -131,7 +134,7 @@ is **not** installed into the firmware image.
 | `overlay/usr/sbin/physical-privacy` | **Added** | - (overlay) | `/usr/sbin/physical-privacy` | ✅ squashfs |
 | `overlay/usr/sbin/tz-update` | **Added** | - (overlay) | `/usr/sbin/tz-update` | ✅ squashfs |
 | `overlay/usr/sbin/daynight-state` | **Added** | - (overlay) | `/usr/sbin/daynight-state` | ✅ squashfs |
-| `package/all-patches/prudynt-t/0001…0014-*.patch` | Added (in branch) | prudynt-t (build patches) | compiled into `/usr/bin/prudynt` | ✅ binary |
+| `package/all-patches/prudynt-t/0001…0015-*.patch` | Added (in branch) | prudynt-t (build patches) | compiled into `/usr/bin/prudynt` | ✅ binary |
 | `tests/test-daynight-state.sh` | **Added** | - | not installed | ❌ repo test only |
 | `PT2-FIX-SET.md` (this file) | **Added** | - | not installed | ❌ repo doc only |
 | `.github/workflows/prudynt-binary.yml` | **Added** | - | not installed (CI) | ❌ builds prudynt binary only |
@@ -414,11 +417,12 @@ the ~14 KB ELF (`7f454c46`).
   temp to `/tmp/prudynt_config_temp_<pid>.json` (tmpfs) then `rename()`s onto `/etc` (jffs2); the
   cross-filesystem rename returns `EXDEV` and falls back to `fopen("…","w")` (**truncate**) + byte
   copy - a power-loss window that could leave the file 0-byte/partial. This pre-existing window is
-  retained for `prudynt.json` writes, which after baking + write-on-change are rare and boot-time
-  only. The **day/night sidecar** (`/etc/daynight.state`) is the atomic path - its `daynight-state`
-  helper does the same-dir temp + `mv` + `sync` itself (pid-aware orphan reclaim), independent of
-  jct. A day/night boot corrupted in jct's window is **C1-healed** (ROM restore) and then
-  re-synced from the sidecar by `sync-to-config` (see below).
+  retained for `prudynt.json` writes, which after baking are rare (occasional non-daynight settings
+  changes; the day/night keys are dead under `0015`). The **day/night sidecar**
+  (`/etc/daynight.state`) is the atomic path - its `daynight-state` helper does the same-dir temp +
+  `mv` + `sync` itself (pid-aware orphan reclaim), independent of jct. A `prudynt.json` corrupted in
+  jct's window is **C1-healed** (ROM restore); the day/night mode is unaffected - it lives in the
+  atomic sidecar, which prudynt reads directly.
 - **JFFS2 churn.** jffs2 is log-structured: each ~8.5 KB rewrite appends ~8.5 KB of new nodes
   and marks the old ones obsolete; GC reclaims them **lazily** (on pressure / reboot). So a
   burst of redundant writes can quickly pressure the small (~224 KB) overlay before GC runs -
@@ -529,29 +533,30 @@ power-safe - not the full ~8.5 KB non-atomic `prudynt.json` rewrite the other (r
 **Design (single source of truth).** `/etc/daynight.state` holds one line
 `mode=auto|day|night`. The shared helper `/usr/sbin/daynight-state` owns the format, the
 **atomic write-on-change** writer (same-dir temp + `mv` + `sync`, fail-closed, pid-aware
-orphan reclaim), a one-time `migrate`, and a boot-time `sync-to-config`:
+orphan reclaim) and a one-time `migrate`. prudynt reads the sidecar **directly** (patch `0015`):
 
 | role | who | how |
 |---|---|---|
-| read at boot (color/mono + worker gate) | prudynt `CFG::load()` (**patch 0001**, unmodified) | reads the legacy `daynight.force_mode` / `daynight.enabled` keys from `/etc/prudynt.json`; prudynt does **not** read the sidecar |
-| feed the mode into `prudynt.json` before launch | `S31prudynt start()` → `daynight-state sync-to-config` | writes `daynight.force_mode` / `daynight.enabled` from the sidecar (**write-on-change**) just before `start_daemon`, so prudynt loads the persisted mode through its proven config-load path - no post-start correction, no wrong-mode window |
-| read at boot (IR-cut/IR-LED optics) | `S56ircut` | `daynight-state get` (same source as the mode fed to prudynt → optics & ISP can't disagree) |
+| read at boot + every reload (color/mono + worker gate) | prudynt `CFG::load()` (**patch 0015**) | a zero-allocation overlay POSIX-reads `/etc/daynight.state` and sets `daynight.force_mode_cfg` / `daynight.enabled` from it (static literals; missing/garbage → auto). The sidecar is the **final word** on every config load AND every ConfigWatcher reload - read **directly**, no `prudynt.json` round-trip |
+| read at boot (IR-cut/IR-LED optics) | `S56ircut` | `daynight-state get` (same sidecar prudynt reads → optics & ISP can't disagree) |
 | write (manual/MQTT runtime toggle) | agent adapter, `physical-privacy` freeze/restore | `daynight-state set` only (live apply via `prudyntctl json -`; **no** `prudynt.json` rewrite - this is the flash-wear win) |
 | read (HA state / API) | `ha-state`, adapter status + per-setting GET | `daynight-state get` / sidecar-derived helpers |
-| one-time upgrade migration | `S31prudynt start()` → `daynight-state migrate` | seeds the sidecar from the legacy `prudynt.json` keys **only if the sidecar is missing** (first boot after upgrade); the keys are **not** dead - `sync-to-config` writes them every boot |
+| one-time upgrade migration | `S31prudynt start()` → `daynight-state migrate` | seeds the sidecar from the legacy `prudynt.json` keys **only if the sidecar is missing** (first boot after upgrade); afterwards those keys are **dead** (never read, never written) |
 
-`sync-to-config` mirrors prudynt's `IMPSystem::init` (which applies `force_mode` **regardless of**
-`enabled`): `auto` → `force_mode=""` + `enabled=true`; `day` → `force_mode="day"` + `enabled=false`;
-`night` → `force_mode="night"` + `enabled=false`.
+The `0015` overlay maps the sidecar to prudynt's members the same way `IMPSystem::init` consumes
+them (`force_mode` applied **regardless of** `enabled`): `auto` → `force_mode_cfg=""` +
+`enabled=true`; `day` → `force_mode_cfg="day"` + `enabled=false`; `night` → `force_mode_cfg="night"`
++ `enabled=false`. It allocates nothing (static string literals) and frees nothing, so it adds no
+memory leak and cannot use-after-free the lock-free readers; a missing/unreadable/garbage sidecar
+falls back to `auto` and never crashes.
 
-**Net per runtime toggle:** one ~11 B atomic sidecar write (no `prudynt.json` rewrite at all).
-At boot, `sync-to-config` does a single write-on-change `prudynt.json` update only when the
-persisted mode differs from what `prudynt.json` already holds. The legacy
-`daynight.enabled`/`daynight.force_mode` keys are **live** - `sync-to-config` writes them before
-every launch and prudynt reads them at boot. Tests: `tests/test-daynight-state.sh` (helper
-get/set write-on-change/validation/atomicity, upgrade migration, corrupt→auto, pid-aware reclaim,
-`sync-to-config` mapping). Reviewed by an adversarial QA pass; the confirmed read-side/leak
-findings were fixed.
+**Net per runtime toggle:** one ~11 B atomic sidecar write - **no `prudynt.json` write at all**, at
+runtime or boot. The legacy `daynight.enabled`/`daynight.force_mode` keys are **dead** after the
+one-time `migrate`; the helper's `sync-to-config` verb still exists but is a **legacy/unwired**
+rollback aid, off the boot path (CI fails the build if `S31prudynt` calls it). Tests:
+`tests/test-daynight-state.sh` (helper get/set write-on-change/validation/atomicity, upgrade
+migration, corrupt→auto, pid-aware reclaim, and the legacy `sync-to-config` mapping). Reviewed by
+an adversarial QA pass; the confirmed findings were fixed.
 
 **Scope (by design):** only the day/night mode and physical-privacy are persisted. `color`,
 `ircut` and the 850 nm LED stay **derived runtime effects** of the day/night mode (unchanged
@@ -561,16 +566,17 @@ persisted - see §1.
 ---
 
 ## Build & validate (reminder)
-- prudynt C++ ships **only** via patches `0001`-`0014` in `package/all-patches/prudynt-t/`
+- prudynt C++ ships **only** via patches `0001`-`0015` in `package/all-patches/prudynt-t/`
   (auto-applied; source git-fetched at `f4b3228` - never hand-edit source). There is **no**
   `package/all-patches/thingino-jct/` (the jct atomic-write fork was dropped; `prudynt.json` uses
   stock jct).
-- After build, confirm `package/all-patches/prudynt-t/` holds **exactly** `0001`-`0014`. In the
+- After build, confirm `package/all-patches/prudynt-t/` holds **exactly** `0001`-`0015`. In the
   staged image, verify the motors split (§4); that `0007`/`0013`/`0014` are in the binary (grep
-  `add_strk_a_rtsp` for `0014`); that the prudynt source/binary has **no** `/etc/daynight.state`
-  string (prudynt must not read the sidecar - the reverted `0015` did, and crashed); and that
-  `/usr/sbin/daynight-state` is present + executable with a `sync-to-config` verb, and that
-  `S31prudynt` calls `migrate` + `sync-to-config` before `start_daemon`.
+  `add_strk_a_rtsp` for `0014`); that the prudynt source/binary **does** reference the literal
+  `/etc/daynight.state` (patch `0015`'s direct-read overlay - distinct from the
+  `prudynt_daynight_state` Prometheus metric); that `/usr/sbin/daynight-state` is present +
+  executable; and that `S31prudynt` calls `migrate` and does **not** call `sync-to-config` before
+  `start_daemon`. (The `pt2-build-artifact` / `prudynt-binary` workflows enforce all of this.)
 - Offline: run `sh tests/test-daynight-state.sh`.
 - On device after flash: forced-night boot (optics == colour mode), Day↔Night↔Auto via MQTT
   with **no** `prudynt.json` size change, physical-privacy enter/exit keeps the mode, a

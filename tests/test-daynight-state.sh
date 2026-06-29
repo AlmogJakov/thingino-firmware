@@ -2,15 +2,16 @@
 # test-daynight-state.sh - offline unit tests for the day/night minimal-write set.
 #
 # Exercises the REAL /usr/sbin/daynight-state helper (paths redirected to a
-# sandbox). prudynt does NOT read the sidecar (the earlier patch 0015 that made
-# CFG::load() read /etc/daynight.state crashed prudynt at startup and was
-# reverted); prudynt reads the legacy daynight keys from prudynt.json, which
-# S31prudynt's `sync-to-config` writes from the sidecar before every launch.
-# These tests cover the HELPER itself:
+# sandbox). prudynt reads the sidecar DIRECTLY at config-load (patch 0015 overlays
+# CFG::load to open/read /etc/daynight.state); S31prudynt runs only `migrate` and
+# NO LONGER syncs the sidecar into prudynt.json. (The 0015 startup crash that once
+# forced the rootfs-sync workaround was a miscompiled libuclibcshim.so, since fixed
+# by pinning the proven-good shim -- not 0015 itself.) These tests cover the HELPER:
 #   1) missing-sidecar upgrade migration (seed from prudynt.json once)
 #   2) corrupt/invalid sidecar => auto
 #   3) set: write-on-change / validation / atomicity
-#   4) sync-to-config mapping (auto/day/night -> prudynt.json keys, write-on-change)
+#   4) sync-to-config mapping -- LEGACY/UNWIRED verb (off the boot path under 0015),
+#      kept as a rollback aid; tested here so the escape hatch still works
 #   5) pid-aware orphan reclaim
 # Run:  sh tests/test-daynight-state.sh    (POSIX sh + coreutils only)
 set -u
@@ -119,7 +120,10 @@ eq "set day (unchanged) rc==1" "$rc_same"  "1"
 eq "file is exactly 'mode=day'" "$(cat "$STATE")" "mode=day"
 eq "no leftover .tmp after set" "$(find "$SB" -name 'daynight.state.tmp.*' 2>/dev/null | wc -l | tr -d ' ')" "0"
 
-echo "== sync-to-config mapping (sidecar mode -> prudynt.json keys) =="
+echo "== sync-to-config mapping (sidecar mode -> prudynt.json keys) [LEGACY verb] =="
+# NOTE: sync-to-config is OFF the boot path under patch 0015 (prudynt reads the
+# sidecar directly; S31 runs only `migrate`). This scenario stays only to prove the
+# rollback/escape-hatch verb still maps correctly if ever re-wired.
 # sync-to-config mirrors prudynt's IMPSystem::init (force_mode applied REGARDLESS
 # of enabled): auto -> force_mode=""+enabled=true; day -> force_mode=day+enabled=false;
 # night -> force_mode=night+enabled=false. It is write-on-change: no `jct set` when

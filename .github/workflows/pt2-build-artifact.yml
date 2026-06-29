@@ -81,7 +81,7 @@ jobs:
           for d in $(find output -type d -name 'prudynt-t-*' 2>/dev/null | grep -v '/host/'); do
             [ -f "$d/.applied_patches_list" ] && { SRC="$d"; break; }
           done
-          [ -n "$SRC" ] || SRC=$(find output -type d -name 'prudynt-t-*' 2>/dev/null | grep -v '/host/' | head -1)
+          [ -n "$SRC" ] || SRC=$(find output -type d -name 'prudynt-t-*' 2>/dev/null | grep -v '/host/' | head -1 || true)
           [ -n "$SRC" ] || { echo "::error::prudynt-t source dir not found under output/"; exit 1; }
           echo "prudynt source: $SRC"
           LIST="$SRC/.applied_patches_list"
@@ -102,7 +102,9 @@ jobs:
           grep -qF "/etc/daynight.state" "$SRC/src/Config.cpp" \
             && echo "PASS: 0015 direct-read sidecar overlay present in source" \
             || { echo "::error::Config.cpp: 0015 direct-read overlay (/etc/daynight.state) not applied"; exit 1; }
-          DBG=$(grep -rnoE 'DIAG:|startup-trace|HANDLER entered|\bacq1\b|\bacq2\b' "$SRC/src" 2>/dev/null | head -20)
+          # NB: `|| true` is REQUIRED — grep exits 1 when it finds nothing (the good case),
+          # and under bash -eo pipefail a failing command substitution would kill the step.
+          DBG=$(grep -rnoE 'DIAG:|startup-trace|HANDLER entered|\bacq1\b|\bacq2\b' "$SRC/src" 2>/dev/null | head -20 || true)
           [ -z "$DBG" ] && echo "PASS: no debug scaffolding markers in prudynt source" \
             || { echo "::error::debug scaffolding markers in prudynt source:"; echo "$DBG"; exit 1; }
 
@@ -110,7 +112,7 @@ jobs:
         # Images land under output/<branch>/<camera>-<kernel>-<libc>/images/, not
         # output/images/. Locate the dir holding the packed firmware and flatten it.
         run: |
-          BIN=$(find output -type f -name 'thingino-*.bin' 2>/dev/null | head -1)
+          BIN=$(find output -type f -name 'thingino-*.bin' 2>/dev/null | head -1 || true)
           [ -n "$BIN" ] || { echo "::error::build produced no thingino-*.bin under output/"; exit 1; }
           IMG_DIR=$(dirname "$BIN")
           echo "images dir: $IMG_DIR"
@@ -125,7 +127,7 @@ jobs:
         run: |
           apt-get update -qq
           apt-get install -y --no-install-recommends squashfs-tools
-          SQ=$(find artifacts output -name 'rootfs.squashfs' 2>/dev/null | head -1)
+          SQ=$(find artifacts output -name 'rootfs.squashfs' 2>/dev/null | head -1 || true)
           [ -n "$SQ" ] || { echo "::error::rootfs.squashfs not found"; exit 1; }
           echo "squashfs: $SQ"
           rm -rf rootfs_check
@@ -175,7 +177,7 @@ jobs:
           # bypassed / the toolchain rebuilt it -> refuse (a rebuilt shim is unverified
           # and was what crashed every prudynt). Re-pin only after verifying prudynt boots.
           GOOD_SHIM="07710f80ebc4683c9a9c658142a3cdce018db2949b844647e1709446e21c369b"
-          SHIM=$(find "$ROOT" -name 'libuclibcshim.so' 2>/dev/null | head -1)
+          SHIM=$(find "$ROOT" -name 'libuclibcshim.so' 2>/dev/null | head -1 || true)
           if [ -z "$SHIM" ]; then
             err "libuclibcshim.so not found in rootfs"
           else

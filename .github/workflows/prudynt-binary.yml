@@ -71,7 +71,7 @@ jobs:
 
       - name: Confirm the FINAL patch actually applied
         run: |
-          SRC=$(find output -type d -name 'prudynt-t-*' 2>/dev/null | grep -v '/host/' | head -1)
+          SRC=$(find output -type d -name 'prudynt-t-*' 2>/dev/null | grep -v '/host/' | head -1 || true)
           echo "prudynt source dir: $SRC"
           [ -n "$SRC" ] || { echo "::error::prudynt source dir not found"; exit 1; }
           ok=1
@@ -214,7 +214,9 @@ jobs:
             || { echo "::error::Config.cpp: 0015 direct-read marker comment missing — STALE/partial 0015"; ok=0; }
           # 30b) NO debug scaffolding may ship: a prior diagnostic build leaked startup
           #      trace markers; refuse any that crept back into the prudynt source.
-          DBG=$(grep -rnoE 'DIAG:|startup-trace|HANDLER entered|\bacq1\b|\bacq2\b' "$SRC/src" 2>/dev/null | head -20)
+          # NB: `|| true` is REQUIRED — grep exits 1 when it finds nothing (the good case),
+          # and under bash -eo pipefail a failing command substitution would kill the step.
+          DBG=$(grep -rnoE 'DIAG:|startup-trace|HANDLER entered|\bacq1\b|\bacq2\b' "$SRC/src" 2>/dev/null | head -20 || true)
           if [ -n "$DBG" ]; then
             echo "::error::debug scaffolding markers found in prudynt source:"; echo "$DBG"; ok=0
           fi
@@ -230,11 +232,11 @@ jobs:
         id: find
         run: |
           # prefer the binaries staged into the target rootfs
-          BIN=$(find output -type f -path '*/target/usr/bin/prudynt' 2>/dev/null | head -1)
-          [ -z "$BIN" ] && BIN=$(find output -type f -path '*prudynt-t-*' -name prudynt 2>/dev/null | grep -v '/host/' | head -1)
+          BIN=$(find output -type f -path '*/target/usr/bin/prudynt' 2>/dev/null | head -1 || true)
+          [ -z "$BIN" ] && BIN=$(find output -type f -path '*prudynt-t-*' -name prudynt 2>/dev/null | grep -v '/host/' | head -1 || true)
           [ -n "$BIN" ] || { echo "::error::prudynt binary not found"; exit 1; }
-          SHIM=$(find output -type f -path '*/target/usr/lib/libuclibcshim.so' 2>/dev/null | head -1)
-          [ -z "$SHIM" ] && SHIM=$(find output -type f -name libuclibcshim.so 2>/dev/null | grep -v '/host/' | head -1)
+          SHIM=$(find output -type f -path '*/target/usr/lib/libuclibcshim.so' 2>/dev/null | head -1 || true)
+          [ -z "$SHIM" ] && SHIM=$(find output -type f -name libuclibcshim.so 2>/dev/null | grep -v '/host/' | head -1 || true)
           echo "prudynt: $BIN"; file "$BIN"
           echo "shim:    $SHIM"; [ -n "$SHIM" ] && { file "$SHIM"; sha256sum "$SHIM"; }
           mkdir -p artifact
@@ -244,7 +246,11 @@ jobs:
           # PINNED proven-good prebuilt (07710f80); REQUIRE exactly that, so a rebuilt /
           # regressed shim is caught here, not on the camera.
           GOOD_SHIM="07710f80ebc4683c9a9c658142a3cdce018db2949b844647e1709446e21c369b"
-          shimsha=$([ -n "$SHIM" ] && sha256sum "$SHIM" | cut -d' ' -f1)
+          # set -e safe: a bare shimsha=$([ -n "$SHIM" ] && ...) would die when SHIM is
+          # empty (the test fails -> substitution exits 1). Init then guard-assign instead,
+          # so the empty-$SHIM case falls into the descriptive ::error:: branch below.
+          shimsha=""
+          [ -n "$SHIM" ] && shimsha=$(sha256sum "$SHIM" | cut -d' ' -f1 || true)
           if [ "$shimsha" != "$GOOD_SHIM" ]; then
             echo "::error::libuclibcshim.so sha '$shimsha' != pinned-good $GOOD_SHIM -- shim was rebuilt/changed (unverified, was what crashed prudynt); refusing. Re-pin only after verifying prudynt boots."; exit 1
           fi

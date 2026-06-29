@@ -10,10 +10,10 @@ DNSTATE="/usr/sbin/daynight-state"   # day/night single source of truth (atomic 
 
 # Boot to night optics ONLY when the persisted mode is forced-night. The mode
 # lives in /etc/daynight.state ("mode=auto|day|night"), read through the SAME
-# helper the agent uses; S31prudynt pre-start-syncs that sidecar into prudynt.json
-# before launch, so the boot optics (here, GPIO) and the ISP color/mono mode
-# (prudynt, from the synced config) are both driven by the one sidecar and can
-# never disagree. Everything else keeps the stock day calibration:
+# helper the agent uses; prudynt reads that sidecar DIRECTLY at config-load
+# (patch 0015), so the boot optics (here, GPIO) and the ISP color/mono mode
+# (prudynt) are both driven by the one sidecar and can never disagree.
+# Everything else keeps the stock day calibration:
 #   * forced day  (mode=day)             -> day
 #   * auto        (mode=auto)            -> day start; prudynt's worker then
 #       switches on the measured light level
