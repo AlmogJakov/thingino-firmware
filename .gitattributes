@@ -1,1 +1,2 @@
 *.patch -text
+package/ingenic-uclibc/prebuilt/*.so binary

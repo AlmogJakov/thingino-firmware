@@ -162,20 +162,21 @@ jobs:
           # the proven prudynt boots fine against a good shim. Refuse to ship the known-bad
           # shim. (No daynight.state grep here -- the proven prudynt legitimately contains the
           # prudynt_daynight_state Prometheus metric, so that check was a false positive.)
-          BAD_SHIM="b3ead471b602e75b2557fcb71a52818583a6caddf5ad1296d84ecea35553eefa"
+          # REQUIRE the pinned, proven-good shim (07710f80). The package installs a
+          # committed prebuilt; if the shipped shim is anything else, the pin was
+          # bypassed / the toolchain rebuilt it -> refuse (a rebuilt shim is unverified
+          # and was what crashed every prudynt). Re-pin only after verifying prudynt boots.
           GOOD_SHIM="07710f80ebc4683c9a9c658142a3cdce018db2949b844647e1709446e21c369b"
           SHIM=$(find "$ROOT" -name 'libuclibcshim.so' 2>/dev/null | head -1)
-          if [ -n "$SHIM" ]; then
-            shimsha=$(sha256sum "$SHIM" | cut -d' ' -f1)
-            if [ "$shimsha" = "$BAD_SHIM" ]; then
-              err "libuclibcshim.so is the KNOWN-BAD build ($shimsha) -- crashes prudynt at startup; do NOT ship"
-            elif [ "$shimsha" = "$GOOD_SHIM" ]; then
-              ok "libuclibcshim.so is the known-GOOD build ($shimsha)"
-            else
-              ok "libuclibcshim.so is not the known-bad build (sha $shimsha; verify it boots prudynt)"
-            fi
-          else
+          if [ -z "$SHIM" ]; then
             err "libuclibcshim.so not found in rootfs"
+          else
+            shimsha=$(sha256sum "$SHIM" | cut -d' ' -f1)
+            if [ "$shimsha" = "$GOOD_SHIM" ]; then
+              ok "libuclibcshim.so is the PINNED proven-good build ($shimsha)"
+            else
+              err "libuclibcshim.so sha $shimsha != pinned-good $GOOD_SHIM -- shim was rebuilt/changed; refusing to ship (re-pin only after verifying prudynt boots)"
+            fi
           fi
           # --- the rootfs pre-start sync pieces must actually be present ---
           grep -q 'sync-to-config' "$ROOT/usr/sbin/daynight-state" 2>/dev/null \

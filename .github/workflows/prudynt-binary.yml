@@ -225,12 +225,15 @@ jobs:
           mkdir -p artifact
           cp "$BIN" artifact/prudynt
           [ -n "$SHIM" ] && cp "$SHIM" artifact/libuclibcshim.so
-          # The startup crash was a MISCOMPILED libuclibcshim.so (buildroot 2026.02.1 gcc
-          # + -flto). Refuse to ship the known-bad shim so a regressed toolchain build is
-          # caught here, not on the camera. (We dropped -flto; this verifies it took.)
-          if [ -n "$SHIM" ] && [ "$(sha256sum "$SHIM" | cut -d' ' -f1)" = "b3ead471b602e75b2557fcb71a52818583a6caddf5ad1296d84ecea35553eefa" ]; then
-            echo "::error::libuclibcshim.so is the KNOWN-BAD build (b3ead471) -- still miscompiled (crashes prudynt). The -flto removal did not take or another flag/toolchain issue remains."; exit 1
+          # The startup crash was a MISCOMPILED libuclibcshim.so. The package now ships a
+          # PINNED proven-good prebuilt (07710f80); REQUIRE exactly that, so a rebuilt /
+          # regressed shim is caught here, not on the camera.
+          GOOD_SHIM="07710f80ebc4683c9a9c658142a3cdce018db2949b844647e1709446e21c369b"
+          shimsha=$([ -n "$SHIM" ] && sha256sum "$SHIM" | cut -d' ' -f1)
+          if [ "$shimsha" != "$GOOD_SHIM" ]; then
+            echo "::error::libuclibcshim.so sha '$shimsha' != pinned-good $GOOD_SHIM -- shim was rebuilt/changed (unverified, was what crashed prudynt); refusing. Re-pin only after verifying prudynt boots."; exit 1
           fi
+          echo "shim OK: pinned proven-good ($shimsha)"
           ls -l artifact/
 
       - name: Upload prudynt + libuclibcshim.so
