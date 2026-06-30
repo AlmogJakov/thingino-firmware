@@ -6,7 +6,7 @@ name: pt2-build-artifact
 #   no secrets (read-only token) - single board.
 #
 # Same build commands as thingino's CI (make source + make fast), so the prudynt
-# 0001-0014 patches and the overlay/package changes are baked into the image.
+# 0001-0015 patches and the overlay/package changes are baked into the image.
 # A run is a full build (~1-2 h: toolchain + packages); no caching is configured, so reruns take about the same time.
 #
 # Run:      Actions -> "pt2-build-artifact" -> Run workflow (pick the pt2-firmware branch).

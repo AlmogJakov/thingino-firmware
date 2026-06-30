@@ -15,6 +15,11 @@ is **not** installed into the firmware image.
 ## 1. Executive Summary
 
 ### Problems found
+- **Startup SIGSEGV crash-loop (every prudynt).** On the buildroot **2026.02.1** rootfs prudynt
+  SIGSEGV'd at startup and crash-looped - never serving RTSP at all. Root-caused to a
+  **miscompiled `libuclibcshim.so`** (the glibc→uClibc ABI shim; `-flto` miscompile, fault in
+  its own `__fputc_unlocked`), **not** prudynt - though it was first misattributed to the
+  day/night `0015` work, which cost a long detour. See §3-K.
 - **Cold-boot streamless camera.** On a cold boot prudynt could finish "alive" but with
   **no RTSP channel registered** (SPS/PPS not ready inside the bootstrap deadline), or
   silently continue after an IMP-init failure → DESCRIBE 404 while the process is up.
@@ -49,7 +54,12 @@ is **not** installed into the firmware image.
   AND every ConfigWatcher reload. (An earlier attempt at `0015` was wrongly blamed for a
   startup crash and reverted in favor of a rootfs `sync-to-config` workaround; the real cause
   was a **miscompiled `libuclibcshim.so`** - fixed by pinning the proven-good shim - so `0015`
-  was safe to re-introduce. See §7.)
+  was safe to re-introduce. See §3-K for the shim root cause and §7 for the sidecar design.)
+- **Toolchain / libc shim:** the startup crash-loop's true cause was a **miscompiled
+  `libuclibcshim.so`** (the glibc→uClibc ABI bridge prudynt force-links). Fixed by shipping the
+  **pinned proven-good prebuilt** (sha `07710f80…`) and **dropping `-flto`** in
+  `package/ingenic-uclibc/ingenic-uclibc.mk`; the build verifies the shim sha and refuses to
+  proceed if it was rebuilt/altered. See §3-K.
 - **jct (config tool):** stock jct - **the atomic-write fork was dropped**
   (`package/all-patches/thingino-jct/` no longer exists). `prudynt.json` writes use stock jct.
   The day/night sidecar's atomicity comes from the `/usr/sbin/daynight-state` helper's **own**
@@ -135,6 +145,8 @@ is **not** installed into the firmware image.
 | `overlay/usr/sbin/tz-update` | **Added** | - (overlay) | `/usr/sbin/tz-update` | ✅ squashfs |
 | `overlay/usr/sbin/daynight-state` | **Added** | - (overlay) | `/usr/sbin/daynight-state` | ✅ squashfs |
 | `package/all-patches/prudynt-t/0001…0015-*.patch` | Added (in branch) | prudynt-t (build patches) | compiled into `/usr/bin/prudynt` | ✅ binary |
+| `package/ingenic-uclibc/ingenic-uclibc.mk` | Modified (pin prebuilt `.so`, verify sha, drop `-flto`) | ingenic-uclibc | `/usr/lib/libuclibcshim.so` | ✅ binary |
+| `package/ingenic-uclibc/prebuilt/libuclibcshim.so` | **Added** (pinned proven-good prebuilt, sha `07710f80…`) | ingenic-uclibc | `/usr/lib/libuclibcshim.so` | ✅ binary |
 | `tests/test-daynight-state.sh` | **Added** | - | not installed | ❌ repo test only |
 | `PT2-FIX-SET.md` (this file) | **Added** | - | not installed | ❌ repo doc only |
 | `.github/workflows/prudynt-binary.yml` | **Added** | - | not installed (CI) | ❌ builds prudynt binary only |
@@ -152,8 +164,15 @@ stock build has no watchdog. We add it via the overlay (no `.mk` change needed).
 - **Contested files** (`daynight`/`privacy`/`imp-control`/`color`) have multiple providers,
   but on this board only **prudynt-t** is enabled (ircut/daynightd/dusk2dawn/raptor/
   libimp-control are disabled), so the package-source edits are unambiguous.
-- **Line endings:** files are stored LF; `core.autocrlf=true` normalizes diffs, and the
-  build/device get LF.
+- **Line endings:** `core.autocrlf=true`; the overlay/package shell tree is committed CRLF and
+  is the proven-working state (the GitHub-built firmware runs it fine), so do **not** mass-
+  normalize to LF (huge churn, diverges from the proven format). Edit content normally;
+  `git add` keeps the existing CRLF, so diffs stay content-only.
+- **Pinned prebuilt shim:** `libuclibcshim.so` (the glibc→uClibc ABI bridge prudynt force-links)
+  is the one component shipped as a **committed prebuilt binary**, not source-built - the
+  2026.02.1 toolchain miscompiled it from source (§3-K). `ingenic-uclibc.mk` installs
+  `prebuilt/libuclibcshim.so` to `/usr/lib` and `sha256`-gates it; do **not** revert to a source
+  build without re-verifying prudynt boots and re-pinning the sha.
 
 ---
 
@@ -362,6 +381,32 @@ stock build has no watchdog. We add it via the overlay (no `.mk` change needed).
 - **Files:** `ha-commands`, `ha-discovery`, `ha-state`, `json-imp.cgi`, `json-config-ha.cgi`,
   `main.js`.
 
+### K. Startup SIGSEGV crash-loop - miscompiled `libuclibcshim.so` (true root cause)
+- **Problem:** on the buildroot **2026.02.1** rootfs, EVERY prudynt SIGSEGV'd at startup in a
+  tight crash-loop - never serving RTSP. This was first misattributed to prudynt (specifically
+  the day/night `0015` work), which sent the investigation down a dead end.
+- **Root cause:** `libuclibcshim.so` is a hand-written glibc/musl→uClibc ABI bridge
+  (`uclibc_shim.c`) that pokes raw `FILE`-struct offsets and interposes libc symbols. The
+  2026.02.1 gcc - **especially with `-flto`** - **miscompiled** it; prudynt faulted inside the
+  shim's own `__fputc_unlocked` (epc `libuclibcshim+0xbc8`). The bad rebuild's sha was
+  `b3ead471…`; the proven-good binary built by the older toolchain (sha `07710f80…`) boots
+  prudynt fine on the same 2026.02.1 rootfs - confirmed by swapping the shim on the cameras
+  (cam4's bad shim crashed; cam3's good shim ran the **same** prudynt).
+- **Solution:** `package/ingenic-uclibc/ingenic-uclibc.mk` now **ships the pinned, proven-good
+  prebuilt** `prebuilt/libuclibcshim.so` (sha `07710f80…`) to `/usr/lib/libuclibcshim.so`
+  instead of compiling the `.so` from source, and **drops `-flto`** (the flag that miscompiled
+  it; kept off the `.a` too). `INGENIC_UCLIBC_BUILD_CMDS` runs `sha256sum -c` against
+  `INGENIC_UCLIBC_GOOD_SHA` and **fails the build** if the pinned file was altered. The static
+  `.a` (used only when raptor links the shim statically) is still built from source; PT2/prudynt
+  use the dynamic `.so`. Both CI workflows additionally fail if the **shipped** shim sha is
+  anything other than `07710f80…`. To bump the toolchain or shim source: rebuild the `.so`,
+  verify prudynt boots, then re-pin (update both the file and the sha).
+- **Files:** `package/ingenic-uclibc/ingenic-uclibc.mk`, `package/ingenic-uclibc/prebuilt/libuclibcshim.so`.
+- **Notes:** this - **not** `0015` - is why the earlier `0015` revert + rootfs `sync-to-config`
+  workaround happened; with the shim fixed, `0015` was safe to re-introduce (§7). When prudynt
+  SIGSEGVs in `libuclibcshim` at startup, first `sha256sum /lib/libuclibcshim.so` on a working
+  vs broken unit and swap it - do not touch prudynt.
+
 ---
 
 ## 4. Motors Special Case - wrapper → `motors-bin`
@@ -526,6 +571,9 @@ is a flash write).
 
 ## 7. Minimal-write day/night persistence (sidecar)
 
+> The startup crash that earlier got `0015` reverted was the **miscompiled shim** (§3-K), not
+> this design; with the shim pinned, `0015` (prudynt reading the sidecar directly) is safe.
+
 **Why.** Auto/Day/Night and physical-privacy are the **MQTT-frequent** modes and have
 reboot/power-outage recovery, so persisting them on a runtime toggle must be tiny and
 power-safe - not the full ~8.5 KB non-atomic `prudynt.json` rewrite the other (rare) settings use.
@@ -573,6 +621,11 @@ persisted - see §1.
   (auto-applied; source git-fetched at `f4b3228` - never hand-edit source). There is **no**
   `package/all-patches/thingino-jct/` (the jct atomic-write fork was dropped; `prudynt.json` uses
   stock jct).
+- **Shim sha gate (critical):** the shipped `/usr/lib/libuclibcshim.so` MUST be the pinned
+  proven-good build - sha256 `07710f80ebc4683c9a9c658142a3cdce018db2949b844647e1709446e21c369b`
+  (§3-K). `ingenic-uclibc.mk` verifies the pinned prebuilt before install, and **both** CI
+  workflows fail the run if the shim in the rootfs/staging is anything else (a rebuilt shim is
+  unverified and was what crashed every prudynt). Re-pin only after verifying prudynt boots.
 - After build, confirm `package/all-patches/prudynt-t/` holds **exactly** `0001`-`0015`. In the
   staged image, verify the motors split (§4); that `0007`/`0013`/`0014` are in the binary (grep
   `add_strk_a_rtsp` for `0014`); that the prudynt source/binary **does** reference the literal
