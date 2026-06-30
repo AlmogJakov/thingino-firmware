@@ -1,0 +1,67 @@
+diff --git a/src/Config.cpp b/src/Config.cpp
+index be904ba..3560087 100644
+--- a/src/Config.cpp
++++ b/src/Config.cpp
+@@ -428,13 +428,13 @@ std::vector<ConfigItem<const char *>> CFG::getCharItems() {
+       {"daynight.day_bin_path", daynight.day_bin_path, "", validateCharDummy},
+       {"daynight.night_bin_path", daynight.night_bin_path, "",
+        validateCharDummy},
+-      {"daynight.force_mode", daynight.force_mode_cfg, "",
+-       [](const char *v) {
+-         if (!v || !*v)
+-           return true;
+-         const std::string s(v);
+-         return s == "day" || s == "night";
+-       }},
++      // 0016: daynight.force_mode is intentionally NOT a char-item. handleConfigItem
++      // would strdup it on every CFG::load and the config layer never frees char values
++      // (the lock-free readers IMPSystem/DayNightWorker/JsonAPI would UAF on a free), so it
++      // would leak ~16B per reload. Instead force_mode_cfg is only ever assigned
++      // process-lifetime STRING LITERALS -- by the 0013 quote-strip (below), the 0015
++      // sidecar overlay, and the JsonAPI force handler -- so it is never heap, never freed,
++      // never leaks, and a lock-free reader only ever sees a complete, immortal literal.
+       {"daynight.schedule.start_at", daynight.schedule.start_at, "",
+        validateCharDummy},
+       {"daynight.schedule.stop_at", daynight.schedule.stop_at, "",
+@@ -1395,10 +1395,10 @@ void CFG::load() {
+       std::string fm = jsonValueToString(fmv);
+       if (fm.size() >= 2 && fm.front() == '"' && fm.back() == '"')
+         fm = fm.substr(1, fm.size() - 2);
+-      if ((fm == "day" || fm == "night") &&
+-          (!daynight.force_mode_cfg ||
+-           std::strcmp(daynight.force_mode_cfg, fm.c_str()) != 0)) {
+-        daynight.force_mode_cfg = strdup(fm.c_str());
++      if (fm == "day" || fm == "night") {
++        // 0016: assign a process-lifetime LITERAL (fm is validated day|night above),
++        // never strdup -> force_mode_cfg is never heap, so nothing to free or leak.
++        daynight.force_mode_cfg = (fm == "night") ? "night" : "day";
+       }
+     }
+   }
+diff --git a/src/JsonAPI.cpp b/src/JsonAPI.cpp
+index d787774..14b0bea 100644
+--- a/src/JsonAPI.cpp
++++ b/src/JsonAPI.cpp
+@@ -1362,14 +1362,14 @@ void handle_daynight(JsonValue *obj, std::string &out, bool &sep) {
+         // Runtime signal to the DayNightWorker as an int enum (1=day, 2=night) —
+         // no heap string, so high-frequency force commands cannot leak.
+         cfg->daynight.force_mode.store(std::strcmp(mode, "night") == 0 ? 2 : 1);
+-        // Mirror into the PERSISTED member (bound to the "daynight.force_mode"
+-        // key) so a pinned mode survives reboot — but only on a REAL change: the
+-        // config layer never frees char values, so an unconditional re-strdup
+-        // would leak per command. This matches the codebase's leak-on-change norm.
+-        if (!cfg->daynight.force_mode_cfg ||
+-            std::strcmp(cfg->daynight.force_mode_cfg, mode) != 0) {
+-          cfg->daynight.force_mode_cfg = strdup(mode);
+-        }
++        // 0016: mirror into the persisted member as a process-lifetime LITERAL (mode is
++        // validated day|night above), never strdup. force_mode_cfg is never heap, so a
++        // high-frequency force command cannot leak and the lock-free readers
++        // (IMPSystem/DayNightWorker) only ever see a complete, immortal literal. The
++        // sidecar (/etc/daynight.state, via the agent) is what actually persists across
++        // reboot; this just keeps the running daemon's reported mode consistent.
++        cfg->daynight.force_mode_cfg =
++            (std::strcmp(mode, "night") == 0) ? "night" : "day";
+       }
+       add_key(out, s2, "force_mode");
+       add_str(out, mode);

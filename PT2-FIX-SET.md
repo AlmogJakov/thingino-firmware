@@ -46,7 +46,7 @@ is **not** installed into the firmware image.
   were edited live, filling the tiny jffs2 config overlay.
 
 ### What was fixed
-- **prudynt binary:** 15 source patches `0001`-`0015` (auto-applied by buildroot's global
+- **prudynt binary:** 16 source patches `0001`-`0016` (auto-applied by buildroot's global
   patch dir; the source is git-fetched at `f4b3228` and never hand-edited). For day/night
   persistence, patch `0015` makes `CFG::load()` read the `/etc/daynight.state` sidecar
   **directly** (a zero-allocation static-literal overlay) and set `daynight.enabled` /
@@ -144,7 +144,7 @@ is **not** installed into the firmware image.
 | `overlay/usr/sbin/physical-privacy` | **Added** | - (overlay) | `/usr/sbin/physical-privacy` | ✅ squashfs |
 | `overlay/usr/sbin/tz-update` | **Added** | - (overlay) | `/usr/sbin/tz-update` | ✅ squashfs |
 | `overlay/usr/sbin/daynight-state` | **Added** | - (overlay) | `/usr/sbin/daynight-state` | ✅ squashfs |
-| `package/all-patches/prudynt-t/0001…0015-*.patch` | Added (in branch) | prudynt-t (build patches) | compiled into `/usr/bin/prudynt` | ✅ binary |
+| `package/all-patches/prudynt-t/0001…0016-*.patch` | Added (in branch) | prudynt-t (build patches) | compiled into `/usr/bin/prudynt` | ✅ binary |
 | `package/ingenic-uclibc/ingenic-uclibc.mk` | Modified (pin prebuilt `.so`, verify sha, drop `-flto`) | ingenic-uclibc | `/usr/lib/libuclibcshim.so` | ✅ binary |
 | `package/ingenic-uclibc/prebuilt/libuclibcshim.so` | **Added** (pinned proven-good prebuilt, sha `07710f80…`) | ingenic-uclibc | `/usr/lib/libuclibcshim.so` | ✅ binary |
 | `tests/test-daynight-state.sh` | **Added** | - | not installed | ❌ repo test only |
@@ -601,6 +601,18 @@ sidecar falls back to **forced `day`** (`force_mode_cfg="day"` + `enabled=false`
 `daynight-state get` helper, and `migrate` (which self-heals a missing/corrupt sidecar to `day` at
 boot). A legitimate `mode=auto` is preserved as auto.
 
+**Leak-free `force_mode_cfg` (patch `0016`).** `force_mode_cfg` is a `const char*` that the config
+layer never frees (the lock-free readers `IMPSystem`/`DayNightWorker`/`JsonAPI` would use-after-free
+on a `free()`). Previously it was `strdup`'d on every `CFG::load` (the char-item loop), on the
+`0013` quote-strip, and on every runtime force (`JsonAPI`) - a recurring ~16 B leak that `0015`'s
+overlay then orphaned. Patch `0016` makes it **literal-only**: the `daynight.force_mode` char-item
+entry is removed, and `0013` + `JsonAPI` assign `"day"`/`"night"` string literals instead of
+`strdup`. So `force_mode_cfg` is now *never* on the heap - nothing to leak, nothing to free, no
+UAF, and a racing reader only ever sees a complete, immortal literal (atomic pointer swap). The
+only side effect (`updateConfig` no longer auto-mirrors `daynight.force_mode` into `prudynt.json`)
+is a no-op: the sidecar is the source of truth and `0015` discarded that JSON value anyway. CI
+(both workflows) fails the build if any `force_mode_cfg = strdup` reappears.
+
 **Net per runtime toggle:** one ~11 B atomic sidecar write - **no `prudynt.json` write at all**, at
 runtime or boot. The legacy `daynight.enabled`/`daynight.force_mode` keys are **dead** after the
 one-time `migrate`; the helper's `sync-to-config` verb still exists but is a **legacy/unwired**
@@ -617,7 +629,7 @@ persisted - see §1.
 ---
 
 ## Build & validate (reminder)
-- prudynt C++ ships **only** via patches `0001`-`0015` in `package/all-patches/prudynt-t/`
+- prudynt C++ ships **only** via patches `0001`-`0016` in `package/all-patches/prudynt-t/`
   (auto-applied; source git-fetched at `f4b3228` - never hand-edit source). There is **no**
   `package/all-patches/thingino-jct/` (the jct atomic-write fork was dropped; `prudynt.json` uses
   stock jct).
@@ -626,13 +638,15 @@ persisted - see §1.
   (§3-K). `ingenic-uclibc.mk` verifies the pinned prebuilt before install, and **both** CI
   workflows fail the run if the shim in the rootfs/staging is anything else (a rebuilt shim is
   unverified and was what crashed every prudynt). Re-pin only after verifying prudynt boots.
-- After build, confirm `package/all-patches/prudynt-t/` holds **exactly** `0001`-`0015`. In the
+- After build, confirm `package/all-patches/prudynt-t/` holds **exactly** `0001`-`0016`. In the
   staged image, verify the motors split (§4); that `0007`/`0013`/`0014` are in the binary (grep
   `add_strk_a_rtsp` for `0014`); that the prudynt source/binary **does** reference the literal
   `/etc/daynight.state` (patch `0015`'s direct-read overlay - distinct from the
-  `prudynt_daynight_state` Prometheus metric); that `/usr/sbin/daynight-state` is present +
-  executable; and that `S31prudynt` calls `migrate` and does **not** call `sync-to-config` before
-  `start_daemon`. (The `pt2-build-artifact` / `prudynt-binary` workflows enforce all of this.)
+  `prudynt_daynight_state` Prometheus metric); that **no `force_mode_cfg = strdup` remains** in
+  the source (patch `0016` makes it literal-only - leak-free); that `/usr/sbin/daynight-state` is
+  present + executable; and that `S31prudynt` calls `migrate` and does **not** call
+  `sync-to-config` before `start_daemon`. (The `pt2-build-artifact` / `prudynt-binary` workflows
+  enforce all of this.)
 - Offline: run `sh tests/test-daynight-state.sh`.
 - On device after flash: forced-night boot (optics == colour mode), Day↔Night↔Auto via MQTT
   with **no** `prudynt.json` size change, physical-privacy enter/exit keeps the mode, a

@@ -132,8 +132,11 @@ jobs:
           # 15) M5 (0005): apply_mode honours the optics-switch result (returns bool).
           grep -qF "static bool apply_mode" "$SRC/src/DayNightWorker.cpp" \
             || { echo "::error::DayNightWorker.cpp: apply_mode result-honouring (0005 M5) not applied"; ok=0; }
-          # 16) M4 (0005): forced day/night mode is mirrored into the persisted member.
-          grep -qF "force_mode_cfg = strdup" "$SRC/src/JsonAPI.cpp" \
+          # 16) M4 (0005): a forced day/night mode is mirrored into the persisted member
+          #     force_mode_cfg. NOTE: 0016 makes that assignment a LITERAL (not strdup) -- so
+          #     match the assignment itself, NOT "= strdup" (check #31 below FAILS if strdup
+          #     ever returns). Just confirm the mirror is still wired in JsonAPI's force handler.
+          grep -qF "cfg->daynight.force_mode_cfg =" "$SRC/src/JsonAPI.cpp" \
             || { echo "::error::JsonAPI.cpp: forced-mode persistence (0005 M4) not applied"; ok=0; }
           # 17) M1 (0006): motion.enabled (add_boolk_m) rebuilds only on a real change.
           grep -qF "Rebuild ONLY on a real change" "$SRC/src/JsonAPI.cpp" \
@@ -212,6 +215,15 @@ jobs:
             || { echo "::error::Config.cpp: 0015 direct-read sidecar overlay (/etc/daynight.state) not applied"; ok=0; }
           grep -qF "0015 (direct-read)" "$SRC/src/Config.cpp" \
             || { echo "::error::Config.cpp: 0015 direct-read marker comment missing — STALE/partial 0015"; ok=0; }
+          # 31) (0016 / leak-free force_mode): force_mode_cfg is now ONLY ever a process-
+          #     lifetime string literal (char-item table entry removed; 0013 + JsonAPI assign
+          #     literals), never strdup'd -- the config layer never frees char values, so any
+          #     strdup of it leaked ~16B per CFG::load/force. Verify none remains + marker present.
+          if grep -rqn 'force_mode_cfg = strdup' "$SRC/src"; then
+            echo "::error::force_mode_cfg is strdup'd in source — 0016 (literal-only) regressed -> per-reload leak"; ok=0
+          fi
+          grep -qF "0016: daynight.force_mode is intentionally NOT a char-item" "$SRC/src/Config.cpp" \
+            || { echo "::error::Config.cpp: 0016 marker missing (force_mode char-item not removed)"; ok=0; }
           # 30b) NO debug scaffolding may ship: a prior diagnostic build leaked startup
           #      trace markers; refuse any that crept back into the prudynt source.
           # NB: `|| true` is REQUIRED — grep exits 1 when it finds nothing (the good case),
@@ -226,7 +238,7 @@ jobs:
           # is gone). The startup crash was a regressed libuclibcshim.so, NOT prudynt; the
           # binary legitimately contains the prudynt_daynight_state Prometheus metric, so we
           # match the LITERAL path /etc/daynight.state (above), never a bare 'daynight.state'.
-          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (0001-0003 base; 0004 live reconfig + IDR; 0005 fault-tolerance; 0006 high-freq seamlessness; 0007 physical-privacy software mic mute; 0008 audio RTP sample-clock (all codecs) + AAC force_stereo reframer fix; 0009 cold-boot RTSP SPS/PPS deadline; 0010 IMP-init fail-fast; 0011 zero-channel fail-fast; 0012 config apply-defaults-on-parse-fail; 0013 force_mode quote-tolerance; 0014 live audio codec-switch RTSP rebuild; 0015 daynight direct-read sidecar)" || exit 1
+          [ "$ok" = 1 ] && echo "FINAL PATCH CONFIRMED (0001-0003 base; 0004 live reconfig + IDR; 0005 fault-tolerance; 0006 high-freq seamlessness; 0007 physical-privacy software mic mute; 0008 audio RTP sample-clock (all codecs) + AAC force_stereo reframer fix; 0009 cold-boot RTSP SPS/PPS deadline; 0010 IMP-init fail-fast; 0011 zero-channel fail-fast; 0012 config apply-defaults-on-parse-fail; 0013 force_mode quote-tolerance; 0014 live audio codec-switch RTSP rebuild; 0015 daynight direct-read sidecar; 0016 leak-free force_mode (literal-only, no strdup))" || exit 1
 
       - name: Collect prudynt + the libuclibcshim.so it links (and guard the shim sha)
         id: find
