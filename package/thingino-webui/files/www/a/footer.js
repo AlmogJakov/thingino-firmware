@@ -114,18 +114,55 @@
           (globalConfig.restartLoadingLabel || "Restarting…") +
           "</span>";
       }
+      const statusUrl = "/x/prudynt-status.cgi";
+      // Record the current prudynt pid so we can detect the actual restart
+      // (a NEW pid) and reload only once prudynt is genuinely back up.
+      let oldPid = "";
+      try {
+        const pr = await fetch(statusUrl, {
+          cache: "no-store",
+          credentials: "same-origin",
+        });
+        if (pr.ok) oldPid = ((await pr.json()) || {}).pid || "";
+      } catch (e) {
+        /* non-fatal */
+      }
+
       const endpoint = globalConfig.restartEndpoint || "/x/restart-prudynt.cgi";
       const method = globalConfig.restartMethod || "GET";
       const res = await fetch(endpoint, { method });
       if (!res.ok) throw new Error("HTTP " + res.status);
 
-      const waitOverride = Number(globalConfig.restartWaitMs);
-      const waitMs = Number.isFinite(waitOverride) ? waitOverride : 3000;
-      if (waitMs > 0) await wait(waitMs);
+      // service restart prudynt does stop -> ~15s reclaim -> start (~17s), so a
+      // fixed short wait would reload onto a dead stream. Poll until prudynt is
+      // back with a NEW pid, bounded (~30s fallback).
+      const restartDeadline = Date.now() + 30000;
+      let cameBack = false;
+      while (Date.now() < restartDeadline) {
+        await wait(1000);
+        try {
+          const sr = await fetch(statusUrl, {
+            cache: "no-store",
+            credentials: "same-origin",
+          });
+          if (sr.ok) {
+            const sd = (await sr.json()) || {};
+            if (sd.pid && sd.pid !== oldPid) {
+              cameBack = true;
+              break;
+            }
+          }
+        } catch (e) {
+          /* keep polling */
+        }
+      }
 
       showGlobalMessage(
-        globalConfig.restartSuccessMessage || "Prudynt restarted successfully",
-        "success",
+        cameBack
+          ? globalConfig.restartSuccessMessage ||
+              "Prudynt restarted successfully"
+          : "Prudynt restart is taking longer than expected\u2026",
+        cameBack ? "success" : "warning",
       );
 
       if (globalConfig.restartReload === false) {

@@ -38,6 +38,12 @@ const HeartBeatMaxReconnectDelay = 120 * 1000;
 const HeartBeatEndpoint = "/x/json-heartbeat.cgi";
 const SlowHeartbeatEndpoint = "/x/json-heartbeat-slow.cgi";
 const SlowHeartbeatPollInterval = 15 * 1000;
+const FastStatusEndpoint = "/x/json-status-fast.cgi";
+const FastStatusPollInterval = 2 * 1000;
+let fastStatusTimer = null;
+let fastStatusInFlight = false;
+let physPrivDesired = null;
+let physPrivDesiredAt = 0;
 let heartbeatSource = null;
 let slowHeartbeatTimer = null;
 let slowHeartbeatInFlight = false;
@@ -745,6 +751,44 @@ function togglePrivacy(state) {
     });
 }
 
+function togglePhysicalPrivacy(state) {
+  const button = $("#physical-privacy");
+  // The CGI only STARTS the (detached) lens move, so the state file lags a
+  // cycle or two. Latch the requested state + show it optimistically; the fast
+  // poll confirms it (the reducer holds until it matches, ~15s cap) so the
+  // button never flickers back mid-transition.
+  physPrivDesired = state;
+  physPrivDesiredAt = Date.now();
+  if (button) {
+    button.classList.add("pending");
+    button.classList.toggle("active", state);
+  }
+
+  const q = state ? "on" : "off";
+  fetch("/x/json-physical-privacy.cgi?state=" + q, {
+    cache: "no-store",
+    credentials: "same-origin",
+  })
+    .then((res) => {
+      if (!res.ok) throw new Error(`HTTP error ${res.status}`);
+    })
+    .catch((err) => {
+      console.error("Physical privacy toggle error", err);
+      physPrivDesired = null;
+      if (button) button.classList.remove("pending");
+    });
+
+  // Safety net: stop showing "pending" and drop the latch after ~16s even if
+  // no fast poll arrives (e.g. channel down), so the button can never stick.
+  const myState = state;
+  setTimeout(() => {
+    if (physPrivDesired === myState) {
+      physPrivDesired = null;
+      if (button) button.classList.remove("pending");
+    }
+  }, 16000);
+}
+
 function toggleWireGuard(state) {
   const button = $("#wireguard");
   if (button) button.classList.add("pending");
@@ -1152,6 +1196,59 @@ function updateHeartbeatUi(json) {
       autoBtn.classList.toggle("active", json.daynight_enabled === 1);
     }
   }
+
+  // Update physical privacy button (Batch 2)
+  if (typeof json.physical_privacy_active !== "undefined") {
+    const ppBtn = $("#physical-privacy");
+    if (ppBtn) {
+      const ppVal = json.physical_privacy_active === true;
+      let ppApply = true;
+      // While a user toggle is settling, ignore poll values that do not yet
+      // match the requested state (the detached script writes the file a beat
+      // later); give up after 15s so a failed action still surfaces.
+      if (physPrivDesired !== null) {
+        if (
+          ppVal === physPrivDesired ||
+          Date.now() - physPrivDesiredAt > 15000
+        ) {
+          physPrivDesired = null;
+        } else {
+          ppApply = false;
+        }
+      }
+      if (ppApply) {
+        ppBtn.classList.remove("pending");
+        ppBtn.classList.toggle("active", ppVal);
+      }
+    }
+  }
+
+  // Update Shabbat Ready read-only indicator (Batch 2)
+  if (typeof json.shabbat_ready !== "undefined") {
+    const shabbat = $("#shabbat-indicator");
+    if (shabbat) {
+      const ready = json.shabbat_ready === true;
+      shabbat.textContent = ready ? "Shabbat: Ready" : "Shabbat: \u2014";
+      shabbat.classList.toggle("text-bg-success", ready);
+      shabbat.classList.toggle("text-bg-secondary", !ready);
+    }
+  }
+
+  // Update CPU / RAM minimal badge (Batch 2). cpu_load is a 1-min load average;
+  // on this single-core SoC load ~= CPU fraction, so render as ~%.
+  if (typeof json.cpu_load !== "undefined") {
+    const cpu = $("#sys-cpu");
+    if (cpu) {
+      const load = Number(json.cpu_load);
+      cpu.textContent = Number.isFinite(load)
+        ? Math.round(load * 100) + "%"
+        : "--";
+    }
+  }
+  if (typeof json.mem_used_pct !== "undefined") {
+    const mem = $("#sys-mem");
+    if (mem) mem.textContent = json.mem_used_pct + "%";
+  }
 }
 
 function startHeartbeatSse() {
@@ -1266,6 +1363,57 @@ function startSlowHeartbeatStatus() {
   fetchSlowHeartbeatStatus();
 }
 
+async function fetchFastStatus() {
+  if (
+    fastStatusInFlight ||
+    !passwordCheckComplete ||
+    isDefaultPassword ||
+    document.hidden
+  ) {
+    return;
+  }
+
+  fastStatusInFlight = true;
+
+  try {
+    const response = await fetch(FastStatusEndpoint, {
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+    if (response.ok) {
+      updateHeartbeatUi(await response.json());
+    }
+  } catch (error) {
+    // Best-effort: the SSE + slow heartbeat remain the authoritative fallback.
+  } finally {
+    fastStatusInFlight = false;
+    scheduleFastStatus();
+  }
+}
+
+function scheduleFastStatus(delay = FastStatusPollInterval) {
+  if (fastStatusTimer) {
+    clearTimeout(fastStatusTimer);
+    fastStatusTimer = null;
+  }
+
+  if (!passwordCheckComplete || isDefaultPassword || document.hidden) {
+    return;
+  }
+
+  fastStatusTimer = setTimeout(() => {
+    fastStatusTimer = null;
+    fetchFastStatus();
+  }, delay);
+}
+
+function startFastStatus() {
+  if (fastStatusTimer || fastStatusInFlight) {
+    return;
+  }
+  fetchFastStatus();
+}
+
 function cleanupHeartbeatResources() {
   if (heartbeatSource) {
     heartbeatSource.close();
@@ -1275,7 +1423,12 @@ function cleanupHeartbeatResources() {
     clearTimeout(slowHeartbeatTimer);
     slowHeartbeatTimer = null;
   }
+  if (fastStatusTimer) {
+    clearTimeout(fastStatusTimer);
+    fastStatusTimer = null;
+  }
   slowHeartbeatInFlight = false;
+  fastStatusInFlight = false;
   currentReconnectDelay = HeartBeatReconnectDelay;
 }
 
@@ -1307,6 +1460,7 @@ function heartbeat() {
   }
   startHeartbeatSse();
   startSlowHeartbeatStatus();
+  startFastStatus();
 }
 
 function initCopyToClipboard() {
@@ -2629,6 +2783,32 @@ function initPasswordRevealToggles(root = document) {
       spkBtn.addEventListener("click", (ev) => {
         ev.preventDefault();
         toggleAudio("speaker", !spkBtn.classList.contains("active"));
+      });
+    }
+
+    // setup physical privacy button handler
+    const physPrivBtn = $("#physical-privacy");
+    if (physPrivBtn) {
+      physPrivBtn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        togglePhysicalPrivacy(!physPrivBtn.classList.contains("active"));
+      });
+    }
+
+    // setup PTZ home button handler
+    const ptzHomeBtn = $("#ptz-home");
+    if (ptzHomeBtn) {
+      ptzHomeBtn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ptzHomeBtn.classList.add("pending");
+        fetch("/x/json-motor.cgi?d=r", {
+          cache: "no-store",
+          credentials: "same-origin",
+        })
+          .catch((err) => console.error("PTZ home error", err))
+          .finally(() =>
+            setTimeout(() => ptzHomeBtn.classList.remove("pending"), 600),
+          );
       });
     }
 

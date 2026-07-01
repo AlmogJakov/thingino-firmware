@@ -424,6 +424,38 @@
     return group;
   }
 
+  function createPhysicalPrivacyButton() {
+    const group = document.createElement("div");
+    group.className = "btn-group";
+    group.setAttribute("role", "group");
+
+    const button = createButton({
+      id: "physical-privacy",
+      title: "Physical Privacy (tilt the lens away)",
+      icon: "bi bi-camera-video-off",
+      label: "Phys. Privacy",
+    });
+
+    group.appendChild(button);
+    return group;
+  }
+
+  function createPtzHomeButton() {
+    const group = document.createElement("div");
+    group.className = "btn-group";
+    group.setAttribute("role", "group");
+
+    const button = createButton({
+      id: "ptz-home",
+      title: "PTZ Home (recenter the lens)",
+      icon: "bi bi-house",
+      label: "Home",
+    });
+
+    group.appendChild(button);
+    return group;
+  }
+
   function createAudioControlGroup() {
     const group = document.createElement("div");
     group.className = "btn-group";
@@ -761,6 +793,14 @@
     privacyBtn.classList.add("flex-fill");
     bar.appendChild(privacyBtn);
 
+    const physicalPrivacyBtn = createPhysicalPrivacyButton();
+    physicalPrivacyBtn.classList.add("flex-fill");
+    bar.appendChild(physicalPrivacyBtn);
+
+    const ptzHomeBtn = createPtzHomeButton();
+    ptzHomeBtn.classList.add("flex-fill");
+    bar.appendChild(ptzHomeBtn);
+
     const wireguardBtn = createWireGuardButton();
     wireguardBtn.classList.add("flex-fill");
     bar.appendChild(wireguardBtn);
@@ -784,6 +824,42 @@
     return bar;
   }
 
+  function buildStatusColumn() {
+    const col = document.createElement("div");
+    col.className = "col-12 col-lg text-lg-start x-small";
+
+    const wrap = document.createElement("span");
+    wrap.className = "d-inline-flex align-items-center gap-2 flex-wrap";
+
+    // Shabbat Ready - read-only status indicator (NOT a button).
+    const shabbat = document.createElement("span");
+    shabbat.id = "shabbat-indicator";
+    shabbat.className = "badge rounded-pill text-bg-secondary pe-none";
+    shabbat.title =
+      "Shabbat Ready \u2014 motion detection off and day/night forced (not auto)";
+    shabbat.textContent = "Shabbat: \u2014";
+
+    // CPU / RAM - read-only minimal badge.
+    const sys = document.createElement("span");
+    sys.className = "text-secondary pe-none";
+    sys.title = "CPU load (1 min) \u00b7 RAM used";
+    const cpu = document.createElement("span");
+    cpu.id = "sys-cpu";
+    cpu.textContent = "--";
+    const mem = document.createElement("span");
+    mem.id = "sys-mem";
+    mem.textContent = "--%";
+    sys.appendChild(document.createTextNode("CPU "));
+    sys.appendChild(cpu);
+    sys.appendChild(document.createTextNode(" \u00b7 RAM "));
+    sys.appendChild(mem);
+
+    wrap.appendChild(shabbat);
+    wrap.appendChild(sys);
+    col.appendChild(wrap);
+    return col;
+  }
+
   function buildTimeColumn(className) {
     const col = document.createElement("div");
     col.className = className;
@@ -801,7 +877,7 @@
       wrapperClass: globalConfig.wrapperClass || "",
       timeRowClass:
         globalConfig.timeRowClass || "row my-2 x-small align-items-center",
-      timeColClass: globalConfig.clockColClass || "col-12 text-lg-end",
+      timeColClass: globalConfig.clockColClass || "col-12 col-lg text-lg-end",
       buttonRowClass:
         globalConfig.rowClass || "row my-2 x-small align-items-center",
       buttonColClass: globalConfig.btnColClass || "col-12",
@@ -818,6 +894,7 @@
       placeholder.dataset.clockRow ||
       placeholder.dataset.timeRow ||
       defaults.timeRowClass;
+    timeRow.appendChild(buildStatusColumn());
     timeRow.appendChild(
       buildTimeColumn(placeholder.dataset.clockCol || defaults.timeColClass),
     );

@@ -379,6 +379,8 @@ define THINGINO_WEBUI_INSTALL_TARGET_CMDS
 		$(TARGET_DIR)/var/www/x/json-motion.cgi
 	$(INSTALL) -D -m 0755 $(THINGINO_WEBUI_PKGDIR)/files/www/x/json-motor.cgi \
 		$(TARGET_DIR)/var/www/x/json-motor.cgi
+	$(INSTALL) -D -m 0755 $(THINGINO_WEBUI_PKGDIR)/files/www/x/json-physical-privacy.cgi \
+		$(TARGET_DIR)/var/www/x/json-physical-privacy.cgi
 	$(INSTALL) -D -m 0755 $(THINGINO_WEBUI_PKGDIR)/files/www/x/json-motor-params.cgi \
 		$(TARGET_DIR)/var/www/x/json-motor-params.cgi
 	$(INSTALL) -D -m 0755 $(THINGINO_WEBUI_PKGDIR)/files/www/x/json-motors-config.cgi \
@@ -399,6 +401,8 @@ define THINGINO_WEBUI_INSTALL_TARGET_CMDS
 		$(TARGET_DIR)/var/www/x/json-sensor-info.cgi
 	$(INSTALL) -D -m 0755 $(THINGINO_WEBUI_PKGDIR)/files/www/x/json-sync-time.cgi \
 		$(TARGET_DIR)/var/www/x/json-sync-time.cgi
+	$(INSTALL) -D -m 0755 $(THINGINO_WEBUI_PKGDIR)/files/www/x/json-status-fast.cgi \
+		$(TARGET_DIR)/var/www/x/json-status-fast.cgi
 	$(INSTALL) -D -m 0755 $(THINGINO_WEBUI_PKGDIR)/files/www/x/json-system-usage.cgi \
 		$(TARGET_DIR)/var/www/x/json-system-usage.cgi
 	$(INSTALL) -D -m 0755 $(THINGINO_WEBUI_PKGDIR)/files/www/x/json-telegrambot.cgi \
@@ -419,6 +423,8 @@ define THINGINO_WEBUI_INSTALL_TARGET_CMDS
 		$(TARGET_DIR)/var/www/x/reset.cgi
 	$(INSTALL) -D -m 0755 $(THINGINO_WEBUI_PKGDIR)/files/www/x/restart-httpd.cgi \
 		$(TARGET_DIR)/var/www/x/restart-httpd.cgi
+	$(INSTALL) -D -m 0755 $(THINGINO_WEBUI_PKGDIR)/files/www/x/prudynt-status.cgi \
+		$(TARGET_DIR)/var/www/x/prudynt-status.cgi
 	$(INSTALL) -D -m 0755 $(THINGINO_WEBUI_PKGDIR)/files/www/x/restart-prudynt.cgi \
 		$(TARGET_DIR)/var/www/x/restart-prudynt.cgi
 	$(INSTALL) -D -m 0755 $(THINGINO_WEBUI_PKGDIR)/files/www/x/mqtt-sub-restart.cgi \
