@@ -121,6 +121,11 @@ handle_post() {
 	new_en_live_view=$(jct "$REQ_FILE" get enable_live_view 2>/dev/null)
 	new_en_reboot=$(jct "$REQ_FILE" get enable_reboot 2>/dev/null)
 	new_en_ota=$(jct "$REQ_FILE" get enable_ota 2>/dev/null)
+	new_en_daynight_status=$(jct "$REQ_FILE" get enable_daynight_status 2>/dev/null)
+	new_en_physical_privacy=$(jct "$REQ_FILE" get enable_physical_privacy 2>/dev/null)
+	new_en_mic=$(jct "$REQ_FILE" get enable_mic 2>/dev/null)
+	new_en_ptz=$(jct "$REQ_FILE" get enable_ptz 2>/dev/null)
+	new_en_shabbat=$(jct "$REQ_FILE" get enable_shabbat 2>/dev/null)
 
 	# Normalize
 	enabled=$(normalize_bool "$new_enabled")
@@ -140,6 +145,11 @@ handle_post() {
 	en_live_view=$(normalize_bool "$new_en_live_view")
 	en_reboot=$(normalize_bool "$new_en_reboot")
 	en_ota=$(normalize_bool "$new_en_ota")
+	en_daynight_status=$(normalize_bool "$new_en_daynight_status")
+	en_physical_privacy=$(normalize_bool "$new_en_physical_privacy")
+	en_mic=$(normalize_bool "$new_en_mic")
+	en_ptz=$(normalize_bool "$new_en_ptz")
+	en_shabbat=$(normalize_bool "$new_en_shabbat")
 
 	device_name=$(strip_json_string "$new_device_name")
 	device_model=$(strip_json_string "$new_device_model")
@@ -197,6 +207,11 @@ handle_post() {
 	jct "$TMP_FILE" set "${DOMAIN}.enable_live_view" "$en_live_view" >/dev/null 2>&1
 	jct "$TMP_FILE" set "${DOMAIN}.enable_reboot" "$en_reboot" >/dev/null 2>&1
 	jct "$TMP_FILE" set "${DOMAIN}.enable_ota" "$en_ota" >/dev/null 2>&1
+	jct "$TMP_FILE" set "${DOMAIN}.enable_daynight_status" "$en_daynight_status" >/dev/null 2>&1
+	jct "$TMP_FILE" set "${DOMAIN}.enable_physical_privacy" "$en_physical_privacy" >/dev/null 2>&1
+	jct "$TMP_FILE" set "${DOMAIN}.enable_mic" "$en_mic" >/dev/null 2>&1
+	jct "$TMP_FILE" set "${DOMAIN}.enable_ptz" "$en_ptz" >/dev/null 2>&1
+	jct "$TMP_FILE" set "${DOMAIN}.enable_shabbat" "$en_shabbat" >/dev/null 2>&1
 
 	jct "$CONFIG_FILE" import "$TMP_FILE" >/dev/null 2>&1
 

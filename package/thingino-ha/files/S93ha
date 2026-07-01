@@ -4,6 +4,11 @@ DAEMON="/usr/sbin/ha-daemon"
 PIDFILE="/run/ha-daemon.pid"
 LOGFILE="/tmp/ha-daemon.log"
 
+# Source shared HA config/identity so HA_CAMERA_ID is available for targeted
+# cleanup of the MQTT subscriber during stop(). Best-effort: if it is missing
+# the daemon lifecycle still works (the pkill-by-camera-id lines simply no-op).
+[ -f /usr/share/ha-common ] && . /usr/share/ha-common
+
 start_daemon() {
 	start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON"
 }
@@ -21,6 +26,32 @@ stop_daemon() {
 
 read_config() {
 	jct /etc/thingino.json get "$1" 2>/dev/null
+}
+
+# Return 0 while the long-lived ha-daemon or its command subscriber is alive.
+# Transient one-shot helpers (ha-state / ha-discovery) are intentionally NOT
+# matched: they are short re-sync runs and waiting on them would only cause a
+# spurious SIGKILL escalation. Waiting for ha-daemon guarantees its synchronous
+# retained 'offline' publish has completed before start() (the availability fix).
+ha_procs_running() {
+	ps w 2>/dev/null | grep -v grep \
+		| grep -Eq 'ha-daemon|ha-commands'
+}
+
+# Bounded wait (~5s) for the daemon and its helpers to fully exit after a stop
+# signal. This guarantees the dying daemon's SYNCHRONOUS retained 'offline'
+# publish (ha-daemon cleanup) has completed before start() runs, so the fresh
+# daemon's retained 'online' is always the last write on the availability topic
+# and HA entities cannot get stuck 'unavailable' after a restart. Returns 0 if
+# everything exited, 1 on timeout (caller then escalates to SIGKILL).
+wait_for_ha_shutdown() {
+	i=0
+	while [ "$i" -lt 25 ]; do
+		ha_procs_running || return 0
+		usleep 200000 2>/dev/null || sleep 1
+		i=$((i + 1))
+	done
+	return 1
 }
 
 start() {

@@ -238,7 +238,7 @@ fi
 # Buttons: PTZ motors (pan/tilt). Published automatically whenever this camera
 # has a motor driver (the `motors` command); driven locally by ha-commands (no
 # ONVIF/HTTP dependency). Hardware-gated so fixed cameras stay clean.
-if command -v motors >/dev/null 2>&1; then
+if ha_entity_enabled ptz && command -v motors >/dev/null 2>&1; then
 	ha_pub_disc button ptz_up \
 		"{\"name\":\"PTZ Up\",\"unique_id\":\"thingino_${HA_CAMERA_ID}_ptz_up\",\"command_topic\":\"${ST}/ptz_up/set\",\"payload_press\":\"PRESS\",\"icon\":\"mdi:arrow-up-bold\",\"availability\":${AVAIL_JSON},\"device\":${DEVICE_JSON}}"
 	ha_pub_disc button ptz_down \
