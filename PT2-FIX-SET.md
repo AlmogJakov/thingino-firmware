@@ -120,6 +120,10 @@ is **not** installed into the firmware image.
 
 ## 2. File Change Summary
 
+> **Batch 1 & 2** (HA entity config toggles, `S93ha` lifecycle, physical-privacy
+> responsiveness, Web-UI status bar, read-only fast status channel, CPU/RAM/Storage
+> health badge, Restart-Streamer fix) are documented in **§8**, with their own file list.
+
 | File (repo path) | Action | Package owner | Installs to (device) | In ROM/rootfs? |
 |---|---|---|---|---|
 | `package/prudynt-t/files/daynight` | Replaced | prudynt-t | `/usr/sbin/daynight` | ✅ squashfs |
@@ -129,7 +133,7 @@ is **not** installed into the firmware image.
 | `package/thingino-ha/files/ha-commands` | Replaced | thingino-ha | `/usr/sbin/ha-commands` | ✅ squashfs |
 | `package/thingino-ha/files/ha-discovery` | Replaced | thingino-ha | `/usr/sbin/ha-discovery` | ✅ squashfs |
 | `package/thingino-ha/files/ha-state` | Replaced | thingino-ha | `/usr/sbin/ha-state` | ✅ squashfs |
-| `package/thingino-ha/files/json-config-ha.cgi` | Modified (3 lines) | thingino-ha | `/var/www/x/json-config-ha.cgi` | ✅ squashfs |
+| `package/thingino-ha/files/json-config-ha.cgi` | Modified (+entity toggles; §8) | thingino-ha | `/var/www/x/json-config-ha.cgi` | ✅ squashfs |
 | `package/thingino-webui/files/www/a/main.js` | Modified | thingino-webui | `/var/www/a/main.js` | ✅ squashfs |
 | `package/thingino-webui/files/www/x/json-imp.cgi` | Replaced | thingino-webui | `/var/www/x/json-imp.cgi` | ✅ squashfs |
 | `package/thingino-agent/files/thingino-agent-adapter-prudynt` | Modified (write-on-change guard + day/night→sidecar read/write) | thingino-agent | `/usr/libexec/thingino-agent/adapters/prudynt.sh` | ✅ squashfs |
@@ -625,6 +629,150 @@ an adversarial QA pass; the confirmed findings were fixed.
 `ircut` and the 850 nm LED stay **derived runtime effects** of the day/night mode (unchanged
 from before); the HA `color`/`ircut` toggles remain runtime-only and are intentionally not
 persisted - see §1.
+
+---
+
+## 8. HA entity config toggles + Web UI status bar (Batch 1 & 2)
+
+Two rootfs/web-only batches (no prudynt rebuild) that (a) make the MQTT/HA entities
+manageable in the web HA-config page and fix the HA-daemon restart lifecycle, and
+(b) add a Web-UI status bar with health-oriented CPU/RAM/Storage indicators plus a
+PTZ Home button, a Physical Privacy toggle, and a read-only Shabbat indicator. All
+status reads are read-only (no flash writes); the fast status channel polls only
+while a page is open, so it adds zero device load when nobody is viewing the UI.
+
+### 8.1 HA entity config toggles + `S93ha` daemon lifecycle (Batch 1 - `c5a43f4`)
+- **Problem:** the Mic / Physical-Privacy / PTZ / Day-Night-Status / Shabbat MQTT
+  entities already existed and published (default-on via `ha_entity_enabled`), but
+  were not toggleable in the web HA-config page. `enable_ptz` was a **dead flag** -
+  `ha-discovery` gated PTZ only on `command -v motors` and never read it. And `S93ha`
+  called an **undefined** `wait_for_ha_shutdown` (it never sourced `ha-common`, so
+  `HA_CAMERA_ID` was empty and the mosquitto reaping was skipped) → a non-graceful
+  stop and a retained-`offline`/`online` **restart race** that could leave every HA
+  entity stuck "unavailable" after a `killall` (it recovered only via a clean web
+  "Save changes" → `S93ha restart`).
+- **Solution:**
+  - `config-ha.js` + `config-ha.html`: add enable toggles for `daynight_status`,
+    `shabbat` (Sensors) and `mic`, `physical_privacy`, `ptz` (Switches).
+  - `json-config-ha.cgi`: read / normalize / persist the 5 new `enable_` keys (it had
+    a hardcoded 15-key whitelist; `jct import` deep-merges, so all keys survive).
+  - `ha-discovery`: gate the PTZ buttons on `ha_entity_enabled ptz && command -v motors`
+    (the existing `else` already `ha_clear_disc`'s them) so the toggle actually works.
+  - `thingino-ha.json`: default `enable_ptz` **true** (so wiring the gate doesn't hide
+    working PTZ) + explicit `true` defaults for the 4 opt-out entities.
+  - `S93ha`: source `/usr/share/ha-common` (sets `HA_CAMERA_ID`) and **define** the
+    bounded `wait_for_ha_shutdown` (`ps`-based poll ≤5 s on `ha-daemon|ha-commands`,
+    then the existing SIGKILL escalation), making stop→start deterministic so the
+    dying daemon's `offline` lands before the fresh daemon's `online`.
+  - **Availability scheme is unchanged** (retained `online`, non-retained LWT
+    `offline`, retained cleanup `offline`) - only the ordering was fixed.
+
+### 8.2 Physical-privacy HA responsiveness (`30282b7`)
+- **Problem:** `physical_privacy` was the only `ha-commands` handler that published the
+  optimistic HA state **before** running the action, adding an MQTT round-trip in front
+  of the lens command.
+- **Solution:** reorder to **action-first** and background the trigger
+  (`/sbin/physical-privacy on|off … &`) so its ~0.5 s guard/LED/mic setup never delays
+  the publish; publish the optimistic state immediately; keep the delayed
+  `{ sleep 3; ha-state; }` re-sync. Now matches every other handler. Files: `ha-commands`.
+
+### 8.3 Web UI status bar (Batch 2 - `a335b044d`)
+- **PTZ Home** button (`#ptz-home` → `GET /x/json-motor.cgi?d=r`), **Physical Privacy**
+  toggle (`#physical-privacy` → new `/x/json-physical-privacy.cgi` → setsid-detached
+  `/sbin/physical-privacy`), a read-only **Shabbat** indicator (non-clickable), and a
+  minimal **CPU · RAM · Storage** badge - in the shared control-bar status row.
+- Files: `control-bar.js`, `main.js`.
+
+### 8.4 Fast status channel - READ-ONLY, page-open-only (`a335b044d`)
+- New `/x/json-status-fast.cgi` sources **only** `/run`, `/proc`, and existing state
+  files (the day/night sidecar, `physical-privacy-state.json`, `prudynt.json` via
+  `jct get`; `/proc/stat`, `/proc/meminfo`, `/proc/jz/isp/isp-m0`, `df /`). It **never**
+  calls `prudyntctl`, never talks to the agent, and **writes nothing** (no flash wear,
+  no `/tmp` cache, no state rewrite). `main.js` polls it ~2 s **only while the page is
+  visible** (gated on `document.hidden`; torn down on `pagehide`/`beforeunload`), so a
+  closed/hidden tab produces zero device load.
+- Carries day/night (fixes the ~5-10 s lag), physical-privacy, shabbat, gain
+  (`total_gain` - also fixing a reducer flicker where a mode-only update blanked it to
+  "---"), CPU, RAM and Storage.
+- **Speaker + Mic** stay on the pre-existing `prudyntctl` mic-poll (both runtime-only;
+  `spk_enabled` is **not** persisted to `prudynt.json`, confirmed on device), with
+  `spk_enabled` folded into that **same** existing 15 s query - no new fork.
+- Files: `json-status-fast.cgi` (new), `json-physical-privacy.cgi` (new),
+  `prudynt-status.cgi` (new), `thingino-webui.mk` (installs the 3, `-m 0755`).
+
+### 8.5 Health metrics: CPU / RAM / Storage
+- **CPU** (`2e6a51cf`, `61be971a`): a 1-min **load average was misleading** (it showed
+  ~332 % while real CPU was ~25 %). Now a real `/proc/stat` delta (idle = idle+iowait,
+  busy = total-idle, clamped 0-100), then a **browser-side rolling average** of the last
+  ~15 samples (~30 s) shown as `CPU avg NN%` so single per-frame bursts don't register
+  and only **sustained** load moves it; it turns amber at a sustained avg ≥ 90 %. Still
+  the real total system CPU; averaging is JS-only (no writes, no daemon, page-open-only).
+- **RAM** (`2e6a51cf`, `3b000cd3`): used% + used/total MB from `/proc/meminfo`. This
+  Ingenic kernel has **no `MemAvailable`**, so the fallback is
+  `MemFree+Buffers+Cached+SReclaimable` (matches busybox `free`'s used-excluding-cache;
+  omitting `SReclaimable` read ~5 % high).
+- **Storage** (`f0fcbca7`): the writable config overlay (`df /`) used% + free (adaptive
+  KB/MB/GB) - the small jffs2 partition that fills up and breaks config, so the most
+  health-relevant "storage" to watch.
+- **Observer note:** the preview page runs an MJPEG stream (`/x/ch0.mjpg` → `exec
+  prudyntctl mjpeg -f 5`), so prudynt JPEG-encodes and `uhttpd` serves it → total CPU
+  legitimately climbs *while viewing* (per-thread debug: `uhttpd` ~8 %, network softirq
+  ~9 %, `prudyntctl mjpeg` ~2 %, prudynt threads up). The rolling average keeps the
+  badge readable through that; it is not a bug. `/tmp` is `tmpfs` (RAM) - none of its
+  runtime files (`ha_state_cache`, `colormode.txt`, `ircutmode.txt`, IMP/ISP info,
+  `resolv.conf`, …) touch flash.
+
+### 8.6 Restart-Streamer fix (`a335b044d`)
+- **Problem:** the footer "Restart streamer" fired `service restart prudynt &` with no
+  `setsid` (killable mid-reclaim), and `footer.js` reloaded after a fixed 3 s into a
+  ~17 s restart → onto a dead stream.
+- **Solution:** `restart-prudynt.cgi` **setsid-detaches** the restart (survives the CGI
+  close; `nohup` fallback) + CRLF headers; `footer.js` records prudynt's pid then polls
+  new `/x/prudynt-status.cgi` until a **new** pid appears (restart truly complete, ~17 s,
+  30 s cap) before reloading. Files: `restart-prudynt.cgi`, `footer.js`, `prudynt-status.cgi`.
+
+### Files (Batch 1 & 2)
+| File (repo path) | Action | Installs to (device) |
+|---|---|---|
+| `package/thingino-ha/files/config-ha.js` | Modified (+5 toggles) | `/var/www/a/config-ha.js` |
+| `package/thingino-ha/files/config-ha.html` | Modified (+5 checkboxes) | `/var/www/config-ha.html` |
+| `package/thingino-ha/files/json-config-ha.cgi` | Modified (+5 `enable_` keys) | `/var/www/x/json-config-ha.cgi` |
+| `package/thingino-ha/files/ha-discovery` | Modified (PTZ gate) | `/usr/sbin/ha-discovery` |
+| `package/thingino-ha/files/ha-commands` | Modified (physical-privacy action-first) | `/usr/sbin/ha-commands` |
+| `package/thingino-ha/files/thingino-ha.json` | Modified (`enable_` defaults) | seed → `/etc/thingino.json` |
+| `package/thingino-ha/files/S93ha` | Modified (`wait_for_ha_shutdown` + source `ha-common`) | `/etc/init.d/S93ha` |
+| `package/thingino-webui/files/www/a/control-bar.js` | Modified (bar buttons + status column) | `/var/www/a/control-bar.js` |
+| `package/thingino-webui/files/www/a/main.js` | Modified (toggles, reducer, fast poll, CPU avg) | `/var/www/a/main.js` |
+| `package/thingino-webui/files/www/a/footer.js` | Modified (restart liveness poll) | `/var/www/a/footer.js` |
+| `package/thingino-webui/files/www/x/restart-prudynt.cgi` | Modified (setsid + CRLF) | `/var/www/x/restart-prudynt.cgi` |
+| `package/thingino-webui/files/www/x/json-status-fast.cgi` | **Added** | `/var/www/x/json-status-fast.cgi` |
+| `package/thingino-webui/files/www/x/json-physical-privacy.cgi` | **Added** | `/var/www/x/json-physical-privacy.cgi` |
+| `package/thingino-webui/files/www/x/prudynt-status.cgi` | **Added** | `/var/www/x/prudynt-status.cgi` |
+| `package/thingino-webui/thingino-webui.mk` | Modified (install 3 new cgis, `-m 0755`) | build rule |
+
+All are shell / JS / JSON / Makefile - **no prudynt rebuild**. New cgis are git mode
+`100755` and explicitly listed in `thingino-webui.mk` (which installs every `www` file).
+
+### Commits (branch `pt2-firmware`)
+- `c5a43f4` feat(thingino-ha): configurable MQTT entity toggles + deterministic S93ha restart
+- `30282b7` fix(thingino-ha): physical_privacy triggers the lens move before the optimistic publish
+- `a335b044d` feat(webui): Batch 2 - PTZ Home + Physical Privacy + Shabbat/CPU-RAM, fast status channel, restart fix
+- `2e6a51cf` fix(webui): accurate CPU%, memory MB, gain flicker, Shabbat "Not Ready" label
+- `036bd37e` fix(webui): show live speaker state faster via the existing mic poll
+- `f0fcbca7` feat(webui): add storage usage to the status badge
+- `3b000cd3` fix(webui): RAM% matches busybox free on kernels without MemAvailable
+- `61be971a` feat(webui): CPU badge shows a rolling average (health monitoring)
+
+### On-device validation
+- **HA:** the 5 toggles appear in the HA-config page and persist; entities publish; a
+  `S93ha restart` (or web "Save changes") is clean - no `wait_for_ha_shutdown: not found`,
+  no entities stuck unavailable.
+- **Bar:** PTZ Home recenters; Physical Privacy toggles cleanly (no flicker); Shabbat reads
+  "Ready" / "Not Ready"; CPU shows `avg NN%` (≈25 % idle, higher while previewing), RAM
+  matches `free`, Storage matches `df -h /`.
+- **Fast channel:** day/night + gain update in ~2 s; polling stops when the tab is hidden.
+- **Flash:** status is read-only; the only persistent flash writes remain the day/night
+  sidecar (`/etc/daynight.state`) and physical-privacy state (§7, §5).
 
 ---
 
