@@ -71,12 +71,13 @@ di=$((cpu_i2 - cpu_i1))
 [ "$cpu_pct" -lt 0 ] 2>/dev/null && cpu_pct=0
 [ "$cpu_pct" -gt 100 ] 2>/dev/null && cpu_pct=100
 
-# --- RAM: used% and used/total MB from /proc/meminfo (MemAvailable; fallback
-#     free+buffers+cached). Pure reads. ---
+# --- RAM: used% and used/total MB from /proc/meminfo. Prefer MemAvailable; this
+#     Ingenic kernel lacks it, so fall back to MemFree+Buffers+Cached+SReclaimable
+#     (matches busybox `free` used-excluding-cache). Pure reads. ---
 mem_total=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null)
 mem_avail=$(awk '/^MemAvailable:/{print $2; exit}' /proc/meminfo 2>/dev/null)
 if [ -z "$mem_avail" ]; then
-	mem_avail=$(awk '/^MemFree:/{f=$2} /^Buffers:/{b=$2} /^Cached:/{c=$2} END{print f+b+c}' /proc/meminfo 2>/dev/null)
+	mem_avail=$(awk '/^MemFree:/{f=$2} /^Buffers:/{b=$2} /^Cached:/{c=$2} /^SReclaimable:/{s=$2} END{print f+b+c+s}' /proc/meminfo 2>/dev/null)
 fi
 mem_pct=0
 mem_total_mb=0
