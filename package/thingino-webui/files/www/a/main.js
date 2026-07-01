@@ -1256,6 +1256,22 @@ function updateHeartbeatUi(json) {
         "(" + json.mem_used_mb + "/" + json.mem_total_mb + " MB)";
     }
   }
+  if (
+    typeof json.storage_used_pct !== "undefined" &&
+    typeof json.storage_free_kb !== "undefined"
+  ) {
+    const st = $("#sys-storage");
+    if (st) {
+      const kb = Number(json.storage_free_kb);
+      let free = "--";
+      if (Number.isFinite(kb)) {
+        if (kb < 1024) free = kb + " KB";
+        else if (kb < 1048576) free = (kb / 1024).toFixed(1) + " MB";
+        else free = (kb / 1048576).toFixed(1) + " GB";
+      }
+      st.textContent = "Storage " + json.storage_used_pct + "% free " + free;
+    }
+  }
 }
 
 function startHeartbeatSse() {

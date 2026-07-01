@@ -853,12 +853,17 @@
     memMb.id = "sys-mem-mb";
     memMb.className = "ms-1";
     memMb.textContent = "";
+    const storage = document.createElement("span");
+    storage.id = "sys-storage";
+    storage.textContent = "Storage --";
     sys.appendChild(document.createTextNode("CPU "));
     sys.appendChild(cpu);
     sys.appendChild(document.createTextNode(" \u00b7 RAM "));
     sys.appendChild(mem);
     sys.appendChild(document.createTextNode(" "));
     sys.appendChild(memMb);
+    sys.appendChild(document.createTextNode(" \u00b7 "));
+    sys.appendChild(storage);
 
     wrap.appendChild(shabbat);
     wrap.appendChild(sys);

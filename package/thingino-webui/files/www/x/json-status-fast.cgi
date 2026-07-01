@@ -94,5 +94,22 @@ esac
 [ "$mem_pct" -lt 0 ] 2>/dev/null && mem_pct=0
 [ "$mem_pct" -gt 100 ] 2>/dev/null && mem_pct=100
 
-printf '{"daynight_mode":"%s","daynight_enabled":%s,"physical_privacy_active":%s,"shabbat_ready":%s,"total_gain":%d,"cpu_pct":%d,"mem_used_pct":%d,"mem_used_mb":%d,"mem_total_mb":%d}\n' \
-	"$dn_mode" "$dn_enabled" "$pp" "$shabbat" "$gain" "$cpu_pct" "$mem_pct" "$mem_used_mb" "$mem_total_mb"
+# --- Storage: writable config overlay (df /, read-only). This small jffs2
+#     overlay holds /etc config writes and is the partition that fills up and
+#     breaks config on this device, so it is the most health-relevant storage.
+#     Emit used% + free KB; the UI renders KB/MB/GB adaptively. ---
+set -- $(df 2>/dev/null | awk '$NF == "/" {print $2, $3, $4; exit}')
+st_total=${1:-0}
+st_used=${2:-0}
+st_free=${3:-0}
+storage_pct=0
+case "$st_total" in
+	'' | 0 | *[!0-9]*) ;;
+	*) storage_pct=$((st_used * 100 / st_total)) ;;
+esac
+[ "$storage_pct" -lt 0 ] 2>/dev/null && storage_pct=0
+[ "$storage_pct" -gt 100 ] 2>/dev/null && storage_pct=100
+case "$st_free" in '' | *[!0-9]*) st_free=0 ;; esac
+
+printf '{"daynight_mode":"%s","daynight_enabled":%s,"physical_privacy_active":%s,"shabbat_ready":%s,"total_gain":%d,"cpu_pct":%d,"mem_used_pct":%d,"mem_used_mb":%d,"mem_total_mb":%d,"storage_used_pct":%d,"storage_free_kb":%d}\n' \
+	"$dn_mode" "$dn_enabled" "$pp" "$shabbat" "$gain" "$cpu_pct" "$mem_pct" "$mem_used_mb" "$mem_total_mb" "$storage_pct" "$st_free"
