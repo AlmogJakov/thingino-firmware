@@ -44,6 +44,8 @@ let fastStatusTimer = null;
 let fastStatusInFlight = false;
 let physPrivDesired = null;
 let physPrivDesiredAt = 0;
+let cpuSamples = [];
+const CPU_AVG_WINDOW = 15;
 let heartbeatSource = null;
 let slowHeartbeatTimer = null;
 let slowHeartbeatInFlight = false;
@@ -1234,12 +1236,24 @@ function updateHeartbeatUi(json) {
     }
   }
 
-  // Update CPU / RAM minimal badge. cpu_pct is a real /proc/stat CPU% (0..100).
+  // Update CPU badge. cpu_pct is a real /proc/stat CPU%, but sampled over a short
+  // window so it's spiky (per-frame encoder/ISP bursts). For HEALTH monitoring we
+  // show a rolling average over ~15 samples (~30s at the 2s poll) so single spikes
+  // don't register and only SUSTAINED load moves the number. Buffer is in-memory
+  // (no writes) and only fills while the page polls. Amber when sustained-high.
   if (typeof json.cpu_pct !== "undefined") {
     const cpu = $("#sys-cpu");
     if (cpu) {
       const p = Number(json.cpu_pct);
-      cpu.textContent = Number.isFinite(p) ? p + "%" : "--";
+      if (Number.isFinite(p)) {
+        cpuSamples.push(p < 0 ? 0 : p > 100 ? 100 : p);
+        if (cpuSamples.length > CPU_AVG_WINDOW) cpuSamples.shift();
+        let sum = 0;
+        for (let i = 0; i < cpuSamples.length; i++) sum += cpuSamples[i];
+        const avg = Math.round(sum / cpuSamples.length);
+        cpu.textContent = "avg " + avg + "%";
+        cpu.classList.toggle("text-warning", avg >= 90);
+      }
     }
   }
   if (typeof json.mem_used_pct !== "undefined") {
