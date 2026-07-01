@@ -1318,21 +1318,29 @@ async function fetchSlowHeartbeatStatus() {
 
     updateHeartbeatUi(await response.json());
 
-    // The agent heartbeat reports mic_enabled (capture on/off), NOT mic_muted (the
-    // software mute the HA entity uses). Poll mic_muted directly so the mic button
-    // reflects HA/MQTT-driven mutes too. Non-fatal if it fails.
+    // The agent heartbeat is slow (~5s) and reports mic_enabled (capture on/off),
+    // NOT mic_muted. Query mic_muted AND spk_enabled directly from prudynt in ONE
+    // request (spk_enabled is runtime-only - not persisted to prudynt.json - so it
+    // cannot be read from a file); this refreshes the mic + speaker buttons with
+    // the live state and picks up HA/MQTT-driven changes, with no extra request.
+    // Non-fatal if it fails.
     try {
       const micResp = await fetch("/x/json-prudynt.cgi", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ audio: { mic_muted: null } }),
+        body: JSON.stringify({ audio: { mic_muted: null, spk_enabled: null } }),
         cache: "no-store",
         credentials: "same-origin",
       });
       if (micResp.ok) {
         const micData = await micResp.json();
-        if (micData && micData.audio && typeof micData.audio.mic_muted !== "undefined") {
-          updateHeartbeatUi({ mic_muted: micData.audio.mic_muted });
+        if (micData && micData.audio) {
+          if (typeof micData.audio.mic_muted !== "undefined") {
+            updateHeartbeatUi({ mic_muted: micData.audio.mic_muted });
+          }
+          if (typeof micData.audio.spk_enabled !== "undefined") {
+            updateHeartbeatUi({ spk_enabled: micData.audio.spk_enabled });
+          }
         }
       }
     } catch (micErr) {
