@@ -837,22 +837,28 @@
     shabbat.className = "badge rounded-pill text-bg-secondary pe-none";
     shabbat.title =
       "Shabbat Ready \u2014 motion detection off and day/night forced (not auto)";
-    shabbat.textContent = "Shabbat: \u2014";
+    shabbat.textContent = "Shabbat: Not Ready";
 
     // CPU / RAM - read-only minimal badge.
     const sys = document.createElement("span");
     sys.className = "text-secondary pe-none";
-    sys.title = "CPU load (1 min) \u00b7 RAM used";
+    sys.title = "CPU usage \u00b7 RAM used";
     const cpu = document.createElement("span");
     cpu.id = "sys-cpu";
     cpu.textContent = "--";
     const mem = document.createElement("span");
     mem.id = "sys-mem";
     mem.textContent = "--%";
+    const memMb = document.createElement("span");
+    memMb.id = "sys-mem-mb";
+    memMb.className = "ms-1";
+    memMb.textContent = "";
     sys.appendChild(document.createTextNode("CPU "));
     sys.appendChild(cpu);
     sys.appendChild(document.createTextNode(" \u00b7 RAM "));
     sys.appendChild(mem);
+    sys.appendChild(document.createTextNode(" "));
+    sys.appendChild(memMb);
 
     wrap.appendChild(shabbat);
     wrap.appendChild(sys);

@@ -1016,7 +1016,7 @@ function updateHeartbeatUi(json) {
     typeof json.daynight_mode !== "undefined" &&
     json.daynight_mode !== "unknown" &&
     json.daynight_mode !== "";
-  if (hasTotalGain || hasBrightness || hasMode) {
+  if (hasTotalGain || hasBrightness) {
     // const icon = dayNightIcon(json.daynight_mode);
     // const label = hasTotalGain ? `${icon} ${json.total_gain}` : (hasBrightness ? `${icon} ${json.daynight_brightness}` : icon);
     const label = hasTotalGain
@@ -1228,26 +1228,33 @@ function updateHeartbeatUi(json) {
     const shabbat = $("#shabbat-indicator");
     if (shabbat) {
       const ready = json.shabbat_ready === true;
-      shabbat.textContent = ready ? "Shabbat: Ready" : "Shabbat: \u2014";
+      shabbat.textContent = ready ? "Shabbat: Ready" : "Shabbat: Not Ready";
       shabbat.classList.toggle("text-bg-success", ready);
       shabbat.classList.toggle("text-bg-secondary", !ready);
     }
   }
 
-  // Update CPU / RAM minimal badge (Batch 2). cpu_load is a 1-min load average;
-  // on this single-core SoC load ~= CPU fraction, so render as ~%.
-  if (typeof json.cpu_load !== "undefined") {
+  // Update CPU / RAM minimal badge. cpu_pct is a real /proc/stat CPU% (0..100).
+  if (typeof json.cpu_pct !== "undefined") {
     const cpu = $("#sys-cpu");
     if (cpu) {
-      const load = Number(json.cpu_load);
-      cpu.textContent = Number.isFinite(load)
-        ? Math.round(load * 100) + "%"
-        : "--";
+      const p = Number(json.cpu_pct);
+      cpu.textContent = Number.isFinite(p) ? p + "%" : "--";
     }
   }
   if (typeof json.mem_used_pct !== "undefined") {
     const mem = $("#sys-mem");
     if (mem) mem.textContent = json.mem_used_pct + "%";
+  }
+  if (
+    typeof json.mem_used_mb !== "undefined" &&
+    typeof json.mem_total_mb !== "undefined"
+  ) {
+    const memMb = $("#sys-mem-mb");
+    if (memMb) {
+      memMb.textContent =
+        "(" + json.mem_used_mb + "/" + json.mem_total_mb + " MB)";
+    }
   }
 }
 

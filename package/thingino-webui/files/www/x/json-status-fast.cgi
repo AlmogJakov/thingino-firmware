@@ -47,24 +47,52 @@ else
 	shabbat=false
 fi
 
-# --- CPU: 1-minute load average (pure read; on a single-core T23N the load is
-#     ~= the CPU fraction, so ~0.25 ~= 25%). No delta/cache needed. ---
-load1=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
-case "$load1" in '' | *[!0-9.]*) load1=0 ;; esac
+# --- Gain (ISP total gain): file read of /proc/jz/isp/isp-m0 (same source as
+#     ha-state). Emit -1 when unreadable so the UI keeps its last value instead
+#     of flashing "---". Providing it here also updates gain at the fast cadence. ---
+gain=$(awk '/total_gain/{print $NF; exit}' /proc/jz/isp/isp-m0 2>/dev/null)
+case "$gain" in '' | *[!0-9-]*) gain=-1 ;; esac
 
-# --- RAM: used% from /proc/meminfo (MemAvailable; fallback free+buffers+cached) ---
+# --- CPU: REAL % from two /proc/stat samples over a short window. Pure reads +
+#     a bounded usleep (no cache, no writes). Matches top-style CPU%; on the
+#     single-core T23N this is 0..100 (load average was misleading -> could show
+#     >100% while actual CPU was ~25%). idle = idle+iowait; busy = total-idle. ---
+set -- $(awk '/^cpu /{print ($2+$3+$4+$5+$6+$7+$8+$9), ($5+$6); exit}' /proc/stat 2>/dev/null)
+cpu_t1=${1:-0}
+cpu_i1=${2:-0}
+usleep 300000 2>/dev/null || sleep 1
+set -- $(awk '/^cpu /{print ($2+$3+$4+$5+$6+$7+$8+$9), ($5+$6); exit}' /proc/stat 2>/dev/null)
+cpu_t2=${1:-0}
+cpu_i2=${2:-0}
+cpu_pct=0
+dt=$((cpu_t2 - cpu_t1))
+di=$((cpu_i2 - cpu_i1))
+[ "$dt" -gt 0 ] && cpu_pct=$(((dt - di) * 100 / dt))
+[ "$cpu_pct" -lt 0 ] 2>/dev/null && cpu_pct=0
+[ "$cpu_pct" -gt 100 ] 2>/dev/null && cpu_pct=100
+
+# --- RAM: used% and used/total MB from /proc/meminfo (MemAvailable; fallback
+#     free+buffers+cached). Pure reads. ---
 mem_total=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null)
 mem_avail=$(awk '/^MemAvailable:/{print $2; exit}' /proc/meminfo 2>/dev/null)
 if [ -z "$mem_avail" ]; then
 	mem_avail=$(awk '/^MemFree:/{f=$2} /^Buffers:/{b=$2} /^Cached:/{c=$2} END{print f+b+c}' /proc/meminfo 2>/dev/null)
 fi
 mem_pct=0
+mem_total_mb=0
+mem_used_mb=0
 case "$mem_total" in
 	'' | 0 | *[!0-9]*) ;;
-	*) [ -n "$mem_avail" ] && mem_pct=$(((mem_total - mem_avail) * 100 / mem_total)) ;;
+	*)
+		mem_total_mb=$((mem_total / 1024))
+		if [ -n "$mem_avail" ]; then
+			mem_pct=$(((mem_total - mem_avail) * 100 / mem_total))
+			mem_used_mb=$(((mem_total - mem_avail) / 1024))
+		fi
+		;;
 esac
 [ "$mem_pct" -lt 0 ] 2>/dev/null && mem_pct=0
 [ "$mem_pct" -gt 100 ] 2>/dev/null && mem_pct=100
 
-printf '{"daynight_mode":"%s","daynight_enabled":%s,"physical_privacy_active":%s,"shabbat_ready":%s,"cpu_load":"%s","mem_used_pct":%d}\n' \
-	"$dn_mode" "$dn_enabled" "$pp" "$shabbat" "$load1" "$mem_pct"
+printf '{"daynight_mode":"%s","daynight_enabled":%s,"physical_privacy_active":%s,"shabbat_ready":%s,"total_gain":%d,"cpu_pct":%d,"mem_used_pct":%d,"mem_used_mb":%d,"mem_total_mb":%d}\n' \
+	"$dn_mode" "$dn_enabled" "$pp" "$shabbat" "$gain" "$cpu_pct" "$mem_pct" "$mem_used_mb" "$mem_total_mb"
