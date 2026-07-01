@@ -131,17 +131,18 @@ dispatch() {
 
 		physical_privacy)
 			# Physical privacy: tilt the lens away + force day (no overlay).
-			# Publish optimistically, then re-sync after the move settles so the
-			# day/night entity reflects the forced/restored mode.
+			# Trigger the lens move FIRST, backgrounded so its ~0.5s guard/LED/mic
+			# setup never delays HA feedback; publish the optimistic state right
+			# after, then re-sync once the move settles for final correctness.
 			case "$payload" in
 				on|ON|1)
+					/sbin/physical-privacy on >/dev/null 2>&1 &
 					ha_pub_state physical_privacy ON
-					/sbin/physical-privacy on >/dev/null 2>&1
 					{ sleep 3; ha-state; } &
 					;;
 				off|OFF|0)
+					/sbin/physical-privacy off >/dev/null 2>&1 &
 					ha_pub_state physical_privacy OFF
-					/sbin/physical-privacy off >/dev/null 2>&1
 					{ sleep 3; ha-state; } &
 					;;
 			esac
