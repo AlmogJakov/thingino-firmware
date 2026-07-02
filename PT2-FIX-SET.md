@@ -849,6 +849,116 @@ All are shell / JS / JSON / Makefile - **no prudynt rebuild**. New cgis are git 
 - `f0fcbca7` feat(webui): add storage usage to the status badge
 - `3b000cd3` fix(webui): RAM% matches busybox free on kernels without MemAvailable
 - `61be971a` feat(webui): CPU badge shows a rolling average (health monitoring)
+- `07791b143` fix(webui): pre-release audit - json-motor RCE, SSE hidden-tab, fast/health split + clock
+
+## 9. Default settings (PT2 device profile)
+
+These change the **factory defaults** baked into a fresh image. They take effect on a full flash /
+factory reset; a config-preserving upgrade keeps the existing `/etc` values. All live in the PT2
+**device override** files, deep-merged via `jct import` at build time (verified recursive merge in
+jct `merge_object_into`: only the listed leaf keys change, every base sibling is preserved). No
+prudynt rebuild.
+
+### 9.1 Streamer / OSD / photosensing / audio -> `configs/cameras/sonoff_pt2_t23n_sc2336p_atbm6012bx/prudynt.json`
+| Setting (Web UI) | json path | Base default | New default |
+|---|---|---|---|
+| Main RTSP Bitrate | `stream0.bitrate` | 3000 | **2048** |
+| Sub RTSP Bitrate | `stream1.bitrate` | 1000 | **1024** |
+| Main OSD Logo | `stream0.osd.logo.enabled` | true | **false** |
+| Sub OSD Logo | `stream1.osd.logo.enabled` | true | **false** |
+| Main OSD time Format | `stream0.osd.time.format` | `%F %T` | **`%d-%m-%Y %T`** |
+| Sub OSD time Format | `stream1.osd.time.format` | `%F %T` | **`%d-%m-%Y %T`** |
+| Photosensing "switch to night above" | `daynight.total_gain_night_threshold` | 3000 | **20000** |
+| Photosensing "switch to day below" | `daynight.total_gain_day_threshold` | 300 | **260** |
+| Speaker volume | `audio.spk_vol` | 80 | **65** |
+| Speaker gain | `audio.spk_gain` | 20 | **25** |
+
+- **RC Mode (Main+Sub) left at CBR.** The user requested SMART, but on the T23N prudynt force-overrides
+  H264 SMART->CBR at encoder init (`IMPEncoder.cpp:369` `LOG_WARN("T23: forcing H264 RC mode SMART -> CBR
+  for encoder stability")`), so SMART is a no-op on this chip. Per the user's decision, mode stays **CBR**
+  (the base default) - no override written.
+- **Photosensing hysteresis** stays valid: day(260) < night(20000); the 260..20000 gap is the intended
+  dead-zone. `night_count_threshold`=6 / `day_count_threshold`=4 still gate a switch. These thresholds are
+  read from prudynt.json and are NOT touched by the 0015 sidecar (which only overrides `daynight.enabled`/
+  `force_mode`).
+- **OSD-format note:** a default is applied at prudynt **startup** (fresh bring-up), so it does NOT hit the
+  live-reconfig VPU freeze. That freeze is triggered only by a *live* UI OSD edit, because the web UI
+  gratuitously attaches a `ThreadVideo` rebuild to every OSD change (`preview.js` `sendOsdUpdate`) -> prudynt
+  `global_restart_video` -> the issue2 T23 teardown/rebuild hazard. A UI-side fix (don't request a video
+  rebuild for pure text/format edits) is a possible follow-up.
+
+### 9.2 Blue LED -> `configs/cameras/sonoff_pt2_t23n_sc2336p_atbm6012bx/thingino.json`
+| Setting | json path | Base | New |
+|---|---|---|---|
+| Blue LED active on boot | `gpio.led_b.active_on_boot` | true | **false** |
+
+- Makes the config match observed reality: the blue LED is already **off** at boot due to a boot-order
+  race - `F00ledd` starts the `ledd` daemon and hands it pin 57 to blink (snapshotting the cold-boot OFF
+  state); `S05led`'s `gpio set 57 1` (which DOES honor `active_on_boot`) is blinked over, then `rm
+  /run/ledd/*` makes `ledd` restore pin 57 to the OFF snapshot. So `active_on_boot=false` = LED off at boot
+  (the desired state). A working boot-**ON** blue LED would need a separate `ledd`-race fix (out of scope;
+  user wants it off).
+
+### Investigation answers (recorded)
+- **`buffers=-1` is intentional** (auto: `max(2,(fps+9)/10)` ring depth, RAM-clamped, floor 2 on T23).
+  NOT changed - forcing `1` would drop below the intended minimum and risk frame stalls / encoder starvation.
+- **"Enable photosensing on boot"** = `daynight.enabled` (auto light-based day/night switching). On this
+  build the persistent boot authority is the `/etc/daynight.state` sidecar (patch 0015 overwrites
+  `daynight.enabled`/`force_mode` from it at load); missing/corrupt sidecar -> forced day (safe). Not changed.
+
+### Files (§9)
+| File (repo path) | Action |
+|---|---|
+| `configs/cameras/sonoff_pt2_t23n_sc2336p_atbm6012bx/prudynt.json` | Modified (+audio/daynight/stream0/stream1 overrides) |
+| `configs/cameras/sonoff_pt2_t23n_sc2336p_atbm6012bx/thingino.json` | Modified (`gpio.led_b.active_on_boot` -> false) |
+
+## 10. Reference-parity fixes (from the 7c43396 comparison)
+
+Compared our tree to the user's older reference firmware (`thingino-firmware-7c43396`, prudynt `3c8e8350`,
+Web UI fast + OSD/LED flawless). Findings adversarially verified; the fixes below are PORTABLE (keep our
+prudynt `f4b32289` + all our features).
+
+### 10.1 OSD live-edit no longer freezes the stream (DONE)
+- **Problem:** editing an OSD field live (e.g. time Format) wedged the stream on a static frame until
+  `S31prudynt restart` (the issue2 T23 VPU freeze). The reference does NOT freeze, but its Web UI is
+  byte-identical (both send `restart_thread: ThreadVideo | ThreadOSD`) - the only difference is the prudynt
+  version (reference `3c8e8350` predates the f4b3228 `global_restart_video` teardown regression).
+- **Fix (webui-only):** `preview.js` `sendOsdUpdate` + `setFont` now send `restart_thread: ThreadOSD` (drop
+  `ThreadVideo`). On f4b3228 the action handler decodes only rtsp/video/audio (`JsonAPI.cpp:1544-1552`);
+  `ThreadOSD` (bit 8) raises NO restart flag, so `global_restart_video`/the teardown never runs -> no freeze.
+  The OSD config write still lands via `handle_osd`, and the OSD worker re-reads text fields live each second
+  (`OSD.cpp:1184`), so time/usertext/uptime + their format/position/color apply within ~1s.
+- **Tradeoff (accepted):** structural OSD changes (enable/disable an item, logo, font/stroke) are saved but
+  apply on the next prudynt restart rather than live - a clear net win over wedging the stream. A future
+  prudynt patch could decode `ThreadOSD` as a real OSD-only re-render (no video teardown) to make those live.
+- **Files:** `package/thingino-webui/files/www/a/preview.js`.
+
+### 10.2 Photosensing "Enable photosensing on boot" checkbox removed (DONE)
+- Under our sidecar model (patch 0015), `/etc/daynight.state` mode is the single source of truth (`auto` =>
+  photosensing active; `day`/`night` => off), enforced at every prudynt load and mirrored by every runtime
+  reader (json-status-fast.cgi, agent adapter, ha-state). The separate `daynight.enabled` checkbox was a
+  pre-sidecar vestige: its saved value is overwritten by 0015 on next load, and it could push a transient
+  live `daynight.enabled` contradicting the sidecar (mode=auto but photosensing paused). **Fix:** removed the
+  checkbox (config-photosensing.html) + dropped `"enabled"` from `dayNightParams` (config-photosensing.js);
+  the dashboard Auto/day/night control (which writes the sidecar) is the single enable/disable path.
+  Thresholds unchanged. **Files:** `config-photosensing.html`, `a/config-photosensing.js`.
+
+### 10.3 Findings recorded (not changed / pending decision)
+- **`buffers` stays `-1` (NOT 1).** Reference used `1` only because its older prudynt (`3c8e8350`) had no auto
+  logic and its validator rejected `-1`. Our f4b3228 `-1` = auto (fps/RAM-scaled, floor 2 on T23) is strictly
+  better; a literal `1` would force one VB below the T23 floor and risk stalls. Unrelated to the reference's
+  UI speed. No change.
+- **Blue-LED boot race (PENDING go).** Reference blinks a sentinel file (`/run/boot`) and stops `ledd` at end
+  of boot, so `S05led` is the last writer. Ours blinks the real per-pin `/run/ledd/57` and never stops `ledd`
+  at boot, so `ledd` clobbers `S05led`'s `gpio set`. Portable fix: in `overlay/etc/init.d/S05led`,
+  `rm -f /run/ledd/$pin` immediately before `gpio set $pin`. (Our default is LED-off, so this only matters if
+  a user sets active-on-boot=true.)
+- **UI-vars display speed (PENDING go + verification).** Reference paints every var from ONE 1s SSE that
+  `cat`s a local cache (`/tmp/heartbeat_cache.json`) maintained by `S99heartbeat`. Ours re-pointed the SSE at
+  the agent (`curl` @5s + warmup) and split vars across channels; our own `S99heartbeat` cache is now
+  orphaned. Portable fix: re-point `json-heartbeat.cgi` back to `cat` the local cache at 1s (agent stays
+  authoritative via `json-heartbeat-slow.cgi`) - but first verify our cache carries every field the reducer
+  expects and understand why it was re-pointed.
 
 ### On-device validation
 - **HA:** the 5 toggles appear in the HA-config page and persist; entities publish; a

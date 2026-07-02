@@ -3,7 +3,6 @@
 
   const endpoint = "/x/json-prudynt.cgi";
   const dayNightParams = [
-    "enabled",
     "total_gain_night_threshold",
     "total_gain_day_threshold",
   ];

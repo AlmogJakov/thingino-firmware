@@ -1211,10 +1211,15 @@ function saveStreamValue(streamId, param) {
 
 // OSD controls
 function sendOsdUpdate(streamId, osdPayload) {
-  // OSD changes require Video + OSD thread restart to take effect immediately
+  // OSD-only refresh: do NOT request a video (encoder/VPU) rebuild. On this T23
+  // build (prudynt f4b3228) global_restart_video tears down the live encoder and
+  // wedges the stream on a static frame (issue2). The OSD worker re-reads text
+  // fields (time/usertext/uptime + their format/position/colors) live every second,
+  // so those apply within ~1s. Structural OSD changes (enable/disable, logo,
+  // font/stroke) are saved and take effect on the next prudynt (re)start.
   const payload = {
     [`stream${streamId}`]: { osd: osdPayload },
-    action: { restart_thread: ThreadVideo | ThreadOSD },
+    action: { restart_thread: ThreadOSD },
   };
   sendToEndpoint(payload);
 }
@@ -1238,10 +1243,14 @@ function setFont(streamId) {
 
   if (Object.keys(payload).length === 0) return;
   console.log(ts(), "setFont for stream", streamId, ":", payload);
-  // Font changes require Video + OSD thread restart for immediate effect
+  // Font/stroke are OSD-region attributes; avoid a video (VPU) rebuild here too
+  // (see sendOsdUpdate) - on the T23 f4b3228 build it wedges the stream. Saved
+  // now, applied on the next prudynt restart. ThreadOSD is currently a no-op flag
+  // (prudynt decodes only rtsp/video/audio) - it marks intent for a future
+  // OSD-only refresh patch.
   const fullPayload = {
     [`stream${streamId}`]: { osd: payload },
-    action: { restart_thread: ThreadVideo | ThreadOSD },
+    action: { restart_thread: ThreadOSD },
   };
   sendToEndpoint(fullPayload);
 }
