@@ -69,7 +69,15 @@ start() {
 
 	save_led_states
 	start_daemon || return 1
-	get_led_records | while IFS=: read -r pin _active_low _active_on_boot; do
+	get_led_records | while IFS=: read -r pin _active_low active_on_boot; do
+		# Leave an active-on-boot LED for S05led to drive ON: do NOT hand it to the
+		# blink daemon. If ledd blinks the pin it fights S05led's `gpio set`, and when
+		# the blink file is removed at end of boot ledd restores the pin to its captured
+		# cold-boot (OFF) state -- clobbering the intended ON. Other LEDs still blink.
+		# (Truthiness matches S05led bool_flag.)
+		case "$active_on_boot" in
+			1 | true | TRUE | on | ON | yes | YES) continue ;;
+		esac
 		echo "$BLINK_INTERVAL" >"$LEDD_DIR/$pin"
 	done
 }

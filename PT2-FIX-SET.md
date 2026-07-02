@@ -948,11 +948,15 @@ prudynt `f4b32289` + all our features).
   logic and its validator rejected `-1`. Our f4b3228 `-1` = auto (fps/RAM-scaled, floor 2 on T23) is strictly
   better; a literal `1` would force one VB below the T23 floor and risk stalls. Unrelated to the reference's
   UI speed. No change.
-- **Blue-LED boot race (PENDING go).** Reference blinks a sentinel file (`/run/boot`) and stops `ledd` at end
-  of boot, so `S05led` is the last writer. Ours blinks the real per-pin `/run/ledd/57` and never stops `ledd`
-  at boot, so `ledd` clobbers `S05led`'s `gpio set`. Portable fix: in `overlay/etc/init.d/S05led`,
-  `rm -f /run/ledd/$pin` immediately before `gpio set $pin`. (Our default is LED-off, so this only matters if
-  a user sets active-on-boot=true.)
+- **Blue-LED boot race (DONE - `F00ledd`).** Reference blinks a sentinel file (`/run/boot`) and stops `ledd`
+  at end of boot, so `S05led` is the last writer. Ours blinks the real per-pin `/run/ledd/57` and never stops
+  `ledd` at boot, so `ledd` clobbers `S05led`'s `gpio set`. **Fix:** in `overlay/etc/init.d/F00ledd`, skip
+  handing an `active_on_boot` LED to the blink daemon (don't write its `/run/ledd/$pin` file), so `ledd` never
+  touches that pin and `S05led` sets it uncontested. Chosen over the `S05led rm-before-set` option because
+  deleting a `/run/ledd/$pin` makes `ledd` RESTORE the pin to its cold-boot OFF snapshot (a delete-then-set
+  race that could re-clobber the ON); never blinking the pin is race-free. Truthiness matches S05led's
+  `bool_flag`; non-active LEDs still blink for boot progress. (Our default is LED-off, so this benefits users
+  who set active-on-boot=true.) File: `overlay/etc/init.d/F00ledd`.
 - **UI-vars display speed (RESOLVED: SSE poll 5s->2s; daemon NOT re-enabled).** Reference paints every var
   from ONE 1s SSE that `cat`s a local cache (`/tmp/heartbeat_cache.json`) maintained by `S99heartbeat`.
   CRITICAL: our `S99heartbeat` is DELIBERATELY DISABLED (commented out in `thingino-webui.mk:62-63`) - it is an
