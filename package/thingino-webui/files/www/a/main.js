@@ -40,13 +40,18 @@ const SlowHeartbeatEndpoint = "/x/json-heartbeat-slow.cgi";
 const SlowHeartbeatPollInterval = 15 * 1000;
 const FastStatusEndpoint = "/x/json-status-fast.cgi";
 const FastStatusPollInterval = 2 * 1000;
+const HealthStatusEndpoint = "/x/json-status-health.cgi";
+const HealthStatusPollInterval = 7 * 1000;
 let fastStatusTimer = null;
 let fastStatusInFlight = false;
+let healthStatusTimer = null;
+let healthStatusInFlight = false;
 let physPrivDesired = null;
 let physPrivDesiredAt = 0;
 let cpuSamples = [];
-const CPU_AVG_WINDOW = 15;
+const CPU_AVG_WINDOW = 12;
 let heartbeatSource = null;
+let heartbeatReconnectTimer = null;
 let slowHeartbeatTimer = null;
 let slowHeartbeatInFlight = false;
 let currentReconnectDelay = HeartBeatReconnectDelay;
@@ -1238,9 +1243,9 @@ function updateHeartbeatUi(json) {
 
   // Update CPU badge. cpu_pct is a real /proc/stat CPU%, but sampled over a short
   // window so it's spiky (per-frame encoder/ISP bursts). For HEALTH monitoring we
-  // show a rolling average over ~15 samples (~30s at the 2s poll) so single spikes
-  // don't register and only SUSTAINED load moves the number. Buffer is in-memory
-  // (no writes) and only fills while the page polls. Amber when sustained-high.
+  // show a rolling average over ~12 samples (~84s at the 7s health cadence) so
+  // single spikes don't register and only SUSTAINED load moves the number. Buffer
+  // is in-memory (no writes) and only fills while the page polls. Amber when high.
   if (typeof json.cpu_pct !== "undefined") {
     const cpu = $("#sys-cpu");
     if (cpu) {
@@ -1315,7 +1320,10 @@ function startHeartbeatSse() {
     heartbeatSource.close();
     heartbeatSource = null;
     console.log(`Reconnecting in ${currentReconnectDelay / 1000}s`);
-    setTimeout(heartbeat, currentReconnectDelay); // Use heartbeat() instead of startHeartbeatSse()
+    // Track the reconnect timer so cleanupHeartbeatResources() can cancel it; an
+    // untracked timer could otherwise reopen the SSE on a hidden/closed tab.
+    if (heartbeatReconnectTimer) clearTimeout(heartbeatReconnectTimer);
+    heartbeatReconnectTimer = setTimeout(heartbeat, currentReconnectDelay);
     // Double the delay for next failure, capped at max
     currentReconnectDelay = Math.min(
       currentReconnectDelay * 2,
@@ -1459,10 +1467,69 @@ function startFastStatus() {
   fetchFastStatus();
 }
 
+// Health channel: CPU / RAM / storage. Split off the 2s fast channel onto a
+// slower ~7s cadence (these metrics don't need 2s freshness and the CPU sample
+// costs a short in-request window). Read-only, browser-visible-only (self-gated
+// on document.hidden), single-in-flight, no writes, no daemon.
+async function fetchHealthStatus() {
+  if (
+    healthStatusInFlight ||
+    !passwordCheckComplete ||
+    isDefaultPassword ||
+    document.hidden
+  ) {
+    return;
+  }
+
+  healthStatusInFlight = true;
+
+  try {
+    const response = await fetch(HealthStatusEndpoint, {
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+    if (response.ok) {
+      updateHeartbeatUi(await response.json());
+    }
+  } catch (error) {
+    // Best-effort: health badges keep their last value on failure.
+  } finally {
+    healthStatusInFlight = false;
+    scheduleHealthStatus();
+  }
+}
+
+function scheduleHealthStatus(delay = HealthStatusPollInterval) {
+  if (healthStatusTimer) {
+    clearTimeout(healthStatusTimer);
+    healthStatusTimer = null;
+  }
+
+  if (!passwordCheckComplete || isDefaultPassword || document.hidden) {
+    return;
+  }
+
+  healthStatusTimer = setTimeout(() => {
+    healthStatusTimer = null;
+    fetchHealthStatus();
+  }, delay);
+}
+
+function startHealthStatus() {
+  if (healthStatusTimer || healthStatusInFlight) {
+    return;
+  }
+  fetchHealthStatus();
+}
+
 function cleanupHeartbeatResources() {
   if (heartbeatSource) {
     heartbeatSource.close();
     heartbeatSource = null;
+  }
+  if (heartbeatReconnectTimer) {
+    clearTimeout(heartbeatReconnectTimer);
+    heartbeatReconnectTimer = null;
   }
   if (slowHeartbeatTimer) {
     clearTimeout(slowHeartbeatTimer);
@@ -1472,8 +1539,13 @@ function cleanupHeartbeatResources() {
     clearTimeout(fastStatusTimer);
     fastStatusTimer = null;
   }
+  if (healthStatusTimer) {
+    clearTimeout(healthStatusTimer);
+    healthStatusTimer = null;
+  }
   slowHeartbeatInFlight = false;
   fastStatusInFlight = false;
+  healthStatusInFlight = false;
   currentReconnectDelay = HeartBeatReconnectDelay;
 }
 
@@ -1503,9 +1575,16 @@ function heartbeat() {
     console.log("Heartbeat disabled: default password in use");
     return;
   }
+  // Don't (re)open SSE or start pollers on a hidden/backgrounded tab. A queued
+  // reconnect timer that fires after the tab is hidden must not resurrect any
+  // device-load channel; resume happens via visibilitychange when shown again.
+  if (document.hidden) {
+    return;
+  }
   startHeartbeatSse();
   startSlowHeartbeatStatus();
   startFastStatus();
+  startHealthStatus();
 }
 
 function initCopyToClipboard() {

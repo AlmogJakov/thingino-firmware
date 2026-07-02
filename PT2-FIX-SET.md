@@ -7,8 +7,11 @@ is **not** installed into the firmware image.
 
 > Hardware/role: pan-tilt **life-safety** camera. Ingenic **T23N**, **SC2336P** sensor,
 > **ir850-only** illuminator, stepper PTZ. Software path: Thingino + **prudynt**
-> (`f4b3228`, live555 RTSP) → go2rtc → WebRTC / Home Assistant. The RTSP stream **must**
-> come up after every reboot and every unclean power loss, and stay up.
+> (`f4b3228`, live555 RTSP) → *(off-camera)* go2rtc → WebRTC / Home Assistant. go2rtc is
+> **not** built into or run on this camera (absent from the PT2 defconfig; verified on-device:
+> no binary, init script, process, or listening port). It runs on a **separate LAN host** that
+> consumes the camera's RTSP. The RTSP stream **must** come up after every reboot and every
+> unclean power loss, and stay up.
 
 ---
 
@@ -271,6 +274,13 @@ stock build has no watchdog. We add it via the overlay (no `.mk` change needed).
   verification (`set_ircut_verified` / `set_light_verified`), propagates the real exit code,
   removes the white-LED day/night branches (white is manual-only), and early-returns on a
   same-mode request. A privacy-active gate keeps IR off in night while privacy is armed.
+- **Read-back scope (this board is dual-pin, `gpio.ircut="17 16"`):** the IR LEDs and any
+  single-pin IR-cut expose a real GPIO level, so verification is physical there. The **dual-pin
+  IR-cut latch has no GPIO read-back**, so `set_ircut_verified` can only confirm the `ircut`
+  **invocation** ran (it catches a crashed/missing call), not that the mechanical latch physically
+  flipped; `ircut read` reflects the last commanded state (`/tmp/ircutmode.txt`). A dropped pulse on
+  a healthy latch is therefore not software-detectable — an accepted HW limitation, behavior
+  unchanged (see memory `ircut-dualpin-verify-lies`).
 - **Files:** `package/prudynt-t/files/daynight`.
 - **Notes:** the executor **does not write flash** (it reads config and drives GPIO/runtime),
   so automatic dusk↔dawn switching is flash-free.
@@ -344,8 +354,12 @@ stock build has no watchdog. We add it via the overlay (no `.mk` change needed).
 - **Recovery model (life-safety):** the codec change is the **only** non-recovering case, because it is
   the only event that changes the negotiated codec. Every **involuntary** disruption (reboot, power-cut,
   network drop, prudynt crash/wedge/restart) keeps the same codec → go2rtc reconnects and re-binds both
-  tracks → audio+video recover. Prerequisite: go2rtc itself must be supervised (auto-restart),
-  complementing prudynt fail-fast (§A) + watchdog (§B).
+  tracks → audio+video recover. Prerequisite: the **off-camera** go2rtc must be supervised
+  (auto-restart) **on its own host** — go2rtc is not installed or run on this camera, so on-camera
+  supervision is out of scope. The camera's responsibility is to keep prudynt's RTSP (`:554`) up,
+  which the watchdog (§B) probes directly, complementing prudynt fail-fast (§A). (Confirmed in the
+  pre-release audit — see §8.7 — that go2rtc is not in the PT2 image, so the earlier "unsupervised
+  go2rtc" finding is not applicable to the firmware.)
 
 ### H. Live-reconfig / stream seamlessness (T23)
 - **Problem:** stream-config changes could freeze the VPU or drop the stream.
@@ -686,14 +700,14 @@ while a page is open, so it adds zero device load when nobody is viewing the UI.
 ### 8.4 Fast status channel - READ-ONLY, page-open-only (`a335b044d`)
 - New `/x/json-status-fast.cgi` sources **only** `/run`, `/proc`, and existing state
   files (the day/night sidecar, `physical-privacy-state.json`, `prudynt.json` via
-  `jct get`; `/proc/stat`, `/proc/meminfo`, `/proc/jz/isp/isp-m0`, `df /`). It **never**
-  calls `prudyntctl`, never talks to the agent, and **writes nothing** (no flash wear,
-  no `/tmp` cache, no state rewrite). `main.js` polls it ~2 s **only while the page is
-  visible** (gated on `document.hidden`; torn down on `pagehide`/`beforeunload`), so a
-  closed/hidden tab produces zero device load.
-- Carries day/night (fixes the ~5-10 s lag), physical-privacy, shabbat, gain
-  (`total_gain` - also fixing a reducer flicker where a mode-only update blanked it to
-  "---"), CPU, RAM and Storage.
+  `jct get`; `/proc/jz/isp/isp-m0`). It **never** calls `prudyntctl`, never talks to the
+  agent, and **writes nothing** (no flash wear, no `/tmp` cache, no state rewrite).
+  `main.js` polls it ~2 s **only while the page is visible** (gated on `document.hidden`;
+  torn down on `pagehide`/`beforeunload`), so a closed/hidden tab produces zero device load.
+- Carries the fast-changing **UI state**: day/night (fixes the ~5-10 s lag),
+  physical-privacy, shabbat, gain (`total_gain` - also fixing a reducer flicker where a
+  mode-only update blanked it to "---"). It does **no** in-request sleep. CPU / RAM /
+  Storage were later split onto the slower health channel (§8.7).
 - **Speaker + Mic** stay on the pre-existing `prudyntctl` mic-poll (both runtime-only;
   `spk_enabled` is **not** persisted to `prudynt.json`, confirmed on device), with
   `spk_enabled` folded into that **same** existing 15 s query - no new fork.
@@ -704,9 +718,10 @@ while a page is open, so it adds zero device load when nobody is viewing the UI.
 - **CPU** (`2e6a51cf`, `61be971a`): a 1-min **load average was misleading** (it showed
   ~332 % while real CPU was ~25 %). Now a real `/proc/stat` delta (idle = idle+iowait,
   busy = total-idle, clamped 0-100), then a **browser-side rolling average** of the last
-  ~15 samples (~30 s) shown as `CPU avg NN%` so single per-frame bursts don't register
-  and only **sustained** load moves it; it turns amber at a sustained avg ≥ 90 %. Still
-  the real total system CPU; averaging is JS-only (no writes, no daemon, page-open-only).
+  ~12 samples (~84 s at the ~7 s health cadence, see §8.7) shown as `CPU avg NN%` so single
+  per-frame bursts don't register and only **sustained** load moves it; it turns amber at a
+  sustained avg ≥ 90 %. Still the real total system CPU; averaging is JS-only (no writes, no
+  daemon, page-open-only).
 - **RAM** (`2e6a51cf`, `3b000cd3`): used% + used/total MB from `/proc/meminfo`. This
   Ingenic kernel has **no `MemAvailable`**, so the fallback is
   `MemFree+Buffers+Cached+SReclaimable` (matches busybox `free`'s used-excluding-cache;
@@ -730,6 +745,78 @@ while a page is open, so it adds zero device load when nobody is viewing the UI.
   close; `nohup` fallback) + CRLF headers; `footer.js` records prudynt's pid then polls
   new `/x/prudynt-status.cgi` until a **new** pid appears (restart truly complete, ~17 s,
   30 s cap) before reloading. Files: `restart-prudynt.cgi`, `footer.js`, `prudynt-status.cgi`.
+
+### 8.7 Pre-release audit fixes (verified review)
+A 7-dimension adversarial audit + verification pass before public release (see memory
+`pre-release-audit-verified`). Confirmed items are fixed here; false positives and
+pre-existing/accepted items are recorded so a reviewer does not "re-fix" them.
+
+- **go2rtc supervision - NOT APPLICABLE (verified false positive).** go2rtc is **not** in the
+  PT2 build: absent from the defconfig, `package/go2rtc/Config.in` has no `default y`, and
+  on-device there is no binary, init script, process, or listening port. `thingino-ha` never
+  references it; the only Web UI WebRTC path (`preview-raptor.html` + `webrtc-whip.cgi`) belongs
+  to the `thingino-raptor` streamer variant, which PT2 does **not** select (it ships plain
+  `preview.html` = MJPEG/RTSP). go2rtc runs on a **separate LAN host**; supervising it is that
+  host's concern. Action: **none on-camera** (already uninstalled); doc corrected (header + §G).
+
+- **[BLOCKER - fixed] `json-motor.cgi` command injection → root RCE.** The endpoint parsed the
+  query with `eval $(echo "$QUERY_STRING" | sed "s/&/;/g")` = arbitrary shell as root. Pre-existing
+  upstream, but this branch newly wires an authenticated caller to it (PTZ Home button → `?d=r`),
+  so it is a release blocker for PT2. **Fix:** replaced the `eval` with a safe `IFS='&'` field-parse
+  loop (`set -f` around the split to disable glob expansion of `$QUERY_STRING`; only `d`/`x`/`y`
+  recognized), kept the existing `case "$d"` verb allow-list as the trust boundary, and constrained
+  `x`/`y` to numeric chars (`'' | *[!0-9.-]*` → `0`). PTZ behavior is
+  unchanged: verb routing identical, fractional/negative `d=g` moves preserved, `d=x` still returns
+  "unsupported" exactly as before (no scope creep). Verified: `sh -n` clean; injection payloads
+  (`;touch`, `$(...)`, backticks, `|rm -rf /`) execute nothing and are rejected/zeroed. No flash
+  writes. File: `www/x/json-motor.cgi`.
+
+- **[minor - fixed] SSE reconnect could resurrect on a hidden tab.** The heartbeat SSE `onerror`
+  scheduled `setTimeout(heartbeat, …)` into an **untracked** timer, so `cleanupHeartbeatResources()`
+  (run on `visibilitychange`→hidden) could not cancel it and a late-firing timer reopened the
+  EventSource (one 5 s server-side curl loop) on a hidden tab - breaking the "zero load when hidden"
+  contract. (The 2 s/15 s pollers did **not** resume - they self-gate on `document.hidden`.) **Fix:**
+  track the timer in `heartbeatReconnectTimer`, clear it in `cleanupHeartbeatResources()`, and
+  early-return `heartbeat()` when `document.hidden`. No polling or reconnect while hidden/closed.
+  File: `main.js`.
+
+- **[overhead - fixed] Split CPU/RAM/Storage onto a slower cadence.** The 2 s fast channel computed
+  CPU via a 300 ms in-request `usleep` and parsed `/proc/meminfo` + `df` every poll; these health
+  metrics do not need 2 s freshness. **Fix:** the fast channel (`json-status-fast.cgi`, ~2 s) now
+  carries **UI state only** (day/night, physical-privacy, shabbat, gain) with **no in-request
+  sleep**; CPU/RAM/Storage moved to a new **`json-status-health.cgi`** polled at **~7 s**. Both
+  channels are read-only, single-in-flight, and page-visible-only (`document.hidden` gated, torn down
+  on hide/unload) - no writes, no daemon, no background load when not viewing. CPU rolling-average
+  window ≈ 12 samples (~84 s at 7 s). Files: `json-status-fast.cgi` (trimmed), `json-status-health.cgi`
+  (new), `main.js`, `thingino-webui.mk` (installs the new CGI, `-m 0755`).
+- **[first-paint - fixed] Date/hour on the health channel + immediate first fetch.** After reboot the
+  Web UI clock (`#time-now`) lagged ~7-12 s because `time_now` came **only** from the agent SSE, whose
+  first streamed event is late even when the agent itself answers a one-shot `curl` in <2 s (the file
+  CGIs and the `window.load` gate were measured fast - 262 ms load, <0.3 s CGIs - so neither was the
+  cause). **Fix:** `json-status-health.cgi` now also emits `time_now` = the **camera's own** `date +%s`
+  (JSON number, or `null` if unavailable → reducer keeps its last value); the reducer already applies
+  the configured timezone via `resolveDeviceTimezone()`, so this is device-authoritative time, **not** a
+  browser-local clock. It rides the health channel (not the 2 s fast path) by request. The health
+  channel's first fetch runs **immediately** on page open/visible (`heartbeat()` → `startHealthStatus()`
+  → `fetchHealthStatus()`, no pre-wait), then repeats every ~7 s, and stops completely when hidden/closed
+  (`cleanupHeartbeatResources()` on `visibilitychange`/`pagehide`/`beforeunload`; `heartbeat()` self-guards
+  on `document.hidden`). So Date/CPU/RAM/Storage all paint on the first health fetch (<1 s) after open.
+  Note: **Gain** was independently made fast by the split above - `json-status-fast.cgi` emits `total_gain`
+  from `/proc/jz/isp/isp-m0`, so on the current (pre-flash) build gain rides the slow agent SSE, but the
+  pending build paints it from the fast file channel. File: `json-status-health.cgi`.
+
+- **[pre-existing - documented, no code change] Dual-pin IR-cut has no HW read-back** - see §E's
+  read-back-scope note and memory `ircut-dualpin-verify-lies`. Behavior unchanged.
+
+- **[pre-existing - accepted, no code change] Boot privacy-semantics window (~100 s)** after power
+  loss during privacy - already documented (§E; `physical-privacy` header). Behavior unchanged.
+
+- **Not done (by request): cross-boot reboot circuit-breaker.** The audit flagged that
+  `S32prudyntwd`'s restart budget is process-local and resets each boot (a deterministic,
+  reboot-surviving bringup fault could slow-loop). **Deferred** - it would need a new persistent
+  counter (U-Boot env), and no new persistent writes are being added without approval. Allowed
+  persistent writes remain `/etc/daynight.state`, `/etc/physical-privacy-state.json`, and normal
+  explicit config saves only.
 
 ### Files (Batch 1 & 2)
 | File (repo path) | Action | Installs to (device) |

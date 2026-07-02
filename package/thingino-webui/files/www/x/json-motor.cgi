@@ -46,11 +46,30 @@ json_ok() {
   exit 0
 }
 
-[ -n "$QUERY_STRING" ] && eval $(echo "$QUERY_STRING" | sed "s/&/;/g")
+# Parse QUERY_STRING safely (NO eval). Only d/x/y are recognized; d is
+# allow-listed by the case below, x/y are constrained to numeric characters.
+# This prevents shell/command injection via the query string.
+OLD_IFS=$IFS
+IFS='&'
+set -f  # disable glob expansion of $QUERY_STRING during the split
+for KV in $QUERY_STRING; do
+  case "$KV" in
+    d=*) d=${KV#d=} ;;
+    x=*) x=${KV#x=} ;;
+    y=*) y=${KV#y=} ;;
+  esac
+done
+set +f
+IFS=$OLD_IFS
 
 [ -z "$x" ] && x=0
 [ -z "$y" ] && y=0
 [ -z "$d" ] && d="g"
+
+# Coordinates must be numeric only (digits, optional sign/decimal); reject any
+# value containing shell metacharacters. d is validated by the case below.
+case "$x" in '' | *[!0-9.-]*) x=0 ;; esac
+case "$y" in '' | *[!0-9.-]*) y=0 ;; esac
 
 emit_status() {
   local payload
