@@ -305,7 +305,7 @@
         try {
           const daynight = {};
 
-          // Collect all daynight parameters (enabled, thresholds)
+          // Collect the daynight threshold parameters
           dayNightParams.forEach((param) => {
             const el = $("#daynight_" + param);
             if (el) {

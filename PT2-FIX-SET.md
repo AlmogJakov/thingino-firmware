@@ -896,8 +896,9 @@ prudynt rebuild.
   race - `F00ledd` starts the `ledd` daemon and hands it pin 57 to blink (snapshotting the cold-boot OFF
   state); `S05led`'s `gpio set 57 1` (which DOES honor `active_on_boot`) is blinked over, then `rm
   /run/ledd/*` makes `ledd` restore pin 57 to the OFF snapshot. So `active_on_boot=false` = LED off at boot
-  (the desired state). A working boot-**ON** blue LED would need a separate `ledd`-race fix (out of scope;
-  user wants it off).
+  (the desired state). **Update:** the `ledd`-race fix has since been implemented (§10.3 - `F00ledd` skips
+  handing active-on-boot LEDs to the blink daemon), so setting `active_on_boot=true` now keeps the blue LED ON
+  at boot; for the shipped default (`false`) the pin is simply left off.
 
 ### Investigation answers (recorded)
 - **`buffers=-1` is intentional** (auto: `max(2,(fps+9)/10)` ring depth, RAM-clamped, floor 2 on T23).
@@ -957,7 +958,7 @@ prudynt `f4b32289` + all our features).
   race that could re-clobber the ON); never blinking the pin is race-free. Truthiness matches S05led's
   `bool_flag`; non-active LEDs still blink for boot progress. (Our default is LED-off, so this benefits users
   who set active-on-boot=true.) File: `overlay/etc/init.d/F00ledd`.
-- **UI-vars display speed (RESOLVED: SSE poll 5s->2s; daemon NOT re-enabled).** Reference paints every var
+- **UI-vars display speed (RESOLVED: SSE kept on-demand at 5s + daynight/gain de-duped; daemon NOT re-enabled).** Reference paints every var
   from ONE 1s SSE that `cat`s a local cache (`/tmp/heartbeat_cache.json`) maintained by `S99heartbeat`.
   CRITICAL: our `S99heartbeat` is DELIBERATELY DISABLED (commented out in `thingino-webui.mk:62-63`) - it is an
   ALWAYS-ON 1 Hz daemon that calls `prudyntctl` every second regardless of viewing (continuous idle load); our
@@ -967,8 +968,12 @@ prudynt `f4b32289` + all our features).
   are ALREADY fast via the on-demand file channels (§8.4-8.7); the remaining agent-SSE vars (uptime/rec/motion/
   wg/ir states) change slowly and first-paint in ~1-2 s once the agent is up (the 7-12 s was agent warmup after
   reboot, which an always-on daemon would not fix either). DECISION: keep the on-demand agent SSE (zero idle
-  load) but reduce its poll from 5 s to 2 s (`json-heartbeat.cgi` `HEARTBEAT_INTERVAL` 5->2) so SSE vars refresh
-  faster WHILE VIEWING, still zero when idle. File: `package/thingino-webui/files/www/x/json-heartbeat.cgi`.
+  load) at **5 s**. A brief experiment dropped the SSE poll to 2 s, but the expanded review found the agent
+  heartbeat is the HEAVIEST channel (a `prudyntctl` IPC + ~a dozen forks + four `light/ircut read` execs per
+  beat), so 2 s tripled that while-viewing load for slow-changing vars that don't need it -> reverted to 5 s.
+  Additionally, `daynight_mode`/`daynight_enabled`/`total_gain` were removed from the agent heartbeat payload
+  (they are served by the fast file channel `json-status-fast.cgi`) to stop double reducer updates + badge
+  flicker and shrink the heartbeat. Files: `json-heartbeat.cgi` (5 s), `thingino-agent-adapter-prudynt` (de-dup).
 
 ### On-device validation
 - **HA:** the 5 toggles appear in the HA-config page and persist; entities publish; a

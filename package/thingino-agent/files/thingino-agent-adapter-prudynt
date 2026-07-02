@@ -1200,7 +1200,6 @@ thingino_agent_adapter_prudynt_get_runtime() {
 		heartbeat)
 			thingino_agent_prudynt_query_live
 			_brightness=$(thingino_agent_prudynt_heartbeat_brightness)
-			_daynight_mode=$(thingino_agent_prudynt_daynight_running_mode)
 			_ircut_state=$(thingino_agent_prudynt_heartbeat_hw_state ircut)
 			_ir850_state=$(thingino_agent_prudynt_heartbeat_hw_state "light ir850")
 			_ir940_state=$(thingino_agent_prudynt_heartbeat_hw_state "light ir940")
@@ -1210,8 +1209,9 @@ thingino_agent_adapter_prudynt_get_runtime() {
 			printf '"time_now":%s,' "$(date +%s)"
 			printf '"uptime":%s,' "$(thingino_agent_uptime_seconds)"
 			printf '"daynight_brightness":%s,' "$(thingino_agent_json_string_or_null "$_brightness")"
-			printf '"total_gain":%s,' "$(thingino_agent_json_value_or "${_heartbeat_total_gain:-}" null)"
-			printf '"daynight_mode":%s,' "$(thingino_agent_json_string_or_null "$_daynight_mode")"
+			# total_gain / daynight_mode / daynight_enabled are served by the Web UI fast
+			# file channel (json-status-fast.cgi); omitted here to avoid double reducer
+			# updates + badge flicker and to keep this heartbeat cheaper.
 			printf '"rec_ch0":%s,' "$(thingino_agent_prudynt_stream_recording_active 0)"
 			printf '"rec_ch1":%s,' "$(thingino_agent_prudynt_stream_recording_active 1)"
 			printf '"motion_enabled":%s,' "$(thingino_agent_prudynt_motion_active)"
@@ -1219,7 +1219,6 @@ thingino_agent_adapter_prudynt_get_runtime() {
 			printf '"color_mode":%s,' "$(thingino_agent_json_value_or "${_heartbeat_color_mode:-}" null)"
 			printf '"mic_enabled":%s,' "$(thingino_agent_json_value_or "${_heartbeat_mic_enabled:-}" false)"
 			printf '"spk_enabled":%s,' "$(thingino_agent_json_value_or "${_heartbeat_spk_enabled:-}" false)"
-			printf '"daynight_enabled":%s,' "$(thingino_agent_prudynt_daynight_enabled)"
 			printf '"ircut_state":%s,' "$_ircut_state"
 			printf '"ir850_state":%s,' "$_ir850_state"
 			printf '"ir940_state":%s,' "$_ir940_state"
