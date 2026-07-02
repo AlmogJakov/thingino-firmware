@@ -17,7 +17,7 @@ agent_port() {
 }
 
 AGENT_URL="http://127.0.0.1:$(agent_port)"
-HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-5}"
+HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-2}"
 HEARTBEAT_RETRY_MS=$((HEARTBEAT_INTERVAL * 1000))
 
 http_200() { printf 'Status: 200 OK\r\n'; }

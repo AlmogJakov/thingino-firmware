@@ -953,12 +953,18 @@ prudynt `f4b32289` + all our features).
   at boot, so `ledd` clobbers `S05led`'s `gpio set`. Portable fix: in `overlay/etc/init.d/S05led`,
   `rm -f /run/ledd/$pin` immediately before `gpio set $pin`. (Our default is LED-off, so this only matters if
   a user sets active-on-boot=true.)
-- **UI-vars display speed (PENDING go + verification).** Reference paints every var from ONE 1s SSE that
-  `cat`s a local cache (`/tmp/heartbeat_cache.json`) maintained by `S99heartbeat`. Ours re-pointed the SSE at
-  the agent (`curl` @5s + warmup) and split vars across channels; our own `S99heartbeat` cache is now
-  orphaned. Portable fix: re-point `json-heartbeat.cgi` back to `cat` the local cache at 1s (agent stays
-  authoritative via `json-heartbeat-slow.cgi`) - but first verify our cache carries every field the reducer
-  expects and understand why it was re-pointed.
+- **UI-vars display speed (RESOLVED: SSE poll 5s->2s; daemon NOT re-enabled).** Reference paints every var
+  from ONE 1s SSE that `cat`s a local cache (`/tmp/heartbeat_cache.json`) maintained by `S99heartbeat`.
+  CRITICAL: our `S99heartbeat` is DELIBERATELY DISABLED (commented out in `thingino-webui.mk:62-63`) - it is an
+  ALWAYS-ON 1 Hz daemon that calls `prudyntctl` every second regardless of viewing (continuous idle load); our
+  branch replaced it with the on-demand agent SSE (zero load when not viewing) per the zero-idle-load design.
+  Re-pointing the SSE to the cache would require re-enabling that always-on daemon = 24/7 background load,
+  contradicting that design. Also, the vars actually reported slow (date/gain/CPU/RAM/day-night/mic-speaker)
+  are ALREADY fast via the on-demand file channels (§8.4-8.7); the remaining agent-SSE vars (uptime/rec/motion/
+  wg/ir states) change slowly and first-paint in ~1-2 s once the agent is up (the 7-12 s was agent warmup after
+  reboot, which an always-on daemon would not fix either). DECISION: keep the on-demand agent SSE (zero idle
+  load) but reduce its poll from 5 s to 2 s (`json-heartbeat.cgi` `HEARTBEAT_INTERVAL` 5->2) so SSE vars refresh
+  faster WHILE VIEWING, still zero when idle. File: `package/thingino-webui/files/www/x/json-heartbeat.cgi`.
 
 ### On-device validation
 - **HA:** the 5 toggles appear in the HA-config page and persist; entities publish; a
