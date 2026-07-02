@@ -6,7 +6,7 @@
     "led_b": {
       "pin": 57,
       "active_low": false,
-      "active_on_boot": true
+      "active_on_boot": false
     },
     "mmc_cd": 49,
     "mmc_power": {

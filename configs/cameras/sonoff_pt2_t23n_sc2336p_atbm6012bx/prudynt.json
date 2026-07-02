@@ -1,6 +1,36 @@
 {
+    "audio": {
+        "spk_gain": 25,
+        "spk_vol": 65
+    },
+    "daynight": {
+        "total_gain_day_threshold": 260,
+        "total_gain_night_threshold": 20000
+    },
     "image": {
         "hflip": true,
         "vflip": true
+    },
+    "stream0": {
+        "bitrate": 2048,
+        "osd": {
+            "logo": {
+                "enabled": false
+            },
+            "time": {
+                "format": "%d-%m-%Y %T"
+            }
+        }
+    },
+    "stream1": {
+        "bitrate": 1024,
+        "osd": {
+            "logo": {
+                "enabled": false
+            },
+            "time": {
+                "format": "%d-%m-%Y %T"
+            }
+        }
     }
 }
