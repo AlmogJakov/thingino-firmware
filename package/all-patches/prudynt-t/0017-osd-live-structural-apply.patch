@@ -1,0 +1,187 @@
+Subject: [PATCH] T23: apply structural OSD changes (enable/disable + logo) live, no encoder teardown
+Target: prudynt-t @ f4b32289359d176fb0795d9f3735af0bd9d6d2fd (branch stable)
+Stacks on: 0001-0016 (no prior patch touches OSD.cpp/OSD.hpp).
+Applies with git apply -p1 / patch -p1 AFTER 0001-0016.
+
+==== Why ====
+The Web UI sends action.restart_thread=ThreadOSD (bit 8) for OSD edits, but f4b3228
+handle_action decodes only bits 1/2/4 (rtsp/video/audio), so item enable/disable and
+logo on/off persist to config but are NOT applied until the next prudynt restart. The
+reference firmware applied them live via global_restart_video (a full encoder/VPU
+rebuild) -- which on T23 f4b3228 is the issue2 VPU freeze (see 0002/0003). We must apply
+these changes at the OSD-region layer ONLY, never touching the encoder/framesource/VPU
+or the OSD group binding.
+
+==== What ====
+1) OSD::init(): create the time/usertext/uptime/logo regions UNCONDITIONALLY (was: only
+   if enabled) and set the group region 'show' flag = <item>_enabled ? 1 : 0. All in-scope
+   regions therefore exist after init, disabled ones simply hidden. (brightness unchanged.)
+2) New OSD::applyStructural(): toggles each created region's visibility with
+   IMP_OSD_ShowRgn(rgn, osdGrp, enabled?1:0). No CreateRgn/DestroyRgn/DestroyGroup at
+   runtime -> cannot hit the issue2 bound-node-destroy freeze.
+3) video_stream gains std::atomic<bool> osd_reinit (mirrors 0004's req_*/reconfig idiom).
+4) JsonAPI handle_action decodes bit 8 (ThreadOSD) -> sets osd_reinit=true on every
+   video stream (NOT global_restart_video).
+5) OSD::thread_entry consumes osd_reinit.exchange(false) on the OSD worker thread (the
+   only thread that calls IMP_OSD_*) and runs applyStructural() -> live within ~100ms.
+
+SCOPE / NOT covered (still need a streamer restart): font_size / stroke_size live (needs
+libschrift re-init + glyph-cache clear), and turning a stream's WHOLE OSD on from fully
+off (no OSD object/worker exists when stream.osd.enabled=false at encoder create).
+
+NOTE: UNTESTED on-device at time of authoring. Must be built (prudynt-binary CI) and
+verified on hardware (toggle each OSD item live + confirm the stream never freezes)
+before relying on it. Rollback = delete this file (reverts to apply-on-restart, safe).
+
+diff --git a/src/OSD.hpp b/src/OSD.hpp
+--- a/src/OSD.hpp
++++ b/src/OSD.hpp
+@@ -46,6 +46,7 @@
+   void init();
+   int exit();
+   int start();
++  void applyStructural();
+ 
+   void updateDisplayEverySecond();
+   static void *thread_entry(void *arg);
+diff --git a/src/globals.hpp b/src/globals.hpp
+--- a/src/globals.hpp
++++ b/src/globals.hpp
+@@ -231,6 +231,10 @@
+   std::atomic<int> req_qp_max{-1};
+   std::atomic<bool> reconfig{false};
+ #endif
++  // Live OSD structural apply: toggle region visibility (enable/disable) via
++  // IMP_OSD_ShowRgn on the OSD worker thread, NO encoder/group teardown. Set by
++  // JsonAPI handle_action on the ThreadOSD bit; consumed by OSD::thread_entry. (0017)
++  std::atomic<bool> osd_reinit{false};
+   bool active{false};
+   IMPEncoder *imp_encoder;
+   IMPFramesource *imp_framesource;
+diff --git a/src/JsonAPI.cpp b/src/JsonAPI.cpp
+--- a/src/JsonAPI.cpp
++++ b/src/JsonAPI.cpp
+@@ -1550,6 +1550,10 @@
+       global_restart_video = true;
+     if (mask & 4)
+       global_restart_audio = true;
++    if (mask & 8) // ThreadOSD: apply structural OSD changes live (0017); NOT a video rebuild
++      for (auto v : global_video)
++        if (v != nullptr)
++          v->osd_reinit = true;
+     add_key(out, s2, "restart_thread");
+     add_str(out, "ok");
+     wrote = true;
+diff --git a/src/OSD.cpp b/src/OSD.cpp
+--- a/src/OSD.cpp
++++ b/src/OSD.cpp
+@@ -854,8 +854,8 @@
+     LOG_ERROR("libschrift init failed; text OSD regions will be disabled");
+   }
+ 
+-  if (osd.time_enabled && text_rendering_available) {
+-    /* OSD Time */
++  if (text_rendering_available) {
++    /* OSD Time (created always; shown per osd.time_enabled for live toggle) */
+ 
+     osdTime.data = nullptr;
+     osdTime.imp_rgn = IMP_OSD_CreateRgn(nullptr);
+@@ -881,7 +881,7 @@
+ 
+     IMPOSDGrpRgnAttr grpRgnAttr;
+     memset(&grpRgnAttr, 0, sizeof(IMPOSDGrpRgnAttr));
+-    grpRgnAttr.show = 1;
++    grpRgnAttr.show = osd.time_enabled ? 1 : 0;
+     grpRgnAttr.layer = 1;
+     grpRgnAttr.gAlphaEn = 1; // Enable alpha blending for per-pixel transparency
+     grpRgnAttr.fgAlhpa =
+@@ -890,7 +890,7 @@
+     IMP_OSD_SetGrpRgnAttr(osdTime.imp_rgn, osdGrp, &grpRgnAttr);
+   }
+ 
+-  if (osd.usertext_enabled && text_rendering_available) {
++  if (text_rendering_available) {
+     getIp(ip);
+     gethostname(hostname, 64);
+ 
+@@ -931,7 +931,7 @@
+ 
+     IMPOSDGrpRgnAttr grpRgnAttr;
+     memset(&grpRgnAttr, 0, sizeof(IMPOSDGrpRgnAttr));
+-    grpRgnAttr.show = 1;
++    grpRgnAttr.show = osd.usertext_enabled ? 1 : 0;
+     grpRgnAttr.layer = 2;
+     grpRgnAttr.gAlphaEn = 1; // Enable alpha blending for per-pixel transparency
+     grpRgnAttr.fgAlhpa =
+@@ -974,8 +974,8 @@
+     IMP_OSD_SetGrpRgnAttr(osdBrightness.imp_rgn, osdGrp, &grpRgnAttr);
+   }
+ 
+-  if (osd.uptime_enabled && text_rendering_available) {
+-    /* OSD Uptime */
++  if (text_rendering_available) {
++    /* OSD Uptime (created always; shown per osd.uptime_enabled for live toggle) */
+ 
+     osdUptm.data = nullptr;
+     osdUptm.imp_rgn = IMP_OSD_CreateRgn(nullptr);
+@@ -1000,7 +1000,7 @@
+ 
+     IMPOSDGrpRgnAttr grpRgnAttr;
+     memset(&grpRgnAttr, 0, sizeof(IMPOSDGrpRgnAttr));
+-    grpRgnAttr.show = 1;
++    grpRgnAttr.show = osd.uptime_enabled ? 1 : 0;
+     grpRgnAttr.layer = 3;
+     grpRgnAttr.gAlphaEn = 1; // Enable alpha blending for per-pixel transparency
+     grpRgnAttr.fgAlhpa =
+@@ -1009,7 +1009,7 @@
+     IMP_OSD_SetGrpRgnAttr(osdUptm.imp_rgn, osdGrp, &grpRgnAttr);
+   }
+ 
+-  if (osd.logo_enabled) {
++  { // logo region created always (bare scope); shown per osd.logo_enabled for live toggle
+     /* OSD Logo */
+ 
+     size_t imageSize = 0;
+@@ -1084,7 +1084,7 @@
+ 
+       IMPOSDGrpRgnAttr grpRgnAttr;
+       memset(&grpRgnAttr, 0, sizeof(IMPOSDGrpRgnAttr));
+-      grpRgnAttr.show = 1;
++      grpRgnAttr.show = osd.logo_enabled ? 1 : 0;
+       grpRgnAttr.layer = 4;
+       grpRgnAttr.gAlphaEn = 1;
+       grpRgnAttr.fgAlhpa = osd.logo_transparency;
+@@ -1105,6 +1105,24 @@
+   is_started = true;
+ 
+   return ret;
++}
++
++// Apply STRUCTURAL OSD changes (item enable/disable) live, with NO encoder/VPU/
++// group teardown: only toggle visibility of already-registered regions via
++// IMP_OSD_ShowRgn inside the bound group. Runs ONLY on the OSD worker thread
++// (thread_entry), triggered by the ThreadOSD action bit. Font/stroke size and
++// whole-OSD enable-from-off still require a restart (out of scope). (0017)
++void OSD::applyStructural() {
++  if (!is_started)
++    return;
++  if (time_region_created)
++    IMP_OSD_ShowRgn(osdTime.imp_rgn, osdGrp, osd.time_enabled ? 1 : 0);
++  if (user_region_created)
++    IMP_OSD_ShowRgn(osdUser.imp_rgn, osdGrp, osd.usertext_enabled ? 1 : 0);
++  if (uptime_region_created)
++    IMP_OSD_ShowRgn(osdUptm.imp_rgn, osdGrp, osd.uptime_enabled ? 1 : 0);
++  if (logo_region_created)
++    IMP_OSD_ShowRgn(osdLogo.imp_rgn, osdGrp, osd.logo_enabled ? 1 : 0);
+ }
+ 
+ int OSD::exit() {
+@@ -1259,6 +1277,8 @@
+         if (v->active) {
+           if ((v->imp_encoder->osd != nullptr)) {
+             if (v->imp_encoder->osd->is_started) {
++              if (v->osd_reinit.exchange(false))
++                v->imp_encoder->osd->applyStructural();
+               v->imp_encoder->osd->updateDisplayEverySecond();
+             } else {
+               if (v->imp_encoder->osd->startup_delay_ticks) {

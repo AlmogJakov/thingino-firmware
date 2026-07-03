@@ -975,6 +975,31 @@ prudynt `f4b32289` + all our features).
   (they are served by the fast file channel `json-status-fast.cgi`) to stop double reducer updates + badge
   flicker and shrink the heartbeat. Files: `json-heartbeat.cgi` (5 s), `thingino-agent-adapter-prudynt` (de-dup).
 
+### 10.4 Live-apply for structural OSD changes (patch 0017 - enable/disable + logo)
+- **Problem:** after §10.1 dropped `ThreadVideo` from OSD edits (to kill the freeze), structural OSD changes
+  (item enable/disable, logo on/off) were saved but only applied on the next prudynt restart. The reference
+  applied them live via the video rebuild - which freezes on f4b3228. A design workflow's adversarial verify
+  confirmed the naive "OSD re-init" (`osd->exit()+init()`) would `IMP_OSD_DestroyGroup`/`CreateGroup` a group
+  still `IMP_System_Bind`-bound to the encoder = the issue2 freeze trigger (per 0002). Rejected.
+- **Fix (prudynt patch 0017, phased scope):** apply changes at the OSD-region layer ONLY, never touching the
+  group/encoder bind. `OSD::init()` now creates the time/usertext/uptime/logo regions UNCONDITIONALLY with
+  `grpRgnAttr.show = <item>_enabled ? 1 : 0` (disabled = created-but-hidden; brightness unchanged). New
+  `OSD::applyStructural()` toggles visibility via `IMP_OSD_ShowRgn(rgn, osdGrp, enabled?1:0)` - NO runtime
+  Create/Destroy/DestroyGroup. Trigger: `handle_action` decodes the `ThreadOSD` bit (`mask & 8`, already sent
+  by `preview.js`) -> sets new `std::atomic<bool> video_stream::osd_reinit` (mirrors 0004's flag/exchange
+  idiom, NOT `global_restart_video`) -> `OSD::thread_entry` consumes it (`exchange(false)`) on the OSD worker
+  thread and runs `applyStructural()` -> live within ~100 ms. No webui change needed.
+- **Scope / NOT covered (still need a restart):** font_size / stroke_size (needs `libschrift` re-init +
+  glyph-cache clear), and turning a stream's WHOLE OSD on from fully off (no OSD object/worker exists when
+  `stream.osd.enabled=false` at encoder create).
+- **STATUS: UNTESTED** - prudynt binary patch; needs the prudynt-binary CI build + on-device verification
+  (toggle each OSD item live; confirm ~1 s apply AND that the stream never freezes on toggle). Static review
+  passed (`global_video` visible in JsonAPI.cpp; `IMP_OSD_ShowRgn` signature matches `OSD.cpp:1119`; config
+  bools exist); applies cleanly (`patch -p1`, verified). Rollback = delete the patch file (reverts to the
+  safe apply-on-restart behavior).
+- **Files:** `package/all-patches/prudynt-t/0017-osd-live-structural-apply.patch` (patches prudynt
+  `src/OSD.cpp`, `src/OSD.hpp`, `src/JsonAPI.cpp`, `src/globals.hpp`).
+
 ### On-device validation
 - **HA:** the 5 toggles appear in the HA-config page and persist; entities publish; a
   `S93ha restart` (or web "Save changes") is clean - no `wait_for_ha_shutdown: not found`,
