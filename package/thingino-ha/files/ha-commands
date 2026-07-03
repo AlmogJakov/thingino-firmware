@@ -72,12 +72,19 @@ dispatch() {
 			case "$payload" in
 				on|ON|1|true)
 					printf '{"motion":{"enabled":true}}' | prudyntctl json - >/dev/null 2>&1
-					jct /etc/prudynt.json set motion.enabled true >/dev/null 2>&1
+					# write-on-change: prudyntctl (above) already applied it live in RAM; only
+					# rewrite prudynt.json (a ~9KB flash rewrite + jffs2 churn) when the persisted
+					# value actually differs, so an HA automation repeatedly toggling Motion Guard
+					# cannot churn/fill the tiny jffs2 overlay.
+					[ "$(jct /etc/prudynt.json get motion.enabled 2>/dev/null | tr -d '" ')" = "true" ] \
+						|| jct /etc/prudynt.json set motion.enabled true >/dev/null 2>&1
 					ha_pub_state motion_guard ON
 					;;
 				off|OFF|0|false)
 					printf '{"motion":{"enabled":false}}' | prudyntctl json - >/dev/null 2>&1
-					jct /etc/prudynt.json set motion.enabled false >/dev/null 2>&1
+					# write-on-change (see the ON branch above)
+					[ "$(jct /etc/prudynt.json get motion.enabled 2>/dev/null | tr -d '" ')" = "false" ] \
+						|| jct /etc/prudynt.json set motion.enabled false >/dev/null 2>&1
 					ha_pub_state motion_guard OFF
 					;;
 			esac
