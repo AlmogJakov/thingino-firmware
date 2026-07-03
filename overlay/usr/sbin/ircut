@@ -319,6 +319,23 @@ show_status() {
 	esac
 }
 
+# Fast path: 'read'/'status' only need MODE_FILE (the last-applied state), so
+# skip the expensive load_ircut_config (several jct parses of /etc/thingino.json)
+# entirely. The apply/switch paths below are UNTOUCHED, so IR-cut switching
+# behaviour is unchanged; only the query path drops from ~130ms to ~5ms. read_mode
+# and show_status are defined above and MODE_FILE is initialised at the top, so
+# they are safe to run here. (agent-heartbeat perf: ircut read is called every beat)
+case "$1" in
+	status)
+		show_status
+		exit 0
+		;;
+	\? | read)
+		printf '%s' "$(read_mode)"
+		exit 0
+		;;
+esac
+
 load_ircut_config
 
 if [ "$ircut_disabled" -eq 1 ]; then
