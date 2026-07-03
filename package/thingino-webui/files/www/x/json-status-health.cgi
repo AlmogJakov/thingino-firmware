@@ -17,22 +17,13 @@ printf 'Cache-Control: no-store\r\n'
 printf 'Connection: close\r\n'
 printf '\r\n'
 
-# --- CPU: REAL % from two /proc/stat samples over a short window. Pure reads +
-#     a bounded usleep (no cache, no writes). idle = idle+iowait; busy = total-idle.
-#     On the single-core T23N this is 0..100 (load average was misleading). ---
+# --- CPU: emit RAW /proc/stat counters (total + idle jiffies), NO in-request sleep.
+#     The browser computes %CPU as the delta across consecutive ~7s health polls
+#     (smooth, true system average). total = user+nice+system+idle+iowait+irq+softirq+
+#     steal; idle = idle+iowait. ---
 set -- $(awk '/^cpu /{print ($2+$3+$4+$5+$6+$7+$8+$9), ($5+$6); exit}' /proc/stat 2>/dev/null)
-cpu_t1=${1:-0}
-cpu_i1=${2:-0}
-usleep 300000 2>/dev/null || sleep 1
-set -- $(awk '/^cpu /{print ($2+$3+$4+$5+$6+$7+$8+$9), ($5+$6); exit}' /proc/stat 2>/dev/null)
-cpu_t2=${1:-0}
-cpu_i2=${2:-0}
-cpu_pct=0
-dt=$((cpu_t2 - cpu_t1))
-di=$((cpu_i2 - cpu_i1))
-[ "$dt" -gt 0 ] && cpu_pct=$(((dt - di) * 100 / dt))
-[ "$cpu_pct" -lt 0 ] 2>/dev/null && cpu_pct=0
-[ "$cpu_pct" -gt 100 ] 2>/dev/null && cpu_pct=100
+cpu_total=${1:-0}
+cpu_idle=${2:-0}
 
 # --- RAM: used% and used/total MB from /proc/meminfo. Prefer MemAvailable; this
 #     Ingenic kernel lacks it, so fall back to MemFree+Buffers+Cached+SReclaimable
@@ -83,5 +74,5 @@ case "$st_free" in '' | *[!0-9]*) st_free=0 ;; esac
 time_now=$(date +%s 2>/dev/null)
 case "$time_now" in '' | *[!0-9]*) time_now=null ;; esac
 
-printf '{"time_now":%s,"cpu_pct":%d,"mem_used_pct":%d,"mem_used_mb":%d,"mem_total_mb":%d,"storage_used_pct":%d,"storage_free_kb":%d}\n' \
-	"$time_now" "$cpu_pct" "$mem_pct" "$mem_used_mb" "$mem_total_mb" "$storage_pct" "$st_free"
+printf '{"time_now":%s,"cpu_total":%d,"cpu_idle":%d,"mem_used_pct":%d,"mem_used_mb":%d,"mem_total_mb":%d,"storage_used_pct":%d,"storage_free_kb":%d}\n' \
+	"$time_now" "$cpu_total" "$cpu_idle" "$mem_pct" "$mem_used_mb" "$mem_total_mb" "$storage_pct" "$st_free"

@@ -49,7 +49,9 @@ let healthStatusInFlight = false;
 let physPrivDesired = null;
 let physPrivDesiredAt = 0;
 let cpuSamples = [];
-const CPU_AVG_WINDOW = 12;
+const CPU_AVG_WINDOW = 4;
+let prevCpuTotal = null;
+let prevCpuIdle = null;
 let heartbeatSource = null;
 let heartbeatReconnectTimer = null;
 let slowHeartbeatTimer = null;
@@ -1241,24 +1243,33 @@ function updateHeartbeatUi(json) {
     }
   }
 
-  // Update CPU badge. cpu_pct is a real /proc/stat CPU%, but sampled over a short
-  // window so it's spiky (per-frame encoder/ISP bursts). For HEALTH monitoring we
-  // show a rolling average over ~12 samples (~84s at the 7s health cadence) so
-  // single spikes don't register and only SUSTAINED load moves the number. Buffer
-  // is in-memory (no writes) and only fills while the page polls. Amber when high.
-  if (typeof json.cpu_pct !== "undefined") {
+  // Update CPU badge. The health channel emits RAW /proc/stat counters (cpu_total,
+  // cpu_idle) with NO in-request sleep; %CPU is computed here as the delta between
+  // consecutive health polls (~7s apart) -> a smooth, true system-CPU average. A short
+  // rolling mean (~4 samples) steadies it so single bursts don't register. In-memory
+  // only (no writes); fills while the page polls. Amber when sustained-high.
+  if (typeof json.cpu_total !== "undefined" && typeof json.cpu_idle !== "undefined") {
     const cpu = $("#sys-cpu");
-    if (cpu) {
-      const p = Number(json.cpu_pct);
-      if (Number.isFinite(p)) {
-        cpuSamples.push(p < 0 ? 0 : p > 100 ? 100 : p);
+    const total = Number(json.cpu_total);
+    const idle = Number(json.cpu_idle);
+    if (cpu && Number.isFinite(total) && Number.isFinite(idle)) {
+      if (prevCpuTotal !== null && total > prevCpuTotal) {
+        const dt = total - prevCpuTotal;
+        const di = idle - prevCpuIdle;
+        let p = dt > 0 ? Math.round(((dt - di) * 100) / dt) : 0;
+        p = p < 0 ? 0 : p > 100 ? 100 : p;
+        cpuSamples.push(p);
         if (cpuSamples.length > CPU_AVG_WINDOW) cpuSamples.shift();
         let sum = 0;
         for (let i = 0; i < cpuSamples.length; i++) sum += cpuSamples[i];
         const avg = Math.round(sum / cpuSamples.length);
         cpu.textContent = "avg " + avg + "%";
         cpu.classList.toggle("text-warning", avg >= 90);
+      } else if (prevCpuTotal === null) {
+        cpu.textContent = "...";
       }
+      prevCpuTotal = total;
+      prevCpuIdle = idle;
     }
   }
   if (typeof json.mem_used_pct !== "undefined") {

@@ -1017,9 +1017,11 @@ Connected to cam4 via SSH key auth (read-only) to investigate two reported issue
   standalone, gives 32-47% (NOT 100%). The badge reads ~100% because it samples over a short 300 ms window
   WHILE the Web UI generates concurrent load (2 s fast poll ~10 forks + SSE + especially the MJPEG
   preview's `prudyntctl mjpeg` + `uhttpd`) -> the single core saturates during the sample window. The idle
-  ~31% is normal. Options (pending decision): widen the CPU sample to ~1 s, or diff raw `/proc/stat`
-  jiffies in the browser across the ~7 s health interval (smooth, ~true average); optionally lower the
-  MJPEG preview fps to cut the while-viewing cost.
+  ~31% is normal. **FIXED (raw-jiffy browser-diff):** `json-status-health.cgi` now emits raw `cpu_total`
+  + `cpu_idle` /proc/stat counters with NO in-request `usleep`; `main.js` computes %CPU as the delta
+  across consecutive ~7 s health polls (rolling mean of 4 ≈ 28 s). Result: a smooth, true system-CPU
+  average (~30%) instead of the spiky 300 ms-window artifact, and the 300 ms CGI sleep is removed
+  (lighter). Files: `json-status-health.cgi`, `a/main.js`.
 
 ### On-device validation
 - **HA:** the 5 toggles appear in the HA-config page and persist; entities publish; a
