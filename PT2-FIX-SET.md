@@ -1000,6 +1000,27 @@ prudynt `f4b32289` + all our features).
 - **Files:** `package/all-patches/prudynt-t/0017-osd-live-structural-apply.patch` (patches prudynt
   `src/OSD.cpp`, `src/OSD.hpp`, `src/JsonAPI.cpp`, `src/globals.hpp`).
 
+### 10.5 On-device diagnostics + gain-regression fix (live camera)
+Connected to cam4 via SSH key auth (read-only) to investigate two reported issues.
+- **Gain sensor stuck at 8 (REGRESSION from §10.3 de-dup) - FIXED.** The gain badge is fed by the agent
+  heartbeat's `total_gain` (real value, e.g. 380, from `prudyntctl daynight.status.total_gain`).
+  `json-status-fast.cgi` ALSO tried to read `total_gain` from `/proc/jz/isp/isp-m0` - but that node has
+  **no `total_gain` field** (only "ISP Tgain DB" in dB + raw sensor gains), so it always emitted `-1`,
+  which the reducer treats as "no gain" and falls back to `daynight_brightness` (= `brightness_percent`
+  = **8**). The §10.3 de-dup removed `total_gain` from the agent heartbeat, leaving only the broken file
+  read -> badge showed 8. **Fix:** restore `total_gain` to the agent heartbeat (daynight_mode/enabled stay
+  de-duped - those DO come correctly from the fast channel), and remove the dead `-1` read from
+  `json-status-fast.cgi`. Files: `thingino-agent-adapter-prudynt`, `json-status-fast.cgi`.
+- **CPU badge "100%" - NOT a runaway; measurement/observer artifact.** On-device: prudynt ~31% of the
+  single T23N core (expected dual-stream H.264 HW-encode + ISP + audio + OSD + RTSP baseline; `loglevel`
+  INFO, zero log spew, no debug build), idle total ~35-45%. The health CGI's own 300 ms CPU calc, run
+  standalone, gives 32-47% (NOT 100%). The badge reads ~100% because it samples over a short 300 ms window
+  WHILE the Web UI generates concurrent load (2 s fast poll ~10 forks + SSE + especially the MJPEG
+  preview's `prudyntctl mjpeg` + `uhttpd`) -> the single core saturates during the sample window. The idle
+  ~31% is normal. Options (pending decision): widen the CPU sample to ~1 s, or diff raw `/proc/stat`
+  jiffies in the browser across the ~7 s health interval (smooth, ~true average); optionally lower the
+  MJPEG preview fps to cut the while-viewing cost.
+
 ### On-device validation
 - **HA:** the 5 toggles appear in the HA-config page and persist; entities publish; a
   `S93ha restart` (or web "Save changes") is clean - no `wait_for_ha_shutdown: not found`,

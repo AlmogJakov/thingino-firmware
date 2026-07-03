@@ -1209,9 +1209,10 @@ thingino_agent_adapter_prudynt_get_runtime() {
 			printf '"time_now":%s,' "$(date +%s)"
 			printf '"uptime":%s,' "$(thingino_agent_uptime_seconds)"
 			printf '"daynight_brightness":%s,' "$(thingino_agent_json_string_or_null "$_brightness")"
-			# total_gain / daynight_mode / daynight_enabled are served by the Web UI fast
-			# file channel (json-status-fast.cgi); omitted here to avoid double reducer
-			# updates + badge flicker and to keep this heartbeat cheaper.
+			# daynight_mode / daynight_enabled are served by the Web UI fast file channel
+			# (json-status-fast.cgi). total_gain has NO working file source (isp-m0 exposes
+			# no "total_gain" field), so it MUST come from here (prudyntctl daynight.status).
+			printf '"total_gain":%s,' "$(thingino_agent_json_value_or "${_heartbeat_total_gain:-}" null)"
 			printf '"rec_ch0":%s,' "$(thingino_agent_prudynt_stream_recording_active 0)"
 			printf '"rec_ch1":%s,' "$(thingino_agent_prudynt_stream_recording_active 1)"
 			printf '"motion_enabled":%s,' "$(thingino_agent_prudynt_motion_active)"

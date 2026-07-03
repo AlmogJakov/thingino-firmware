@@ -49,11 +49,7 @@ else
 	shabbat=false
 fi
 
-# --- Gain (ISP total gain): file read of /proc/jz/isp/isp-m0 (same source as
-#     ha-state). Emit -1 when unreadable so the UI keeps its last value instead
-#     of flashing "---". ---
-gain=$(awk '/total_gain/{print $NF; exit}' /proc/jz/isp/isp-m0 2>/dev/null)
-case "$gain" in '' | *[!0-9-]*) gain=-1 ;; esac
-
-printf '{"daynight_mode":"%s","daynight_enabled":%s,"physical_privacy_active":%s,"shabbat_ready":%s,"total_gain":%d}\n' \
-	"$dn_mode" "$dn_enabled" "$pp" "$shabbat" "$gain"
+# --- Gain is NOT emitted here: /proc/jz/isp/isp-m0 has no "total_gain" field, so
+#     the real value comes from the agent heartbeat (prudyntctl daynight.status). ---
+printf '{"daynight_mode":"%s","daynight_enabled":%s,"physical_privacy_active":%s,"shabbat_ready":%s}\n' \
+	"$dn_mode" "$dn_enabled" "$pp" "$shabbat"
