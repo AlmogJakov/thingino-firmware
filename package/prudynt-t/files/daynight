@@ -20,6 +20,13 @@
 singleton $0
 
 MODE_FILE="/run/prudynt/daynight_mode"
+# Script-owned "last mode we actually applied + verified" marker. The dedup in
+# switch_to_day/night keys on THIS, not MODE_FILE. MODE_FILE is written by
+# prudynt and can lag/desync from the physical optics: a night->day that left
+# MODE_FILE at "day" made switch_to_day dedup and silently no-op, stranding the
+# camera in night. tmpfs -> cleared on reboot, so the first boot switch always
+# actuates (no stale-skip of the boot IR-cut).
+APPLIED_FILE="/run/daynight.applied"
 PRUDYNT_CONFIG="/etc/prudynt.json"
 
 command_present() {
@@ -105,9 +112,11 @@ set_ircut_verified() {
 privacy_active() { [ -f /run/physical-privacy.armed ] || grep -q '"active":true' /etc/physical-privacy-state.json 2>/dev/null; }
 
 switch_to_day() {
-	# High-frequency dedup: if prudynt already reports day (MODE_FILE present),
-	# a same-mode re-send does nothing — no fork of ircut/light/color, no churn.
-	[ -s "$MODE_FILE" ] && [ "$state" = "day" ] && return 0
+	# High-frequency dedup: skip a same-mode re-send (no fork of ircut/light/
+	# color, no re-pulse of the IR-cut latch) ONLY when WE last applied day. Keyed
+	# on APPLIED_FILE (our own verified apply), not prudynt's MODE_FILE, so a stale
+	# MODE_FILE can never make this silently no-op a real day switch.
+	[ "$applied_mode" = "day" ] && return 0
 	echo_info "Switching to day mode..."
 	load_controls
 	_rc=0
@@ -138,12 +147,16 @@ switch_to_day() {
 		color on
 	fi
 
+	# Record the applied mode ONLY on full success (all night-vision actuators
+	# verified). On failure leave the marker as-is so prudynt's retry re-actuates
+	# instead of dedup-skipping a half-applied switch.
+	[ "$_rc" = 0 ] && echo day >"$APPLIED_FILE" 2>/dev/null
 	return "$_rc"
 }
 
 switch_to_night() {
 	# High-frequency dedup: same-mode re-send is a no-op (see switch_to_day).
-	[ -s "$MODE_FILE" ] && [ "$state" = "night" ] && return 0
+	[ "$applied_mode" = "night" ] && return 0
 	echo_info "Switching to night mode..."
 	load_controls
 	_rc=0
@@ -176,10 +189,15 @@ switch_to_night() {
 		set_light_verified ir940 "$ir_want" || _rc=1
 	fi
 
+	[ "$_rc" = 0 ] && echo night >"$APPLIED_FILE" 2>/dev/null
 	return "$_rc"
 }
 
 state=$(awk 'NR==1 {print $1}' "$MODE_FILE" 2>/dev/null || echo "day")
+# What WE last applied+verified (empty until the first successful switch, and
+# after every reboot). Drives the dedup and toggle direction; MODE_FILE ($state)
+# is kept only for the read/status reporting below.
+applied_mode=$(awk 'NR==1 {print $1}' "$APPLIED_FILE" 2>/dev/null)
 
 rc=0
 case "$1" in
@@ -192,10 +210,13 @@ case "$1" in
 		rc=$?
 		;;
 	~ | toggle)
-		if [ "day" = "$state" ]; then
-			switch_to_night
-		else
+		# Direction off our own last-applied mode (not prudynt's possibly-stale
+		# MODE_FILE), so toggle can't wedge the way the dedup could. Unknown/empty
+		# (fresh boot) -> treat as day, i.e. toggle to night (matches prior default).
+		if [ "night" = "$applied_mode" ]; then
 			switch_to_day
+		else
+			switch_to_night
 		fi
 		rc=$?
 		;;
