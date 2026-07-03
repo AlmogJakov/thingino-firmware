@@ -1213,10 +1213,13 @@ function saveStreamValue(streamId, param) {
 function sendOsdUpdate(streamId, osdPayload) {
   // OSD-only refresh: do NOT request a video (encoder/VPU) rebuild. On this T23
   // build (prudynt f4b3228) global_restart_video tears down the live encoder and
-  // wedges the stream on a static frame (issue2). The OSD worker re-reads text
-  // fields (time/usertext/uptime + their format/position/colors) live every second,
-  // so those apply within ~1s. Structural OSD changes (enable/disable, logo,
-  // font/stroke) are saved and take effect on the next prudynt (re)start.
+  // wedges the stream on a static frame (issue2). We send the ThreadOSD action,
+  // which prudynt (patch 0017) decodes to apply STRUCTURAL changes live via
+  // IMP_OSD_ShowRgn on the OSD worker thread -- verified on-device (cam4 T23N):
+  // item enable/disable and logo on/off apply within ~1s with NO stream freeze.
+  // Text fields (time/usertext/uptime + format/position/colors) also apply live
+  // (the OSD worker re-renders them each second). Only font/stroke SIZE still
+  // needs a prudynt restart (0017 does not re-init libschrift -- see setFont).
   const payload = {
     [`stream${streamId}`]: { osd: osdPayload },
     action: { restart_thread: ThreadOSD },
@@ -1244,10 +1247,13 @@ function setFont(streamId) {
   if (Object.keys(payload).length === 0) return;
   console.log(ts(), "setFont for stream", streamId, ":", payload);
   // Font/stroke are OSD-region attributes; avoid a video (VPU) rebuild here too
-  // (see sendOsdUpdate) - on the T23 f4b3228 build it wedges the stream. Saved
-  // now, applied on the next prudynt restart. ThreadOSD is currently a no-op flag
-  // (prudynt decodes only rtsp/video/audio) - it marks intent for a future
-  // OSD-only refresh patch.
+  // (see sendOsdUpdate) - on the T23 f4b3228 build it wedges the stream. The
+  // ThreadOSD action IS decoded by prudynt (patch 0017) and toggles region
+  // visibility live, but font/stroke SIZE specifically is NOT applied live:
+  // 0017's applyStructural only calls IMP_OSD_ShowRgn, and changing glyph size
+  // needs a libschrift re-init + glyph-cache clear. So size changes are saved now
+  // and take effect on the next prudynt restart -- verified on-device (font_size
+  // 64 did not enlarge the live OSD text).
   const fullPayload = {
     [`stream${streamId}`]: { osd: payload },
     action: { restart_thread: ThreadOSD },
