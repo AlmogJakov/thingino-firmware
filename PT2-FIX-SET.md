@@ -1036,6 +1036,56 @@ Connected to cam4 via SSH key auth (read-only) to investigate two reported issue
 
 ---
 
+## 11. Day/night wedge fix, OSD live-apply verification, heartbeat perf, flash-overlay audit
+Session 2026-07-03 (branch `pt2-firmware`). Commits: `79933cac0` (ircut fast-path),
+`9da70dad0` (day/night wedge fix), `003a5ef67` (OSD comment correction). All verified on cam4.
+
+### 11.1 Extended production-readiness tests (on-device)
+- **RTSP:** 5/5 `OPTIONS -> 200`. **Leak:** prudynt RSS 8 MB / mem 17 MB / 35 threads flat over 45 s.
+- **Load times (server-side):** jct parse ~20 ms, health CGI ~20 ms, fast CGI ~66 ms, agent heartbeat ~650 ms (see 11.2).
+- **Live config-apply:** `image.brightness` 128->160 instant, RTSP never dropped, reverted clean.
+- **Reboot recovery:** SSH back ~32 s, RTSP `200` ~2 s later; all config persisted (bitrate/thresholds/led_b); blue LED off at boot (F00ledd fix confirmed, gpio 57 = 0); idle load 0.37.
+- **Gain sensor:** live `total_gain` 330-429 (the §10.5 fix confirmed working).
+
+### 11.2 Heartbeat perf - `ircut read` fast-path (`79933cac0`)
+Agent heartbeat ~650 ms/call; breakdown: `prudyntctl`(total_gain)+`wg` ~0 ms, the 4 GPIO reads ~266 ms (`ircut read` ~100-133 ms alone). `ircut read` re-ran full `load_ircut_config` (~4 jct parses) before just returning `/tmp/ircutmode.txt`. Added a `read`/`status` fast-path BEFORE `load_ircut_config` (apply/switch paths untouched). Validated: `ircut read` ~100 ms -> ~0 ms, identical output. The remaining ~200 ms (3 `light read`) DEFERRED (a cache would regress the live IR toggle buttons; needs set-path invalidation).
+
+### 11.3 Day/night night->day wedge - FIXED (`9da70dad0`)
+`daynight day` could silently no-op and strand the camera in night. Root cause: `switch_to_day`/`switch_to_night` (deployed source = `package/prudynt-t/files/daynight`, which overrides the stock thingino-ircut copy) deduped on `/run/prudynt/daynight_mode` (MODE_FILE) - a file the executor NEVER writes (prudynt owns it) and which lags/desyncs (stays "day" after a night switch). Fix: dedup + toggle now key on a script-owned `/run/daynight.applied` marker, written only on a fully-verified switch (`_rc=0`); MODE_FILE/$state kept only for read/status. Cannot wedge (night->day always actuates unless WE last applied day). The tmpfs marker is absent at boot -> the first boot switch actuates -> ALSO fixes the boot IR-cut settle window (the boot day-apply previously deduped against prudynt's early "day"). Night switch is freeze-clean (fps held through). Validated on cam4 (exact wedge sequence now restores day; same-mode re-send still deduples - no IR-cut re-pulse). Adversarial review (correctness/regression/failure-contract) = 3/3 pass, no blockers. Pre-existing (not introduced) minor: chronic ircut-verify-failure re-pulses the latch (§ ircut-dualpin-verify-lies).
+
+### 11.4 OSD structural live-apply - VERIFIED, comments corrected (`003a5ef67`)
+Patch 0017 (`OSD::applyStructural`) IS in the deployed binary (`strings` confirms `_ZN3OSD15applyStructuralEv`). Verified on-device by snapshot: **enabling the logo applied LIVE within ~1 s with NO stream freeze** (fps held 16); **font_size 64 did NOT enlarge the live text** (font/stroke still need a restart - 0017 doesn't re-init libschrift). So OSD item enable/disable + logo apply live; font/stroke need restart. `prudyntctl json` OSD writes are IN-MEMORY (flash byte-identical after the test). Corrected the stale `preview.js` comments that claimed enable/logo need a restart and that ThreadOSD is a no-op. (0017 is now verified-working, closing its "untested" status.)
+
+### 11.5 SSE cadence - verified already 5 s (no change)
+`json-heartbeat.cgi` `HEARTBEAT_INTERVAL:-5`, `main.js` `HeartBeatReconnectDelay = 5000`; deployed matches. (`6ee073d55` handled it earlier.)
+
+### 11.6 Flash-overlay write audit (report-only - NO changes made)
+Question: does anything write persistent flash (jffs2 `/overlay`, 224 KB) except day/night mode + physical-privacy state, and can normal/UI use fill it? Method: a 120 s on-device steady-state monitor + a fanned-out code trace of every subsystem (logs, heartbeat/cache, OSD, HA/MQTT/WG, LED/IR, privacy/config/markers) + an adversarial repo-wide sweep for flash-write patterns; cross-checked.
+
+**IDLE / steady-state (streaming + MQTT + heartbeat, no user action): NO overlay growth.**
+- Empirical: **0 overlay files written in 120 s; df delta 0 KB.**
+- Code trace: 0 idle flash writers in every subsystem. Logs -> tmpfs (syslogd `-C64` 64 KB RAM ring; `/var/log -> /tmp`); heartbeat/status/health/fast CGIs read-only (mktemp in /tmp, rm'd same call); OSD live edits -> `prudyntctl json` = IN-MEMORY; HA/MQTT publish-only (state cache in /tmp); LED/IR = GPIO (no file); ircut marker `/tmp/ircutmode.txt` + daynight marker `/run/daynight.applied` = tmpfs; `/etc/resolv.conf -> /tmp`; `/etc/onvif.json` = boot-only (S96/S97); no active cron.
+- The ONE idle-reachable flash path: `tz-update -> /etc/TZ` via the NTP poll callback - but strictly **write-on-change** (skips if the TZ string is unchanged), so ~1 write/year (DST rollover) + first-sync-after-boot. `/etc/TZ` mtime is stable (first-boot), confirming it does not churn.
+
+**User-action writers (bounded, expected):** config Saves (`json-config-*.cgi` -> `/etc/*.json`, per POST), the agent `persist_value` (write-on-change), day/night sidecar `/etc/daynight.state` (~11 B, atomic, write-on-change), `/etc/physical-privacy-state.json` (atomic), `light <type> gpio <pin>` pin reassignment, and two HA paths: HA config Save; and **HA Motion Guard toggle -> full `jct set motion.enabled` rewrite of prudynt.json** (`ha-commands:75,80`, NOT write-on-change).
+
+**Verdict on the intended rule ("only day/night + privacy write flash"):**
+- **Autonomous / idle writes: essentially TRUE** - the sole exception is the ~yearly write-on-change `/etc/TZ` (system-time category). The overlay does not grow on its own.
+- **Literally, incl. user actions: NOT exactly** - config Saves + the two HA paths also write flash. All deliberate, bounded, user-triggered - not idle churn.
+
+**Can normal long-term use or repeated UI use grow/fill the overlay? Answer: NO.**
+- Idle/long-term: no autonomous growth (0 writers except ~1/yr TZ).
+- Repeated UI: live tuning/viewing = 0 flash; config Saves = fixed-size rewrites -> jffs2 obsolete-node churn, GC-reclaimed. Overlay currently 54 % (29 KB real data + jffs2 churn). No append/log/per-event-file growth vector exists.
+- Realistic fill risks (NOT normal use): (a) an HA automation toggling Motion Guard frequently (repeated 9 KB prudynt.json rewrites), (b) a pathological manual save rate hitting jffs2's ~5-erase-block GC reserve (transient ENOSPC), (c) a large new file copied-up (the historical `prudynt.sh` 85 KB - not present now).
+
+**Proposed mitigations (NOT implemented - awaiting approval):**
+1. Make the HA Motion Guard command **write-on-change** (skip `jct set` if `motion.enabled` already matches) - mirrors the agent `persist_value` guard; removes the main repeated-UI churn vector. [`ha-commands:75,80`]
+2. (Optional) write-on-change in the config-save CGIs' `write_config` (skip identical writes) - minor churn reduction.
+3. Keep the health-channel storage monitor (~80 % alert) + the tmpfs-for-runtime-state pattern; land the Phase 3 firmware rebuild (bake fixes into `/rom` -> overlay clears to a few KB).
+The `tz-update` path needs no change (bounded + correct).
+
+---
+
 ## Build & validate (reminder)
 - prudynt C++ ships **only** via patches `0001`-`0016` in `package/all-patches/prudynt-t/`
   (auto-applied; source git-fetched at `f4b3228` - never hand-edit source). There is **no**
