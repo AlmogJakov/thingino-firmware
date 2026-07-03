@@ -1078,9 +1078,9 @@ Question: does anything write persistent flash (jffs2 `/overlay`, 224 KB) except
 - Repeated UI: live tuning/viewing = 0 flash; config Saves = fixed-size rewrites -> jffs2 obsolete-node churn, GC-reclaimed. Overlay currently 54 % (29 KB real data + jffs2 churn). No append/log/per-event-file growth vector exists.
 - Realistic fill risks (NOT normal use): (a) an HA automation toggling Motion Guard frequently (repeated 9 KB prudynt.json rewrites), (b) a pathological manual save rate hitting jffs2's ~5-erase-block GC reserve (transient ENOSPC), (c) a large new file copied-up (the historical `prudynt.sh` 85 KB - not present now).
 
-**Proposed mitigations (NOT implemented - awaiting approval):**
-1. Make the HA Motion Guard command **write-on-change** (skip `jct set` if `motion.enabled` already matches) - mirrors the agent `persist_value` guard; removes the main repeated-UI churn vector. [`ha-commands:75,80`]
-2. (Optional) write-on-change in the config-save CGIs' `write_config` (skip identical writes) - minor churn reduction.
+**Mitigations:**
+1. **IMPLEMENTED (`8fd3fe50f`):** HA Motion Guard command is now **write-on-change** - the `jct set` is guarded by a get-compare (skip if `motion.enabled` already matches); the live `prudyntctl` apply is unchanged. Removes the main repeated-UI churn vector. Validated on cam4 against a copy of the real config: redundant on/off = no flash write, genuine change = writes once. [`ha-commands` motion_guard branch]
+2. (Optional, NOT done - general config-save flow intentionally left unchanged per request) write-on-change in the config-save CGIs' `write_config`.
 3. Keep the health-channel storage monitor (~80 % alert) + the tmpfs-for-runtime-state pattern; land the Phase 3 firmware rebuild (bake fixes into `/rom` -> overlay clears to a few KB).
 The `tz-update` path needs no change (bounded + correct).
 
