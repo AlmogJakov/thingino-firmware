@@ -138,12 +138,31 @@ STATE_INTERVAL="${STATE_INTERVAL:-15}"
 DISC_INTERVAL=$(ha_cfg discovery_interval)
 DISC_INTERVAL="${DISC_INTERVAL:-3600}"
 
+# Periodic full reconcile: force-publish every entity's true state on this cadence
+# so a stale retained MQTT value cannot stay stuck if a publish-on-change update was
+# ever dropped. mosquitto_pub failures are silently swallowed (_ha_pub_exec) and the
+# change-detection cache is written BEFORE the send, so a dropped update leaves the
+# cache matching reality while the broker keeps the old retained value -> it is never
+# re-sent. This force pass re-asserts all states and heals any such drift within the
+# interval. MQTT-only, no flash (ha-state reads /proc, GPIO, prudyntctl, jct get).
+RECONCILE_INTERVAL=$(ha_cfg reconcile_interval)
+RECONCILE_INTERVAL="${RECONCILE_INTERVAL:-300}"
+
 elapsed=0
+since_reconcile=0
 while true; do
 	sleep "$STATE_INTERVAL"
 	elapsed=$((elapsed + STATE_INTERVAL))
-	# No "force" argument: only publishes entities that changed since last poll.
-	ha-state
+	since_reconcile=$((since_reconcile + STATE_INTERVAL))
+	if [ "$since_reconcile" -ge "$RECONCILE_INTERVAL" ]; then
+		# Reconcile: re-assert the true state of ALL entities (like startup),
+		# healing any retained value that drifted from a dropped publish.
+		ha-state force
+		since_reconcile=0
+	else
+		# No "force": only publishes entities that changed since last poll.
+		ha-state
+	fi
 	if [ "$elapsed" -ge "$DISC_INTERVAL" ]; then
 		ha-discovery
 		elapsed=0
