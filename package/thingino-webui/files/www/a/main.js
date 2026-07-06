@@ -1265,8 +1265,18 @@ function updateHeartbeatUi(json) {
         const avg = Math.round(sum / cpuSamples.length);
         cpu.textContent = "avg " + avg + "%";
         cpu.classList.toggle("text-warning", avg >= 90);
-      } else if (prevCpuTotal === null) {
-        cpu.textContent = "...";
+      } else if (prevCpuTotal === null && total > 0) {
+        // First sample has no delta yet: show the since-boot average (busy/total
+        // over the whole uptime) so a real value appears INSTANTLY instead of
+        // "...". Subsequent polls refine it to the live rolling delta above. One
+        // /proc/stat read -> zero extra cost. (Raw loadavg is intentionally NOT
+        // used: prudynt's D-state HW/DMA threads inflate it to ~3 while true CPU
+        // utilisation is ~30%, which would look alarming and wrong.)
+        let p = Math.round(((total - idle) * 100) / total);
+        p = p < 0 ? 0 : p > 100 ? 100 : p;
+        cpuSamples.push(p);
+        cpu.textContent = "avg " + p + "%";
+        cpu.classList.toggle("text-warning", p >= 90);
       }
       prevCpuTotal = total;
       prevCpuIdle = idle;
@@ -1356,47 +1366,32 @@ async function fetchSlowHeartbeatStatus() {
   slowHeartbeatInFlight = true;
 
   try {
-    const response = await fetch(SlowHeartbeatEndpoint, {
+    // Mic + speaker buttons: query mic_muted AND spk_enabled directly from prudynt
+    // in ONE request. (Both are runtime-only - not in any file and NOT in the agent
+    // heartbeat, which reports mic_enabled/capture.) The redundant agent-heartbeat
+    // fetch that used to run FIRST on this channel was removed: the SSE already
+    // streams that exact data every ~5s, so re-polling it here only delayed the
+    // mic/speaker values behind a ~550ms request -> now the first value is instant.
+    const micResp = await fetch("/x/json-prudynt.cgi", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ audio: { mic_muted: null, spk_enabled: null } }),
       cache: "no-store",
       credentials: "same-origin",
     });
-
-    if (!response.ok) {
-      throw new Error(`Slow heartbeat request failed: ${response.status}`);
-    }
-
-    updateHeartbeatUi(await response.json());
-
-    // The agent heartbeat is slow (~5s) and reports mic_enabled (capture on/off),
-    // NOT mic_muted. Query mic_muted AND spk_enabled directly from prudynt in ONE
-    // request (spk_enabled is runtime-only - not persisted to prudynt.json - so it
-    // cannot be read from a file); this refreshes the mic + speaker buttons with
-    // the live state and picks up HA/MQTT-driven changes, with no extra request.
-    // Non-fatal if it fails.
-    try {
-      const micResp = await fetch("/x/json-prudynt.cgi", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ audio: { mic_muted: null, spk_enabled: null } }),
-        cache: "no-store",
-        credentials: "same-origin",
-      });
-      if (micResp.ok) {
-        const micData = await micResp.json();
-        if (micData && micData.audio) {
-          if (typeof micData.audio.mic_muted !== "undefined") {
-            updateHeartbeatUi({ mic_muted: micData.audio.mic_muted });
-          }
-          if (typeof micData.audio.spk_enabled !== "undefined") {
-            updateHeartbeatUi({ spk_enabled: micData.audio.spk_enabled });
-          }
+    if (micResp.ok) {
+      const micData = await micResp.json();
+      if (micData && micData.audio) {
+        if (typeof micData.audio.mic_muted !== "undefined") {
+          updateHeartbeatUi({ mic_muted: micData.audio.mic_muted });
+        }
+        if (typeof micData.audio.spk_enabled !== "undefined") {
+          updateHeartbeatUi({ spk_enabled: micData.audio.spk_enabled });
         }
       }
-    } catch (micErr) {
-      console.error("mic_muted poll error", micErr);
     }
   } catch (error) {
-    console.error("Slow heartbeat fetch error", error);
+    console.error("mic/speaker poll error", error);
   } finally {
     slowHeartbeatInFlight = false;
     scheduleSlowHeartbeatStatus();
