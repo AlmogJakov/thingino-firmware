@@ -121,19 +121,30 @@ ha_state_cache_clear() {
 	rm -rf "$_HA_STATE_CACHE_DIR"
 }
 
-# Return 0 if entity state changed since last publish; update cache.
-# Return 1 if unchanged — caller should skip publishing.
+# Return 0 if entity state changed since the last CONFIRMED publish (caller
+# should publish); return 1 if unchanged (skip). READ-ONLY: the cache is written
+# only by _ha_cache_write AFTER a confirmed publish (confirm-then-cache), never
+# here — so a value is remembered only once the broker has actually acked it.
 _ha_state_changed() {
 	local entity="$1" state="$2"
-	mkdir -p "$_HA_STATE_CACHE_DIR"
 	local cache_file="$_HA_STATE_CACHE_DIR/$entity"
 	local last=""
 	[ -f "$cache_file" ] && last=$(cat "$cache_file" 2>/dev/null)
-	if [ "$state" = "$last" ]; then
-		return 1  # unchanged
+	[ "$state" = "$last" ] && return 1   # unchanged since last confirmed publish -> skip
+	return 0                             # changed (or no cache yet) -> publish
+}
+
+# Atomically record the last CONFIRMED state for an entity by copying the exact
+# bytes we just published (the publish tmpfile) into the cache. Called ONLY from
+# _ha_pub_confirm on a QoS1 PUBACK, so the cache == the last broker-acked value.
+_ha_cache_write() {
+	local entity="$1" srcfile="$2"
+	[ -n "$entity" ] || return 0
+	mkdir -p "$_HA_STATE_CACHE_DIR"
+	local dst="$_HA_STATE_CACHE_DIR/$entity"
+	if cp -f "$srcfile" "$dst.w$$" 2>/dev/null; then
+		mv -f "$dst.w$$" "$dst" 2>/dev/null || rm -f "$dst.w$$"
 	fi
-	printf '%s' "$state" > "$cache_file"
-	return 0  # changed
 }
 
 # ---------------------------------------------------------------------------
@@ -150,31 +161,50 @@ ha_pub_begin() {
 	_HA_PUB_QUEUE_FILE=$(mktemp /tmp/ha_pubq.XXXXXX) || _HA_PUB_QUEUE_FILE=""
 }
 
-_ha_pub_exec() {
-	local retain="$1" suffix="$2" topic="$3" tmpfile="$4"
+# Publish ONE message and confirm delivery. -q 1 makes mosquitto_pub block until
+# the broker PUBACKs, so its exit code is real confirmation (was QoS0, exit
+# ignored). Wrapped in `timeout` so an unreachable/hung broker can't block for
+# minutes (validated: a publish to an unroutable host hangs until killed). On
+# success — and only then — the cache is updated (confirm-then-cache); a dropped
+# publish leaves the cache stale so the next poll re-publishes. Failures are
+# logged. entity="" (e.g. discovery) publishes normally but is never cached.
+_ha_pub_confirm() {
+	local retain="$1" suffix="$2" topic="$3" tmpfile="$4" entity="$5"
 	[ -f "$tmpfile" ] || return 1
-	local mpub
+	local mpub errf rc emsg
 	mpub=$(ha_mpub_cmd "$suffix")
+	mpub="$mpub -q 1"
 	[ "$retain" = "1" ] && mpub="$mpub -r"
-	sh -c "$mpub -t $(_sq "$topic") -f $(_sq "$tmpfile")" 2>/dev/null
+	errf=$(mktemp /tmp/ha_puberr.XXXXXX 2>/dev/null)
+	timeout "${HA_PUB_TIMEOUT:-4}" sh -c "$mpub -t $(_sq "$topic") -f $(_sq "$tmpfile")" 2>"${errf:-/dev/null}"
+	rc=$?
+	if [ "$rc" = 0 ]; then
+		_ha_cache_write "$entity" "$tmpfile"      # cache ONLY after confirmed PUBACK
+	else
+		emsg=""
+		[ -s "$errf" ] && emsg=" err=$(head -c 160 "$errf" 2>/dev/null | tr '\n\r' '  ')"
+		logger -t ha-mqtt "publish FAILED rc=$rc topic=$topic$emsg"
+	fi
 	rm -f "$tmpfile"
+	[ -n "$errf" ] && rm -f "$errf"
+	return "$rc"
 }
 
 _ha_queue_or_pub() {
-	local retain="$1" suffix="$2" topic="$3" tmpfile="$4"
+	local retain="$1" suffix="$2" topic="$3" tmpfile="$4" entity="$5"
 	if [ -n "$_HA_PUB_QUEUE_FILE" ]; then
-		printf '%s|%s|%s|%s\n' "$retain" "$suffix" "$topic" "$tmpfile" \
+		printf '%s|%s|%s|%s|%s\n' "$retain" "$suffix" "$topic" "$tmpfile" "$entity" \
 			>> "$_HA_PUB_QUEUE_FILE"
 	else
-		_ha_pub_exec "$retain" "$suffix" "$topic" "$tmpfile"
+		_ha_pub_confirm "$retain" "$suffix" "$topic" "$tmpfile" "$entity"
 	fi
 }
 
 ha_pub_flush() {
 	[ -n "$_HA_PUB_QUEUE_FILE" ] || return 0
-	local retain suffix topic tmpfile
-	while IFS='|' read -r retain suffix topic tmpfile; do
-		_ha_pub_exec "$retain" "$suffix" "$topic" "$tmpfile"
+	local retain suffix topic tmpfile entity
+	while IFS='|' read -r retain suffix topic tmpfile entity; do
+		_ha_pub_confirm "$retain" "$suffix" "$topic" "$tmpfile" "$entity"
 		usleep "$HA_PUB_DELAY_US" 2>/dev/null || true
 	done < "$_HA_PUB_QUEUE_FILE"
 	rm -f "$_HA_PUB_QUEUE_FILE"
@@ -199,12 +229,10 @@ ha_pub_state() {
 	local entity="$1" state="$2" force="${3:-0}"
 	[ -n "$state" ] || return 0
 
-	if [ "$force" = "1" ]; then
-		# Force: always publish and update cache.
-		mkdir -p "$_HA_STATE_CACHE_DIR"
-		printf '%s' "$state" > "${_HA_STATE_CACHE_DIR}/${entity}"
-	else
-		# Normal: skip if state unchanged since last publish.
+	# Skip only if unchanged since the last CONFIRMED publish (read-only compare).
+	# force=1 (startup/reconcile) always publishes. The cache is written by
+	# _ha_cache_write ONLY after a QoS1 PUBACK, never here.
+	if [ "$force" != "1" ]; then
 		_ha_state_changed "$entity" "$state" || return 0
 	fi
 
@@ -212,17 +240,14 @@ ha_pub_state() {
 	local tmpfile
 	tmpfile=$(mktemp /tmp/ha_state.XXXXXX) || return 1
 	printf '%s' "$state" > "$tmpfile"
-	_ha_queue_or_pub 1 state "$topic" "$tmpfile"
+	_ha_queue_or_pub 1 state "$topic" "$tmpfile" "$entity"
 }
 
 # Publish a JSON state payload with the same change-detection logic.
 ha_pub_state_json() {
 	local entity="$1" payload="$2" force="${3:-0}"
 
-	if [ "$force" = "1" ]; then
-		mkdir -p "$_HA_STATE_CACHE_DIR"
-		printf '%s' "$payload" > "${_HA_STATE_CACHE_DIR}/${entity}"
-	else
+	if [ "$force" != "1" ]; then
 		_ha_state_changed "$entity" "$payload" || return 0
 	fi
 
@@ -230,7 +255,7 @@ ha_pub_state_json() {
 	local tmpfile
 	tmpfile=$(mktemp /tmp/ha_state.XXXXXX) || return 1
 	printf '%s' "$payload" > "$tmpfile"
-	_ha_queue_or_pub 1 state "$topic" "$tmpfile"
+	_ha_queue_or_pub 1 state "$topic" "$tmpfile" "$entity"
 }
 
 # Clear a discovery topic (empty retained message removes entity from HA).
