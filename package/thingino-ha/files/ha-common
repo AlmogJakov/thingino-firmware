@@ -161,6 +161,67 @@ ha_pub_begin() {
 	_HA_PUB_QUEUE_FILE=$(mktemp /tmp/ha_pubq.XXXXXX) || _HA_PUB_QUEUE_FILE=""
 }
 
+# ---------------------------------------------------------------------------
+# Per-entity publish lock (/run/ha/pub/<entity>.d, tmpfs).
+#
+# Serializes the publish+cache of ONE entity across ha-commands and ha-state so
+# they can't interleave or tear the cache. DIFFERENT entities use DIFFERENT lock
+# dirs and never block each other. Crash-safe: a lock whose owner PID is dead is
+# stolen immediately; an empty-pid or otherwise orphaned lock is stolen once it
+# ages past _HA_LOCK_STALE_AGE (a live publish holds the lock <= HA_PUB_TIMEOUT,
+# so a young lock is never falsely stolen). Steals are atomic (mv-aside: only one
+# waiter wins). mkdir failing while the dir does NOT exist means ENOSPC/perm, not
+# a held lock -> give up and publish best-effort UNLOCKED instead of busy-looping.
+# Returns 0 if acquired (or entity empty => no lock needed), 1 if it gave up.
+: "${_HA_LOCK_WAIT_US:=25000}"   # 25ms between attempts
+: "${_HA_LOCK_TRIES:=240}"       # ~6s bounded wait (> HA_PUB_TIMEOUT)
+: "${_HA_LOCK_STALE_AGE:=15}"    # steal a lock older than this many seconds
+
+_ha_lock_aged() {
+	local d="$1" mt now
+	mt=$(stat -c %Y "$d" 2>/dev/null) || return 1   # can't stat -> don't age-steal
+	[ -n "$mt" ] || return 1
+	now=$(date +%s)
+	[ "$((now - mt))" -ge "${_HA_LOCK_STALE_AGE:-15}" ]
+}
+
+_ha_lock() {
+	local entity="$1"
+	[ -n "$entity" ] || return 0                    # discovery/availability: no lock
+	mkdir -p /run/ha/pub 2>/dev/null
+	local lockd="/run/ha/pub/${entity}.d" i=0 owner
+	while ! mkdir "$lockd" 2>/dev/null; do
+		if [ ! -d "$lockd" ]; then                  # mkdir failed, no dir => ENOSPC/perm
+			logger -t ha-mqtt "lock: cannot create $lockd (ENOSPC/err); publishing unlocked"
+			return 1
+		fi
+		owner=$(cat "$lockd/pid" 2>/dev/null)
+		if { [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; } || _ha_lock_aged "$lockd"; then
+			# orphan (dead pid OR aged/empty): steal atomically -- only one waiter
+			# wins the rename; the loser's mv fails and it simply retries mkdir.
+			if mv "$lockd" "$lockd.stale.$$" 2>/dev/null; then
+				rm -rf "$lockd.stale.$$" 2>/dev/null
+				logger -t ha-mqtt "lock: stole orphan $entity (pid=${owner:-none})"
+			fi
+			continue
+		fi
+		i=$((i + 1))
+		if [ "$i" -ge "${_HA_LOCK_TRIES:-240}" ]; then
+			logger -t ha-mqtt "lock: wait timeout $entity; publishing unlocked"
+			return 1
+		fi
+		usleep "${_HA_LOCK_WAIT_US:-25000}" 2>/dev/null || sleep 1
+	done
+	printf '%s\n' "$$" > "$lockd/pid" 2>/dev/null
+	return 0
+}
+
+_ha_unlock() {
+	local entity="$1"
+	[ -n "$entity" ] || return 0
+	rm -rf "/run/ha/pub/${entity}.d" 2>/dev/null
+}
+
 # Publish ONE message and confirm delivery. -q 1 makes mosquitto_pub block until
 # the broker PUBACKs, so its exit code is real confirmation (was QoS0, exit
 # ignored). Wrapped in `timeout` so an unreachable/hung broker can't block for
@@ -171,7 +232,8 @@ ha_pub_begin() {
 _ha_pub_confirm() {
 	local retain="$1" suffix="$2" topic="$3" tmpfile="$4" entity="$5"
 	[ -f "$tmpfile" ] || return 1
-	local mpub errf rc emsg
+	local mpub errf rc emsg locked=0
+	if _ha_lock "$entity"; then locked=1; fi
 	mpub=$(ha_mpub_cmd "$suffix")
 	mpub="$mpub -q 1"
 	[ "$retain" = "1" ] && mpub="$mpub -r"
@@ -185,6 +247,7 @@ _ha_pub_confirm() {
 		[ -s "$errf" ] && emsg=" err=$(head -c 160 "$errf" 2>/dev/null | tr '\n\r' '  ')"
 		logger -t ha-mqtt "publish FAILED rc=$rc topic=$topic$emsg"
 	fi
+	[ "$locked" = 1 ] && [ -n "$entity" ] && _ha_unlock "$entity"
 	rm -f "$tmpfile"
 	[ -n "$errf" ] && rm -f "$errf"
 	return "$rc"
