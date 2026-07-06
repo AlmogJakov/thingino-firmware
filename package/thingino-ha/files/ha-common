@@ -147,6 +147,27 @@ _ha_cache_write() {
 	fi
 }
 
+# Per-entity command epoch (/run/ha/epoch/<entity>, tmpfs). ha-commands bumps it
+# when it handles a command (BEFORE actuating/publishing); a poll captures it at
+# publish-request time and _ha_pub_confirm re-checks it UNDER the lock, so a stale
+# poll snapshot can never overwrite a newer command result. Reads "0" when the
+# entity has never been commanded, so an un-commanded entity publishes normally.
+_ha_epoch_read() {
+	local v
+	v=$(cat "/run/ha/epoch/$1" 2>/dev/null)
+	printf '%s' "${v:-0}"
+}
+
+# Bump an entity's command epoch (atomic temp+mv; ha-commands is the single
+# serial writer, so a plain increment cannot race).
+_ha_cmd_stamp() {
+	[ -n "$1" ] || return 0
+	mkdir -p /run/ha/epoch 2>/dev/null
+	local f="/run/ha/epoch/$1" n
+	n=$(cat "$f" 2>/dev/null); n=$((n + 1))
+	printf '%s' "$n" > "$f.t$$" 2>/dev/null && mv -f "$f.t$$" "$f" 2>/dev/null || rm -f "$f.t$$"
+}
+
 # ---------------------------------------------------------------------------
 # Publish queue
 #
@@ -230,10 +251,18 @@ _ha_unlock() {
 # publish leaves the cache stale so the next poll re-publishes. Failures are
 # logged. entity="" (e.g. discovery) publishes normally but is never cached.
 _ha_pub_confirm() {
-	local retain="$1" suffix="$2" topic="$3" tmpfile="$4" entity="$5"
+	local retain="$1" suffix="$2" topic="$3" tmpfile="$4" entity="$5" epoch0="$6"
 	[ -f "$tmpfile" ] || return 1
 	local mpub errf rc emsg locked=0
 	if _ha_lock "$entity"; then locked=1; fi
+	# Stale-poll guard (UNDER the lock): if a command bumped this entity's epoch
+	# since epoch0 was captured, a newer ha-commands result has superseded this
+	# snapshot -> skip (do NOT publish the old value). Not an error; return 0.
+	if [ -n "$entity" ] && [ "$(_ha_epoch_read "$entity")" != "${epoch0:-0}" ]; then
+		[ "$locked" = 1 ] && _ha_unlock "$entity"
+		rm -f "$tmpfile"
+		return 0
+	fi
 	mpub=$(ha_mpub_cmd "$suffix")
 	mpub="$mpub -q 1"
 	[ "$retain" = "1" ] && mpub="$mpub -r"
@@ -254,20 +283,20 @@ _ha_pub_confirm() {
 }
 
 _ha_queue_or_pub() {
-	local retain="$1" suffix="$2" topic="$3" tmpfile="$4" entity="$5"
+	local retain="$1" suffix="$2" topic="$3" tmpfile="$4" entity="$5" epoch0="$6"
 	if [ -n "$_HA_PUB_QUEUE_FILE" ]; then
-		printf '%s|%s|%s|%s|%s\n' "$retain" "$suffix" "$topic" "$tmpfile" "$entity" \
+		printf '%s|%s|%s|%s|%s|%s\n' "$retain" "$suffix" "$topic" "$tmpfile" "$entity" "$epoch0" \
 			>> "$_HA_PUB_QUEUE_FILE"
 	else
-		_ha_pub_confirm "$retain" "$suffix" "$topic" "$tmpfile" "$entity"
+		_ha_pub_confirm "$retain" "$suffix" "$topic" "$tmpfile" "$entity" "$epoch0"
 	fi
 }
 
 ha_pub_flush() {
 	[ -n "$_HA_PUB_QUEUE_FILE" ] || return 0
-	local retain suffix topic tmpfile entity
-	while IFS='|' read -r retain suffix topic tmpfile entity; do
-		_ha_pub_confirm "$retain" "$suffix" "$topic" "$tmpfile" "$entity"
+	local retain suffix topic tmpfile entity epoch0
+	while IFS='|' read -r retain suffix topic tmpfile entity epoch0; do
+		_ha_pub_confirm "$retain" "$suffix" "$topic" "$tmpfile" "$entity" "$epoch0"
 		usleep "$HA_PUB_DELAY_US" 2>/dev/null || true
 	done < "$_HA_PUB_QUEUE_FILE"
 	rm -f "$_HA_PUB_QUEUE_FILE"
@@ -292,6 +321,11 @@ ha_pub_state() {
 	local entity="$1" state="$2" force="${3:-0}"
 	[ -n "$state" ] || return 0
 
+	# Capture the entity's command epoch NOW (publish-request time, right after the
+	# caller read the state); re-checked under the lock at publish/flush.
+	local epoch0
+	epoch0=$(_ha_epoch_read "$entity")
+
 	# Skip only if unchanged since the last CONFIRMED publish (read-only compare).
 	# force=1 (startup/reconcile) always publishes. The cache is written by
 	# _ha_cache_write ONLY after a QoS1 PUBACK, never here.
@@ -303,12 +337,15 @@ ha_pub_state() {
 	local tmpfile
 	tmpfile=$(mktemp /tmp/ha_state.XXXXXX) || return 1
 	printf '%s' "$state" > "$tmpfile"
-	_ha_queue_or_pub 1 state "$topic" "$tmpfile" "$entity"
+	_ha_queue_or_pub 1 state "$topic" "$tmpfile" "$entity" "$epoch0"
 }
 
 # Publish a JSON state payload with the same change-detection logic.
 ha_pub_state_json() {
 	local entity="$1" payload="$2" force="${3:-0}"
+
+	local epoch0
+	epoch0=$(_ha_epoch_read "$entity")
 
 	if [ "$force" != "1" ]; then
 		_ha_state_changed "$entity" "$payload" || return 0
@@ -318,7 +355,7 @@ ha_pub_state_json() {
 	local tmpfile
 	tmpfile=$(mktemp /tmp/ha_state.XXXXXX) || return 1
 	printf '%s' "$payload" > "$tmpfile"
-	_ha_queue_or_pub 1 state "$topic" "$tmpfile" "$entity"
+	_ha_queue_or_pub 1 state "$topic" "$tmpfile" "$entity" "$epoch0"
 }
 
 # Clear a discovery topic (empty retained message removes entity from HA).

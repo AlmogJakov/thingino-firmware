@@ -63,6 +63,11 @@ dispatch() {
 	entity=$(printf '%s' "$topic" \
 		| sed "s|cameras/${HA_CAMERA_ID}/||; s|/set\$||; s|/|_|g")
 
+	# Stale-poll protection (Stage 3): bump this entity's command epoch BEFORE
+	# actuating/publishing, so any ha-state poll that already read this entity
+	# skips its now-stale snapshot at flush and lets this command's result win.
+	_ha_cmd_stamp "$entity"
+
 	case "$entity" in
 
 		motion_guard)
