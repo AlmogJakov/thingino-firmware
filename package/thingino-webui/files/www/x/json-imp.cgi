@@ -66,19 +66,23 @@ val=$(printf '%s' "$POST_DATA" | sed -n 's/.*"val"[[:space:]]*:[[:space:]]*"\{0,
 
 # Physical-privacy interlock: a manual day/night-class change (auto / day-night /
 # color / ircut) while physical privacy is on means "cancel privacy" — privacy is
-# turned off and THIS command is dropped (re-issue it afterwards). If privacy is
-# mid transition, the change is dropped with no effect. json_ok exits the script.
-# Mirrors the MQTT path (ha-commands): ircut joins the interlock; ir850/ir940/white
-# are NOT interlocked here because they go through `light`, whose guard already
-# refuses any IR/white turn-on while privacy is armed (so no extra cancel needed).
+# turned off and THIS command is dropped (re-issue it afterwards). We do NOT exit
+# here: we record the drop, SKIP applying the command, then still read back and
+# return the true (unchanged) state below so the UI corrects immediately instead
+# of showing the optimistic value until the next heartbeat. Mirrors the MQTT path
+# (ha-commands); ir850/ir940/white are NOT interlocked (they go through `light`,
+# whose guard already refuses any IR/white turn-on while privacy is armed — a
+# no-op the read-back below also captures).
+privacy_msg=""
 case "$cmd" in
   auto | daynight | color | ircut)
     if [ -x /sbin/physical-privacy ] && ! /sbin/physical-privacy guard; then
-      json_ok "physical privacy was active and has been cancelled; re-issue your command"
+      privacy_msg="physical privacy was active and has been cancelled; re-issue your command"
     fi
     ;;
 esac
 
+if [ -z "$privacy_msg" ]; then
 case "$cmd" in
   auto)
     # Delegate to the agent so runtime AND persisted config stay in sync.
@@ -134,6 +138,35 @@ case "$cmd" in
     ircut $val >/dev/null
     ;;
 esac
+fi
 
-# All state data is provided by heartbeat, no need to build payload here
-json_ok
+# Read back the true post-command state for the GPIO/ISP toggles so the UI renders
+# authoritative state (not just the optimistic value) — correcting a privacy-
+# cancelled, light-guard-refused, failed, or externally-changed toggle immediately
+# instead of waiting for the ~15s SSE heartbeat. Mapping mirrors the agent
+# heartbeat: raw numeric `<cmd> read` (else null); color_mode = image.running_mode.
+imp_num() { case "$1" in '' | *[!0-9]*) printf 'null' ;; *) printf '%s' "$1" ;; esac; }
+state=""
+case "$cmd" in
+  white | ir850 | ir940)
+    state="{\"${cmd}_state\":$(imp_num "$(light "$cmd" read 2>/dev/null)")}"
+    ;;
+  ircut)
+    state="{\"ircut_state\":$(imp_num "$(ircut read 2>/dev/null)")}"
+    ;;
+  color)
+    rm=$(echo '{"image":{"running_mode":null}}' | prudyntctl json - 2>/dev/null \
+      | grep -o '"running_mode":[^,}]*' | head -n 1 | cut -d: -f2 | tr -d ' "')
+    state="{\"color_mode\":$(imp_num "$rm")}"
+    ;;
+esac
+
+# Other state (day/night, privacy, ...) is refreshed by the fast + SSE channels.
+http_200
+json_header
+if [ -n "$state" ]; then
+  printf '{"code":200,"result":"success","state":%s,"message":"%s"}\n' "$state" "$privacy_msg"
+else
+  printf '{"code":200,"result":"success","message":"%s"}\n' "$privacy_msg"
+fi
+exit 0

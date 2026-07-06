@@ -42,10 +42,17 @@ const FastStatusEndpoint = "/x/json-status-fast.cgi";
 const FastStatusPollInterval = 2 * 1000;
 const HealthStatusEndpoint = "/x/json-status-health.cgi";
 const HealthStatusPollInterval = 7 * 1000;
+// Live day/night channel: gain + brightness only, from a single cheap prudyntctl
+// query (json-daynight.cgi). These are the only fast-changing status values; the
+// rest of the heartbeat is rare and streams on the slow ~15s SSE.
+const LiveGainEndpoint = "/x/json-daynight.cgi";
+const LiveGainPollInterval = 5 * 1000;
 let fastStatusTimer = null;
 let fastStatusInFlight = false;
 let healthStatusTimer = null;
 let healthStatusInFlight = false;
+let liveGainTimer = null;
+let liveGainInFlight = false;
 let physPrivDesired = null;
 let physPrivDesiredAt = 0;
 let cpuSamples = [];
@@ -945,7 +952,7 @@ async function toggleButton(el) {
     .then((res) => res.json())
     .then((data) => {
       console.log(data.message);
-      // Map button IDs to their heartbeat UI keys and update immediately
+      // Optimistic fallback: map button IDs to their heartbeat UI keys.
       const keyMap = {
         color: { color_mode: newState },
         ircut: { ircut_state: newState },
@@ -957,16 +964,25 @@ async function toggleButton(el) {
           daynight_mode: newState ? undefined : "day",
         },
       };
-      const update = keyMap[el.id];
+      // Prefer the AUTHORITATIVE read-back json-imp.cgi returns in data.state
+      // (e.g. {white_state:0}). It reflects a privacy-cancelled, light-guard-
+      // refused or otherwise no-op command, so the badge shows reality at once
+      // instead of the optimistic value until the ~15s SSE. Fall back to the
+      // optimistic newState only when no (or a null) read-back was returned.
+      let update = null;
+      if (data && data.state && typeof data.state === "object") {
+        const k = Object.keys(data.state)[0];
+        if (k && data.state[k] !== null) update = data.state;
+      }
+      if (!update) update = keyMap[el.id];
       if (update) {
         // Remove undefined values (e.g. daynight_mode when enabling auto)
         Object.keys(update).forEach(
           (k) => update[k] === undefined && delete update[k],
         );
         updateHeartbeatUi(update);
-      } else {
-        el.classList.remove("pending");
       }
+      el.classList.remove("pending");
     })
     .catch((err) => {
       console.error("toggleButton error", err);
@@ -1014,10 +1030,12 @@ function updateHeartbeatUi(json) {
 
   const hasBrightness =
     typeof json.daynight_brightness !== "undefined" &&
+    json.daynight_brightness !== null &&
     json.daynight_brightness !== "unknown" &&
     json.daynight_brightness !== "";
   const hasTotalGain =
     typeof json.total_gain !== "undefined" &&
+    json.total_gain !== null &&
     json.total_gain !== "unknown" &&
     json.total_gain !== "" &&
     json.total_gain >= 0;
@@ -1473,6 +1491,62 @@ function startFastStatus() {
   fetchFastStatus();
 }
 
+// Live day/night channel: gain + brightness ONLY, from a single cheap prudyntctl
+// query (~0-30ms) via json-daynight.cgi. Same discipline as the other channels:
+// password/visibility-gated, single-in-flight, immediate first fetch, no writes,
+// no daemon; stopped on hide/close. The slow ~15s SSE still carries gain too, so
+// a failed fetch here just falls back to the slower value (never a wrong number).
+async function fetchLiveGainStatus() {
+  if (
+    liveGainInFlight ||
+    !passwordCheckComplete ||
+    isDefaultPassword ||
+    document.hidden
+  ) {
+    return;
+  }
+
+  liveGainInFlight = true;
+
+  try {
+    const response = await fetch(LiveGainEndpoint, {
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+    if (response.ok) {
+      updateHeartbeatUi(await response.json());
+    }
+  } catch (error) {
+    // Best-effort: the slow SSE heartbeat still carries gain as a fallback.
+  } finally {
+    liveGainInFlight = false;
+    scheduleLiveGainStatus();
+  }
+}
+
+function scheduleLiveGainStatus(delay = LiveGainPollInterval) {
+  if (liveGainTimer) {
+    clearTimeout(liveGainTimer);
+    liveGainTimer = null;
+  }
+
+  if (!passwordCheckComplete || isDefaultPassword || document.hidden) {
+    return;
+  }
+
+  liveGainTimer = setTimeout(() => {
+    liveGainTimer = null;
+    fetchLiveGainStatus();
+  }, delay);
+}
+
+function startLiveGainStatus() {
+  if (liveGainTimer || liveGainInFlight) {
+    return;
+  }
+  fetchLiveGainStatus();
+}
+
 // Health channel: CPU / RAM / storage. Split off the 2s fast channel onto a
 // slower ~7s cadence (these metrics don't need 2s freshness and the CPU sample
 // costs a short in-request window). Read-only, browser-visible-only (self-gated
@@ -1549,9 +1623,14 @@ function cleanupHeartbeatResources() {
     clearTimeout(healthStatusTimer);
     healthStatusTimer = null;
   }
+  if (liveGainTimer) {
+    clearTimeout(liveGainTimer);
+    liveGainTimer = null;
+  }
   slowHeartbeatInFlight = false;
   fastStatusInFlight = false;
   healthStatusInFlight = false;
+  liveGainInFlight = false;
   currentReconnectDelay = HeartBeatReconnectDelay;
 }
 
@@ -1591,6 +1670,7 @@ function heartbeat() {
   startSlowHeartbeatStatus();
   startFastStatus();
   startHealthStatus();
+  startLiveGainStatus();
 }
 
 function initCopyToClipboard() {

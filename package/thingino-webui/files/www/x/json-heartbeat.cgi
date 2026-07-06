@@ -17,8 +17,13 @@ agent_port() {
 }
 
 AGENT_URL="http://127.0.0.1:$(agent_port)"
-HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-5}"
-HEARTBEAT_RETRY_MS=$((HEARTBEAT_INTERVAL * 1000))
+HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-15}"
+HEARTBEAT_RETRY_MS="${HEARTBEAT_RETRY_MS:-5000}"
+# Emit a lightweight SSE keepalive comment every KEEPALIVE seconds so uhttpd's
+# network timeout (-T) never trips on the idle gap and a client disconnect is
+# detected within ~KEEPALIVE s (SIGPIPE on the ping), even though the expensive
+# agent heartbeat only runs every HEARTBEAT_INTERVAL s.
+HEARTBEAT_KEEPALIVE="${HEARTBEAT_KEEPALIVE:-5}"
 
 http_200() { printf 'Status: 200 OK\r\n'; }
 
@@ -39,5 +44,13 @@ while true; do
 	else
 		printf 'data: {"error":"Heartbeat daemon not running"}\n\n' || exit 0
 	fi
-	sleep "$HEARTBEAT_INTERVAL" || exit 0
+	# Interruptible, keepalive-sliced wait: a trapped signal breaks the wait at
+	# once; between slices a ":" SSE comment (ignored by EventSource) keeps the
+	# connection alive and surfaces a client disconnect promptly via SIGPIPE.
+	_waited=0
+	while [ "$_waited" -lt "$HEARTBEAT_INTERVAL" ]; do
+		sleep "$HEARTBEAT_KEEPALIVE" & wait $! || exit 0
+		_waited=$((_waited + HEARTBEAT_KEEPALIVE))
+		[ "$_waited" -lt "$HEARTBEAT_INTERVAL" ] && { echo ":" || exit 0; }
+	done
 done
