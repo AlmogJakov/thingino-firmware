@@ -62,6 +62,13 @@ run_commands() {
 		sleep 5
 		mpub=$(ha_mpub_cmd daemon)
 		sh -c "$mpub -r -t '${HA_AVAIL_TOPIC}' -m 'online'" 2>/dev/null
+		# On-reconnect reconcile: the subscriber just dropped (often a broker
+		# restart, which may have wiped retained state). Re-assert every entity's
+		# true state now, BEFORE the subscriber restarts on the next loop -- since
+		# ha-commands is NOT running here, no command can be in flight to race, and
+		# a concurrent periodic ha-state serialises per-entity via the Stage 2 lock.
+		# This is the primary recovery for broker-side retained loss.
+		ha-state force
 	done
 }
 run_commands &
@@ -138,15 +145,19 @@ STATE_INTERVAL="${STATE_INTERVAL:-15}"
 DISC_INTERVAL=$(ha_cfg discovery_interval)
 DISC_INTERVAL="${DISC_INTERVAL:-3600}"
 
-# Periodic full reconcile: force-publish every entity's true state on this cadence
-# so a stale retained MQTT value cannot stay stuck if a publish-on-change update was
-# ever dropped. mosquitto_pub failures are silently swallowed (_ha_pub_exec) and the
-# change-detection cache is written BEFORE the send, so a dropped update leaves the
-# cache matching reality while the broker keeps the old retained value -> it is never
-# re-sent. This force pass re-asserts all states and heals any such drift within the
-# interval. MQTT-only, no flash (ha-state reads /proc, GPIO, prudyntctl, jct get).
+# Low-frequency reconcile BACKSTOP. Since the confirm-then-cache fix (ha-common
+# Stages 1-3) a DROPPED publish no longer sticks: the cache is written only after
+# a QoS1 PUBACK, so a failed publish leaves cache != reality and the normal 15s
+# ha-state poll re-publishes it. This periodic `ha-state force` is therefore NO
+# LONGER the dropped-publish heal; it only covers BROKER-SIDE retained loss
+# (broker restart without persistence), which confirm-then-cache cannot detect
+# (cache == reality, nothing to re-send). The primary recovery for that is the
+# on-reconnect force in run_commands(); this timer is just the slow safety net,
+# so it runs at 900s (was 300s). MQTT-only, no flash. A concurrent HA command is
+# never overwritten by the force: the Stage 2 per-entity lock serialises them and
+# the Stage 3 epoch guard makes the force skip any entity a command just changed.
 RECONCILE_INTERVAL=$(ha_cfg reconcile_interval)
-RECONCILE_INTERVAL="${RECONCILE_INTERVAL:-300}"
+RECONCILE_INTERVAL="${RECONCILE_INTERVAL:-900}"
 
 elapsed=0
 since_reconcile=0
