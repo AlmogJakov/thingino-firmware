@@ -1084,6 +1084,19 @@ Question: does anything write persistent flash (jffs2 `/overlay`, 224 KB) except
 3. Keep the health-channel storage monitor (~80 % alert) + the tmpfs-for-runtime-state pattern; land the Phase 3 firmware rebuild (bake fixes into `/rom` -> overlay clears to a few KB).
 The `tz-update` path needs no change (bounded + correct).
 
+### 11.7 Web UI live-status latency - Option B split (`bd2dde208`, BUILD-ONLY, not deployed)
+Session 2026-07-06. Splits the fast-changing gain/brightness out of the heavy ~650 ms agent SSE so it no longer runs every 5 s, and makes LED/colour/ircut toggles show authoritative state at once. **4 files** (supersedes 11.5's "no change"; addresses 11.2's deferred light-read cost by polling *less often*, not by caching):
+- **NEW `www/x/json-daynight.cgi`** - cheap gain/brightness endpoint: one `prudyntctl json '{"daynight":{"status":null}}'` (~0 ms), inline `grep` parse (`total_gain` + `brightness_percent`), `require_auth`, **no temp file / no writes**. Polled by a **new `main.js` LiveGain 5 s channel** (fetch/schedule/start, gated on password + `document.hidden`, cleared in `cleanupHeartbeatResources()` = zero idle, immediate first fetch).
+- **`main.js`** - the LiveGain channel + a **null-guard fix**: `hasTotalGain`/`hasBrightness` now reject JSON `null` (JS quirk: `null >= 0` is `true`), so a null read-back (prudynt down/restarting) keeps the last value instead of blanking the badge.
+- **`www/x/json-heartbeat.cgi`** - full-heartbeat cadence **5 s -> 15 s**; a 5 s `:` SSE keepalive comment keeps output flowing (avoids uhttpd's `-T 15` network timeout dropping a silent stream) + a fixed 5 s reconnect retry; interruptible `sleep & wait $!` for prompt disconnect cleanup (busybox ash defers a trap until an external `sleep` returns).
+- **`www/x/json-imp.cgi`** - authoritative read-back of the true post-command state for `white`/`ir850`/`ir940`/`ircut`/`color` (returned as `data.state`; mapping mirrors the agent heartbeat exactly). The privacy interlock now records the drop + SKIPS applying but STILL returns the true (unchanged) state, so a privacy-cancelled or light-guard-refused **no-op toggle shows reality at once** instead of the optimistic value.
+
+**Build-only reason:** `main.js` (~104 KB) exceeds the ~92 KB free jffs2 overlay, so it CANNOT be live-copied (§5 / the flash-overlay-space failure). The whole set ships via the **next firmware build** (baked into `/rom`, zero overlay cost). **Not deployed live** - validated only via `/tmp` harnesses + read-only device reads; the camera is untouched. Adversarial review (5 lenses / 10 agents): 1 low bug FIXED (the null-guard), rest nit/accepted/false-positive.
+
+**Expected after next build:** gain first value ~66 ms (was ~650 ms), refresh ~5 s; full heartbeat (LED/colour/ircut/motion/privacy/WG/rec/uptime) every 15 s; server CPU while viewing **~18 % -> ~10.6 %** (the heavy agent call runs 3x less); SSE still emits every 5 s (keepalive) so uhttpd never drops it; IR/white/colour/ircut toggles reflect true state instantly incl. interlock/no-op; external/auto LED changes reflect <=15 s (day/night *mode* still <=2 s via the fast channel); hidden/closed tab = zero idle; prudynt-down keeps the last gain value.
+
+**Rollback:** `git revert bd2dde208` (or drop the commit) before the build.
+
 ---
 
 ## Build & validate (reminder)
