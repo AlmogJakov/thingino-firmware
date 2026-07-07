@@ -29,6 +29,11 @@ RETRY_DELAY=5
 # Per-probe hard timeout (applies to curl AND to nc).
 CHECK_TIMEOUT=5
 
+# Hard timeout for the local frame-liveness query (prudyntctl control socket).
+# A healthy prudynt answers in ~0s; a hung control socket is killed and treated
+# as INCONCLUSIVE (never as "frozen"), so it can never cause a needless restart.
+FRAME_CHECK_TIMEOUT=3
+
 # Startup / post-relaunch GRACE (seconds), measured monotonically. MUST exceed
 # the worst-case HEALTHY bringup. With 0009: serial ch0(45s)+ch1(45s) ~= 90s,
 # plus cold/power-cut sensor IMP init (M1: wait_for_sensor_resolution +
@@ -161,16 +166,40 @@ check_with_nc() {
 		| grep -q "RTSP/1.0 200"
 }
 
-# One probe pass: curl, then raw-nc fallback. Classifies serving vs not-serving;
-# never itself a restart trigger (only via the grace + streak gates in watch()).
+# Frame-liveness via prudynt's LOCAL control socket (NO RTSP/HTTP auth needed).
+# stream0.stats.fps is the MEASURED encoder output rate; on a socket-up-but-frozen
+# prudynt (VPU wedge / 0005 in-process rebuild loop / a channel that stopped
+# emitting) it reads 0 while RTSP OPTIONS still returns 200 -- the exact life-safety
+# blind spot this watchdog otherwise misses. Returns:
+#   0 = frames flowing (fps > 0)
+#   1 = CONFIRMED frozen (SUCCESSFUL query, fps == 0)
+#   2 = INCONCLUSIVE (no prudyntctl / query failed / timeout / non-numeric)
+# FAIL-SAFE: only an explicit fps==0 from a SUCCESSFUL query is treated as frozen;
+# every hiccup is INCONCLUSIVE and never downgrades serving, so a transient control-
+# socket stall can NOT drive a self-inflicted restart. Cost is a ~0ms local query.
+check_frames() {
+	command -v prudyntctl >/dev/null 2>&1 || return 2
+	local _out _fps
+	_out=$(timeout "$FRAME_CHECK_TIMEOUT" prudyntctl json '{"stream0":{"stats":null}}' 2>/dev/null) || return 2
+	_fps=$(printf '%s' "$_out" | grep -o '"fps":[0-9]*' | head -n 1 | cut -d: -f2)
+	case "$_fps" in
+		'' | *[!0-9]*) return 2 ;;   # no numeric fps -> inconclusive (do NOT penalize)
+	esac
+	[ "$_fps" -gt 0 ] && return 0    # frames flowing
+	return 1                          # SUCCESSFUL query, fps==0 -> confirmed frozen
+}
+
+# One probe pass: OPTIONS socket liveness (curl, then raw-nc fallback) AND, when the
+# socket is up, a frame-liveness confirmation. A CONFIRMED-frozen encoder (fps==0)
+# now counts as NOT serving so the existing grace + DOWN_STREAK + reboot ladder can
+# act; an inconclusive frame check is treated as serving (fail-safe). Never itself a
+# restart trigger (only via the grace + streak gates in watch()).
 check_rtsp_stream() {
-	if check_with_curl; then
-		return 0
-	fi
-	if check_with_nc; then
-		return 0
-	fi
-	return 1
+	local _frc
+	check_with_curl || check_with_nc || return 1   # socket down -> not serving
+	check_frames; _frc=$?                            # socket up -> confirm frames flowing
+	[ "$_frc" -eq 1 ] && return 1                    # CONFIRMED frozen (fps==0) -> not serving
+	return 0                                          # flowing OR inconclusive -> serving
 }
 
 # Up to RETRY_COUNT passes; success on any. Worst-case duration on a fully-down
