@@ -1099,6 +1099,83 @@ Session 2026-07-06. Splits the fast-changing gain/brightness out of the heavy ~6
 
 ---
 
+## 12. Reliability safety batch — Steps 1-5 (2026-07-07)
+Staged from the 2026-07-07 production-readiness audit (46 review agents, 27 confirmed findings).
+Each fix is its own commit with a `/opt/wd-bak/<name>.orig` backup, validated before deploy and
+verified after. **Branch `pt2-firmware`, final commit `af35c0ad6`.** Batch commit range
+`5a7a58477..af35c0ad6` (9 commits), plus the earlier Option B Web-UI commit `bd2dde208`.
+System invariants held throughout: prudynt PID unchanged, RTSP 200, SSH connected, no unexpected
+restart/reboot, no new errors.
+
+### 12.1 Deployed LIVE to cam4 (active now — rootfs; took effect without a build)
+- **Step 1 — watchdog frame-liveness probe** (`5a7a58477`, `overlay/etc/init.d/S32prudyntwd`):
+  detects a socket-up-but-frozen/black stream that the OPTIONS-only probe was blind to, via a
+  local `prudyntctl` `stream0.stats.fps` check, and arms the reboot ladder. Fail-safe: only a
+  CONFIRMED `fps==0` downgrades "serving"; any query hiccup is INCONCLUSIVE (treated as serving),
+  so it can never cause a self-inflicted restart.
+- **Step 2a — prudynt OOM protection `oom_score_adj=-800`** (`083677018`, `package/prudynt-t/files/S31prudynt`):
+  makes prudynt a near-last-resort OOM victim (was `oom_score` 197 = first victim on this 36 MB
+  no-swap box); re-applied on every start/restart; `start-stop-daemon` return code preserved.
+- **Step 2b — dropbear SSH-listener OOM protection `-500`** (`2fbba09ef`, new `overlay/etc/init.d/S33oomprotect`):
+  keeps remote-recovery SSH out of the OOM killer's first picks; children inherit the score.
+- **Step 2b-ii — watchdog auto-re-asserts dropbear `-500` ≤60 s** (`b6776c415`, `S32prudyntwd`):
+  a check-then-set line in the existing loop re-applies the shield after a mid-run dropbear restart.
+- **Step 3b — `agent.cgi` non-streaming curl bounded** `--connect-timeout 2 --max-time 8`
+  (`79d0734bb`): a stalled/deadlocked agent can no longer hang the Web UI. The SSE `curl -N`
+  streaming path is deliberately left unbounded.
+- **Step 3c — all 8 HA direct publishes wrapped in `timeout ${HA_PUB_TIMEOUT:-4}`** (`bc42afe36`,
+  `ha-common`/`ha-state`/`ha-daemon`/`ha-discovery`): a broker/Wi-Fi outage can no longer stall the
+  synchronous ha-daemon loop for minutes. `_ha_pub_confirm` was already wrapped.
+- **Step 5 — `physical-privacy off --force` explicit fail-open escape** (`af35c0ad6`,
+  `overlay/usr/sbin/physical-privacy`): a motor-readback fault can no longer pin the camera blind
+  with no software override. Default `off` stays fail-CLOSED; `do_guard` never force-opens; no
+  automatic fail-open, no persistent state.
+
+### 12.2 BUILD-ONLY — active only AFTER the firmware build + flash
+- **Option B Web-UI live-status split** (`bd2dde208`): LiveGain 5 s channel + `json-daynight.cgi`
+  + full SSE heartbeat slowed to 15 s w/ 5 s keepalive + null-guard. Build-only because `main.js`
+  (~104 KB) exceeds the ~92 KB overlay free and cannot be live-copied.
+- **Step 3a — `json-daynight.cgi` prudyntctl `timeout 2`** (`08a7eee2a`): ships with Option B
+  (the CGI is not on the live device).
+- **Step 4 — prudynt patch `0005` bounded VPU-stall exit** (`777c6427a`): after 3 in-process
+  rebuilds that don't restore a frame, raise `kill(getpid(), SIGTERM)` (the `0011` clean-exit
+  idiom) so a hard VPU wedge recovers via S31/S32 instead of looping alive-but-frameless. Baked
+  into the prudynt binary. Regenerated from `themactep/prudynt-t@f4b3228` + `0001-0004`,
+  `git apply --check` clean.
+
+### 12.3 Deferred (agreed — not in this batch)
+- **2c `vm.min_free_kbytes`** — delicate reclaim knob on a 36 MB no-swap box; the real OOM safety
+  (victim ordering) is already done.
+- Watchdog **over-count** (counts legitimate external restarts) + **cross-boot circuit-breaker**
+  (needs a new persistent write).
+- Low-priority lows: RTSP `max_clients` cap, Wi-Fi power-save/`bgscan`, DHCP-renew address flush,
+  `S00blink` (dead code), WebUI session expiry.
+
+### 12.4 Post-build / post-flash validation checklist
+1. SSH reconnects (~2-5 min); Wi-Fi `Zoe2.4` up; `/root/.ssh/authorized_keys` intact; day/night +
+   physical-privacy state preserved.
+2. Build-only fixes ACTIVE: `json-daynight.cgi` has `timeout 2`; `main.js` LiveGain channel
+   present; prudynt binary shows the `0005` stall-exit log string; Option B channels work.
+3. Rootfs fixes baked in `/rom`: `S32prudyntwd` (`check_frames` + dropbear re-assert), `S31prudynt`
+   (`-800`), `S33oomprotect`, `physical-privacy --force`, `ha-*`/`agent.cgi` timeouts.
+4. Runtime: prudynt `oom_score_adj=-800`, dropbear `-500`, watchdog running (frame-probe), RTSP
+   `200`, streaming healthy.
+5. Overlay reclaimed (optional: `rm` each `/overlay` copy whose md5 matches `/rom`).
+6. Clean cold-boot (the flash-reboot is itself the test) + short soak; no new errors.
+
+### 12.5 Operational notes
+- **Overlay usage rose on the live unit** to ~75 % (168 KB used / 56 KB free) from the live rootfs
+  deploys (copy-ups of the modified scripts). Still safe, but monitor.
+- **The firmware build reclaims overlay space** — once the fixes bake into `/rom`, the overlay
+  copies are redundant and can be removed, dropping the overlay back to a few KB.
+- **DO NOT FLASH without:** (a) off-device backups of mtd2 `config` + mtd3 `kernel` + mtd4 `rootfs`;
+  (b) a **verified config-preserving** `sysupgrade` plan — mtd2 holds Wi-Fi `Zoe2.4` + the SSH
+  authorized_keys, so losing it means losing the remote camera; and (c) confirmed physical
+  UART/U-Boot recovery access. `sysupgrade` also requires `fw_setenv enable_updates true` + a reboot
+  first.
+
+---
+
 ## Build & validate (reminder)
 - prudynt C++ ships **only** via patches `0001`-`0016` in `package/all-patches/prudynt-t/`
   (auto-applied; source git-fetched at `f4b3228` - never hand-edit source). There is **no**
