@@ -15,7 +15,12 @@ H2 (VideoWorker.cpp) — bounded stall recovery: stock prudynt incremented
    if no encoded frame is produced for kStallRestartMs (8s), request the proven
    pipeline rebuild (global_restart_video + cv notify, under mutex_main). Reset
    on every delivered frame and on subscriber (re)connect so an idle, viewer-
-   less stream never trips it.
+   less stream never trips it. ESCALATION: if kMaxStallRestarts (3) consecutive
+   stalls still produce no frame, the in-process rebuild cannot fix a hard VPU
+   wedge (reboot-only) -> raise SIGTERM (the 0011 clean-exit idiom, handled by
+   the shutdown-signal thread) so the process exits, the RTSP socket drops, and
+   the S31/S32 reclaim+reboot ladder recovers the VPU instead of looping
+   alive-but-frameless forever. Counter resets on any delivered frame.
 
 M5 (DayNightWorker.cpp + /sbin/daynight) — honour the optics-switch result:
    apply_mode() now returns bool (the /sbin/daynight exit status), and all four
@@ -231,28 +236,55 @@ index d252a39..5630b15 100644
        add_key(out, s2, "force_mode");
        add_str(out, mode);
 diff --git a/src/VideoWorker.cpp b/src/VideoWorker.cpp
-index 59d5fb3..bc08e4c 100644
+index 59d5fb3..eb7030f 100644
 --- a/src/VideoWorker.cpp
 +++ b/src/VideoWorker.cpp
-@@ -39,6 +39,28 @@ void VideoWorker::run() {
+@@ -3,6 +3,8 @@
+ #include <algorithm>
+ #include <chrono>
+ #include <cstring>
++#include <signal.h>
++#include <unistd.h>
+ 
+ #include "Config.hpp"
+ #include "IMPEncoder.hpp"
+@@ -39,6 +41,46 @@ void VideoWorker::run() {
    uint32_t bps = 0;
    uint32_t fps = 0;
    uint32_t error_count = 0; // Keep track of polling errors
-+  // Bounded stall recovery: if the encoder yields no frame for kStallRestartMs
-+  // (GetStream keeps failing or PollingStream keeps timing out), request the
-+  // proven pipeline rebuild instead of spinning forever on `continue`. Stock
-+  // prudynt incremented error_count but never acted on it -> a wedged encoder
-+  // meant a silent, permanent black live view on a 24/7 life-guard camera.
-+  // Reset on every delivered frame and on subscriber (re)connect so an idle
-+  // stream that simply has no viewers never trips it.
++  // Bounded stall recovery + escalation: if the encoder yields no frame for
++  // kStallRestartMs (GetStream keeps failing or PollingStream keeps timing
++  // out), request the proven pipeline rebuild instead of spinning forever on
++  // `continue`. Stock prudynt incremented error_count but never acted on it ->
++  // a wedged encoder meant a silent, permanent black live view. Reset on every
++  // delivered frame and on subscriber (re)connect so an idle, viewer-less
++  // stream never trips it. If kMaxStallRestarts consecutive stalls all fail to
++  // restore frames, the in-process rebuild cannot fix it (a hard T23 VPU wedge
++  // is reboot-only) -> raise SIGTERM for a CLEAN exit (the 0011 idiom: the
++  // shutdown-signal thread turns it into a graceful shutdown), so the process
++  // exits, the RTSP socket drops, and the S31/S32 reclaim+reboot ladder can
++  // recover the VPU instead of looping alive-but-frameless forever.
 +  constexpr uint64_t kStallRestartMs = 8000;
++  constexpr int kMaxStallRestarts = 3; // in-process rebuild attempts before exit
 +  uint64_t last_progress_ms = monotonic_ms();
++  int stall_restart_count = 0; // consecutive stalls with no recovered frame
 +  auto request_restart_if_stalled = [&]() {
 +    uint64_t idle = monotonic_ms() - last_progress_ms;
 +    if (idle <= kStallRestartMs)
 +      return;
++    if (++stall_restart_count > kMaxStallRestarts) {
++      LOG_ERROR("VideoWorker ch"
++                << encChn << ": " << (stall_restart_count - 1)
++                << " pipeline rebuilds did not restore frames; raising SIGTERM "
++                   "for VPU reclaim (S31/S32 recovery)");
++      kill(getpid(), SIGTERM);
++      last_progress_ms = monotonic_ms(); // don't re-raise while shutting down
++      return;
++    }
 +    LOG_ERROR("VideoWorker ch" << encChn << ": no encoded frame for " << idle
-+                               << "ms; requesting pipeline restart");
++                               << "ms; requesting pipeline restart ("
++                               << stall_restart_count << "/" << kMaxStallRestarts
++                               << ")");
 +    {
 +      std::lock_guard<std::mutex> lk(mutex_main);
 +      global_restart_video = true;
@@ -263,15 +295,16 @@ index 59d5fb3..bc08e4c 100644
    unsigned long long ms = 0;
    bool run_for_jpeg = false;
    auto video_state = global_video[encChn];
-@@ -296,6 +318,7 @@ void VideoWorker::run() {
+@@ -296,6 +338,8 @@ void VideoWorker::run() {
        ts_last_rtp_us = 0;
        ts_current_frame_us = 0;
        ts_have_current_frame = false;
 +      last_progress_ms = monotonic_ms(); // fresh start; don't count idle as stall
++      stall_restart_count = 0;
      }
      had_video_clients = video_clients_active;
  
-@@ -354,6 +377,7 @@ void VideoWorker::run() {
+@@ -354,6 +398,7 @@ void VideoWorker::run() {
          if (IMP_Encoder_GetStream(encChn, &stream, GET_STREAM_BLOCKING) != 0) {
            LOG_ERROR("IMP_Encoder_GetStream(" << encChn << ") failed");
            error_count++;
@@ -279,18 +312,19 @@ index 59d5fb3..bc08e4c 100644
            continue;
          }
  
-@@ -362,6 +386,10 @@ void VideoWorker::run() {
+@@ -362,6 +407,11 @@ void VideoWorker::run() {
            continue;
          }
  
 +        // A real encoded frame arrived — the encoder is making progress.
 +        error_count = 0;
 +        last_progress_ms = monotonic_ms();
++        stall_restart_count = 0;
 +
          int64_t nominal_frame_step_us = 33333;
          if (video_state && video_state->stream &&
              video_state->stream->fps > 0) {
-@@ -820,6 +848,7 @@ void VideoWorker::run() {
+@@ -820,6 +870,7 @@ void VideoWorker::run() {
          }
        } else {
          error_count++;
