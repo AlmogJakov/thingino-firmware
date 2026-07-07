@@ -368,7 +368,13 @@ watch() {
 				sleep "$(current_interval)"
 				continue
 			fi
-			# Re-check said it is actually alive: fall through and treat as ALIVE.
+			# Re-check said prudynt is actually alive: it REAPPEARED during the confirm
+			# window (e.g. an external `service restart prudynt` landing inside it). Treat
+			# it as a FRESH incarnation -- arm the bringup grace and reset DOWN_STREAK so
+			# the next slow-startup interval is not counted as an immediate serving failure
+			# (mirrors the LAST_LIVE 0->1 new-incarnation handler above).
+			arm_grace
+			DOWN_STREAK=0
 			LAST_LIVE=1
 		fi
 
