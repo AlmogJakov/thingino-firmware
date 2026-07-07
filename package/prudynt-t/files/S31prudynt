@@ -91,6 +91,21 @@ stop_heartbeat() {
 
 start_daemon() {
 	start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON"
+	_ssd_rc=$?
+	# OOM protection (this unit: ~36MB RAM, NO swap). Without it the kernel OOM
+	# killer targets prudynt FIRST (largest RSS = highest badness), taking the
+	# life-safety stream down under memory pressure. -800 makes prudynt a near-
+	# last-resort victim while staying killable in extremis (deliberately NOT
+	# -1000, so a genuine prudynt leak can still be reaped and the box can recover
+	# instead of hanging). Applied on EVERY start/restart (all start paths funnel
+	# here). Best-effort; MUST NOT change start_daemon's return code (start()
+	# branches on it and the watchdog reads it to decide grace re-arm).
+	_op=$(cat "$PIDFILE" 2>/dev/null)
+	case "$_op" in
+		'' | *[!0-9]*) ;;
+		*) [ -w "/proc/$_op/oom_score_adj" ] && echo -800 > "/proc/$_op/oom_score_adj" 2>/dev/null ;;
+	esac
+	return "$_ssd_rc"
 }
 
 # --- C1: validate-and-restore prudynt.json (brick prevention) --------------
