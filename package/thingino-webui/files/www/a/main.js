@@ -1666,11 +1666,11 @@ function heartbeat() {
   if (document.hidden) {
     return;
   }
-  startHeartbeatSse();
-  startSlowHeartbeatStatus();
   startFastStatus();
   startHealthStatus();
   startLiveGainStatus();
+  startHeartbeatSse();
+  startSlowHeartbeatStatus();
 }
 
 function initCopyToClipboard() {
