@@ -1,0 +1,45 @@
+#!/bin/sh
+# S33oomprotect - shield the remote-recovery path (SSH) from the OOM killer.
+#
+# On this ~36MB no-swap unit the kernel OOM killer picks the largest-RSS process;
+# if it kills the dropbear SSH listener we lose remote recovery. Pin the listener's
+# oom_score_adj so it is a near-last-resort victim; its per-session children inherit
+# the score at fork. prudynt (the video pipeline) is protected separately and MORE
+# strongly in S31prudynt (-800), so prudynt stays the single most-protected process.
+#
+# Boot one-shot, and safe to re-run manually after any dropbear restart:
+#     /etc/init.d/S33oomprotect start        # (or restart)
+# It does NOT touch dropbear itself (no fork of the Buildroot S30dropbear) and adds
+# NO loop / daemon / cron. Best-effort: never fails, never blocks boot.
+
+DROPBEAR_PIDFILE="/run/dropbear.pid"
+DROPBEAR_OOM_ADJ="-500"
+
+# set_adj PID ADJ  -- numeric-guarded, best-effort; the [ -w ] test means a stale/
+# missing proc path is skipped cleanly (no redirect-open error leak). Always rc 0.
+set_adj() {
+	case "$1" in
+		'' | *[!0-9]*) return 0 ;;
+	esac
+	[ -w "/proc/$1/oom_score_adj" ] && echo "$2" > "/proc/$1/oom_score_adj" 2>/dev/null
+	return 0
+}
+
+start() {
+	set_adj "$(cat "$DROPBEAR_PIDFILE" 2>/dev/null)" "$DROPBEAR_OOM_ADJ"
+}
+
+case "$1" in
+	start | restart | reload)
+		start
+		;;
+	stop)
+		: # nothing to undo; a reboot resets oom_score_adj anyway
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+		;;
+esac
+
+exit 0
