@@ -195,7 +195,7 @@ BODY_OUT=$(mktemp /tmp/agent-cgi-out.XXXXXX) || {
 	json_error '500 Internal Server Error' 'Unable to create temporary response file.'
 }
 
-set -- -sS -D "$HEADERS_FILE" -o "$BODY_OUT" -X "${REQUEST_METHOD:-GET}"
+set -- -sS --connect-timeout 2 --max-time 8 -D "$HEADERS_FILE" -o "$BODY_OUT" -X "${REQUEST_METHOD:-GET}"
 if [ -n "$CONTENT_TYPE" ]; then
 	set -- "$@" -H "Content-Type:$CONTENT_TYPE"
 fi
