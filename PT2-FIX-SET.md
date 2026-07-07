@@ -49,7 +49,7 @@ is **not** installed into the firmware image.
   were edited live, filling the tiny jffs2 config overlay.
 
 ### What was fixed
-- **prudynt binary:** 16 source patches `0001`-`0016` (auto-applied by buildroot's global
+- **prudynt binary:** 17 source patches `0001`-`0017` (auto-applied by buildroot's global
   patch dir; the source is git-fetched at `f4b3228` and never hand-edited). For day/night
   persistence, patch `0015` makes `CFG::load()` read the `/etc/daynight.state` sidecar
   **directly** (a zero-allocation static-literal overlay) and set `daynight.enabled` /
@@ -1141,7 +1141,7 @@ restart/reboot, no new errors.
   rebuilds that don't restore a frame, raise `kill(getpid(), SIGTERM)` (the `0011` clean-exit
   idiom) so a hard VPU wedge recovers via S31/S32 instead of looping alive-but-frameless. Baked
   into the prudynt binary. Regenerated from `themactep/prudynt-t@f4b3228` + `0001-0004`,
-  `git apply --check` clean.
+  `git apply --check` clean. NOTE: `0005` is the broader **T23 life-guard fault-tolerance** patch (it also carries the bounded prudyntctl IPC socket timeout, honour-actuation-result day/night switch, and persist-forced-mode - see section 3-G); this batch ADDED its bounded VPU-stall exit.
 
 ### 12.3 Deferred (agreed — not in this batch)
 - **2c `vm.min_free_kbytes`** — delicate reclaim knob on a 36 MB no-swap box; the real OOM safety
@@ -1177,7 +1177,7 @@ restart/reboot, no new errors.
 ---
 
 ## Build & validate (reminder)
-- prudynt C++ ships **only** via patches `0001`-`0016` in `package/all-patches/prudynt-t/`
+- prudynt C++ ships **only** via patches `0001`-`0017` in `package/all-patches/prudynt-t/`
   (auto-applied; source git-fetched at `f4b3228` - never hand-edit source). There is **no**
   `package/all-patches/thingino-jct/` (the jct atomic-write fork was dropped; `prudynt.json` uses
   stock jct).
@@ -1186,7 +1186,7 @@ restart/reboot, no new errors.
   (§3-K). `ingenic-uclibc.mk` verifies the pinned prebuilt before install, and **both** CI
   workflows fail the run if the shim in the rootfs/staging is anything else (a rebuilt shim is
   unverified and was what crashed every prudynt). Re-pin only after verifying prudynt boots.
-- After build, confirm `package/all-patches/prudynt-t/` holds **exactly** `0001`-`0016`. In the
+- After build, confirm `package/all-patches/prudynt-t/` holds **exactly** `0001`-`0017`. In the
   staged image, verify the motors split (§4); that `0007`/`0013`/`0014` are in the binary (grep
   `add_strk_a_rtsp` for `0014`); that the prudynt source/binary **does** reference the literal
   `/etc/daynight.state` (patch `0015`'s direct-read overlay - distinct from the

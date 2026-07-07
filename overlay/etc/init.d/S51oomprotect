@@ -1,5 +1,5 @@
 #!/bin/sh
-# S33oomprotect - shield the remote-recovery path (SSH) from the OOM killer.
+# S51oomprotect - shield the remote-recovery path (SSH) from the OOM killer.
 #
 # On this ~36MB no-swap unit the kernel OOM killer picks the largest-RSS process;
 # if it kills the dropbear SSH listener we lose remote recovery. Pin the listener's
@@ -8,7 +8,7 @@
 # strongly in S31prudynt (-800), so prudynt stays the single most-protected process.
 #
 # Boot one-shot, and safe to re-run manually after any dropbear restart:
-#     /etc/init.d/S33oomprotect start        # (or restart)
+#     /etc/init.d/S51oomprotect start        # (or restart)
 # It does NOT touch dropbear itself (no fork of the Buildroot S30dropbear) and adds
 # NO loop / daemon / cron. Best-effort: never fails, never blocks boot.
 
