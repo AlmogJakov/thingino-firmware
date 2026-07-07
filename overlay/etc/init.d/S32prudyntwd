@@ -280,7 +280,7 @@ confirm_gone() {
 
 # SSH is the remote-recovery path; keep the dropbear LISTENER shielded from the OOM
 # killer even after a mid-run dropbear restart (which resets oom_score_adj to 0).
-# Boot + manual protection is S33oomprotect (-500); this is the automatic re-assert
+# Boot + manual protection is S51oomprotect (-500); this is the automatic re-assert
 # on the watchdog's existing loop. Check-then-set: a plain read each cycle, a WRITE
 # only when the value has drifted. Strictly best-effort: numeric- and [ -w ]-guarded,
 # treats missing/empty/non-numeric/exited PIDs as clean no-ops, ALWAYS returns 0, and

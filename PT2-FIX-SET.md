@@ -151,7 +151,7 @@ is **not** installed into the firmware image.
 | `overlay/usr/sbin/physical-privacy` | **Added** | - (overlay) | `/usr/sbin/physical-privacy` | ✅ squashfs |
 | `overlay/usr/sbin/tz-update` | **Added** | - (overlay) | `/usr/sbin/tz-update` | ✅ squashfs |
 | `overlay/usr/sbin/daynight-state` | **Added** | - (overlay) | `/usr/sbin/daynight-state` | ✅ squashfs |
-| `package/all-patches/prudynt-t/0001…0016-*.patch` | Added (in branch) | prudynt-t (build patches) | compiled into `/usr/bin/prudynt` | ✅ binary |
+| `package/all-patches/prudynt-t/0001…0017-*.patch` | Added (in branch) | prudynt-t (build patches) | compiled into `/usr/bin/prudynt` | ✅ binary |
 | `package/ingenic-uclibc/ingenic-uclibc.mk` | Modified (pin prebuilt `.so`, verify sha, drop `-flto`) | ingenic-uclibc | `/usr/lib/libuclibcshim.so` | ✅ binary |
 | `package/ingenic-uclibc/prebuilt/libuclibcshim.so` | **Added** (pinned proven-good prebuilt, sha `07710f80…`) | ingenic-uclibc | `/usr/lib/libuclibcshim.so` | ✅ binary |
 | `tests/test-daynight-state.sh` | **Added** | - | not installed | ❌ repo test only |
@@ -1102,8 +1102,8 @@ Session 2026-07-06. Splits the fast-changing gain/brightness out of the heavy ~6
 ## 12. Reliability safety batch — Steps 1-5 (2026-07-07)
 Staged from the 2026-07-07 production-readiness audit (46 review agents, 27 confirmed findings).
 Each fix is its own commit with a `/opt/wd-bak/<name>.orig` backup, validated before deploy and
-verified after. **Branch `pt2-firmware`, final commit `af35c0ad6`.** Batch commit range
-`5a7a58477..af35c0ad6` (9 commits), plus the earlier Option B Web-UI commit `bd2dde208`.
+verified after. **Branch `pt2-firmware` - always build from the current branch TIP (do NOT pin an older per-step SHA such as `af35c0ad6`).** Batch commit range
+`5a7a58477..HEAD` (build the branch tip; pinning the stale `af35c0ad6` would omit the `2dfd2c2bd` packaging fixes + later watchdog hardening), plus the earlier Option B Web-UI commit `bd2dde208`.
 System invariants held throughout: prudynt PID unchanged, RTSP 200, SSH connected, no unexpected
 restart/reboot, no new errors.
 
@@ -1116,7 +1116,7 @@ restart/reboot, no new errors.
 - **Step 2a — prudynt OOM protection `oom_score_adj=-800`** (`083677018`, `package/prudynt-t/files/S31prudynt`):
   makes prudynt a near-last-resort OOM victim (was `oom_score` 197 = first victim on this 36 MB
   no-swap box); re-applied on every start/restart; `start-stop-daemon` return code preserved.
-- **Step 2b — dropbear SSH-listener OOM protection `-500`** (`2fbba09ef`, new `overlay/etc/init.d/S33oomprotect`):
+- **Step 2b — dropbear SSH-listener OOM protection `-500`** (`2fbba09ef`, renamed to `S51oomprotect` in `2dfd2c2bd`; ships as `overlay/etc/init.d/S51oomprotect`, executable + ordered after `S50dropbear`):
   keeps remote-recovery SSH out of the OOM killer's first picks; children inherit the score.
 - **Step 2b-ii — watchdog auto-re-asserts dropbear `-500` ≤60 s** (`b6776c415`, `S32prudyntwd`):
   a check-then-set line in the existing loop re-applies the shield after a mid-run dropbear restart.
@@ -1157,7 +1157,7 @@ restart/reboot, no new errors.
 2. Build-only fixes ACTIVE: `json-daynight.cgi` has `timeout 2`; `main.js` LiveGain channel
    present; prudynt binary shows the `0005` stall-exit log string; Option B channels work.
 3. Rootfs fixes baked in `/rom`: `S32prudyntwd` (`check_frames` + dropbear re-assert), `S31prudynt`
-   (`-800`), `S33oomprotect`, `physical-privacy --force`, `ha-*`/`agent.cgi` timeouts.
+   (`-800`), `S51oomprotect`, `physical-privacy --force`, `ha-*`/`agent.cgi` timeouts.
 4. Runtime: prudynt `oom_score_adj=-800`, dropbear `-500`, watchdog running (frame-probe), RTSP
    `200`, streaming healthy.
 5. Overlay reclaimed (optional: `rm` each `/overlay` copy whose md5 matches `/rom`).

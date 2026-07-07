@@ -6,7 +6,7 @@ name: pt2-build-artifact
 #   no secrets (read-only token) - single board.
 #
 # Same build commands as thingino's CI (make source + make fast), so the prudynt
-# 0001-0016 patches and the overlay/package changes are baked into the image.
+# 0001-0017 patches and the overlay/package changes are baked into the image.
 # A run is a full build (~1-2 h: toolchain + packages); no caching is configured, so reruns take about the same time.
 #
 # Run:      Actions -> "pt2-build-artifact" -> Run workflow (pick the pt2-firmware branch).
@@ -54,16 +54,16 @@ jobs:
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Confirm prudynt patches 0001-0016 present (fail fast before build)
+      - name: Confirm prudynt patches 0001-0017 present (fail fast before build)
         run: |
           D=package/all-patches/prudynt-t
           [ -d "$D" ] || { echo "::error::$D missing"; exit 1; }
           ls -l "$D"
           miss=0
-          for n in 0001 0002 0003 0004 0005 0006 0007 0008 0009 0010 0011 0012 0013 0014 0015 0016; do
+          for n in 0001 0002 0003 0004 0005 0006 0007 0008 0009 0010 0011 0012 0013 0014 0015 0016 0017; do
             ls "$D"/"$n"-*.patch >/dev/null 2>&1 && echo "PASS: patch $n present" || { echo "::error::missing patch $n-*.patch"; miss=1; }
           done
-          [ "$miss" = 0 ] && echo "ALL 16 PRUDYNT PATCHES PRESENT (0001-0016)" || exit 1
+          [ "$miss" = 0 ] && echo "ALL 17 PRUDYNT PATCHES PRESENT (0001-0017)" || exit 1
 
       - name: Download sources
         run: BOARD="$BOARD" make source WORKFLOW=1
@@ -88,10 +88,10 @@ jobs:
           if [ -f "$LIST" ]; then
             echo "== .applied_patches_list =="; cat "$LIST"
             miss=0
-            for n in 0001 0002 0003 0004 0005 0006 0007 0008 0009 0010 0011 0012 0013 0014 0015 0016; do
+            for n in 0001 0002 0003 0004 0005 0006 0007 0008 0009 0010 0011 0012 0013 0014 0015 0016 0017; do
               grep -qE "/${n}-.*\.patch$" "$LIST" && echo "PASS: patch $n applied" || { echo "::error::patch $n not in .applied_patches_list"; miss=1; }
             done
-            [ "$miss" = 0 ] && echo "ALL 16 PRUDYNT PATCHES APPLIED (0001-0016)" || exit 1
+            [ "$miss" = 0 ] && echo "ALL 17 PRUDYNT PATCHES APPLIED (0001-0017)" || exit 1
           elif [ -f "$SRC/.stamp_patched" ]; then
             echo "::warning::.applied_patches_list absent; .stamp_patched present (patch phase ran), cannot enumerate per-patch"
           else
