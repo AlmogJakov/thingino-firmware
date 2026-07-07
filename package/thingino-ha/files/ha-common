@@ -367,7 +367,7 @@ ha_clear_disc() {
 	local topic="${disc_prefix}/${component}/thingino_${HA_CAMERA_ID}/${object_id}/config"
 	local mpub
 	mpub=$(ha_mpub_cmd disc)
-	sh -c "$mpub -r -t $(_sq "$topic") -n" 2>/dev/null
+	timeout "${HA_PUB_TIMEOUT:-4}" sh -c "$mpub -r -t $(_sq "$topic") -n" 2>/dev/null
 	usleep "$HA_PUB_DELAY_US" 2>/dev/null || true
 }
 

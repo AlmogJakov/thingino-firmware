@@ -61,7 +61,7 @@ run_commands() {
 		echo "ha-daemon: ha-commands exited, restarting in 5s..."
 		sleep 5
 		mpub=$(ha_mpub_cmd daemon)
-		sh -c "$mpub -r -t '${HA_AVAIL_TOPIC}' -m 'online'" 2>/dev/null
+		timeout "${HA_PUB_TIMEOUT:-4}" sh -c "$mpub -r -t '${HA_AVAIL_TOPIC}' -m 'online'" 2>/dev/null
 		# On-reconnect reconcile: the subscriber just dropped (often a broker
 		# restart, which may have wiped retained state). Re-assert every entity's
 		# true state now, BEFORE the subscriber restarts on the next loop -- since
@@ -105,7 +105,7 @@ if ha_entity_enabled live_view; then
 			if [ -s "$snap" ]; then
 				b64="${snap}.b64"
 				base64 "$snap" | tr -d '\n' >"$b64"
-				sh -c "$mpub -t 'cameras/${HA_CAMERA_ID}/live_view/image' -f $(_sq "$b64")" 2>/dev/null
+				timeout "${HA_PUB_TIMEOUT:-4}" sh -c "$mpub -t 'cameras/${HA_CAMERA_ID}/live_view/image' -f $(_sq "$b64")" 2>/dev/null
 				rm -f "$b64"
 			fi
 			rm -f "$snap"
@@ -121,7 +121,7 @@ fi
 cleanup() {
 	local mpub
 	mpub=$(ha_mpub_cmd daemon)
-	sh -c "$mpub -r -t '${HA_AVAIL_TOPIC}' -m 'offline'" 2>/dev/null
+	timeout "${HA_PUB_TIMEOUT:-4}" sh -c "$mpub -r -t '${HA_AVAIL_TOPIC}' -m 'offline'" 2>/dev/null
 	kill "$CMD_PID" 2>/dev/null
 	wait "$CMD_PID" 2>/dev/null
 	[ -n "${CAMERA_PID:-}" ] && kill "$CAMERA_PID" 2>/dev/null

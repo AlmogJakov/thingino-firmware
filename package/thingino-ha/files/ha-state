@@ -35,7 +35,7 @@ ha_pub_begin
 # unavailable while we're running. Published directly (not queued) so it
 # reaches the broker immediately before any state values.
 mpub=$(ha_mpub_cmd state)
-sh -c "$mpub -r -t '${HA_AVAIL_TOPIC}' -m 'online'"
+timeout "${HA_PUB_TIMEOUT:-4}" sh -c "$mpub -r -t '${HA_AVAIL_TOPIC}' -m 'online'"
 
 # Motion binary sensor
 if ha_entity_enabled motion; then
@@ -224,7 +224,7 @@ if ha_entity_enabled ota; then
 		}
 	done
 	[ -z "$installed" ] && installed="unknown"
-	sh -c "$mpub -t 'cameras/${HA_CAMERA_ID}/firmware/state' -m '$installed'"
+	timeout "${HA_PUB_TIMEOUT:-4}" sh -c "$mpub -t 'cameras/${HA_CAMERA_ID}/firmware/state' -m '$installed'"
 
 	cache_dir="/tmp/ha_ota_cache_${HA_CAMERA_ID}"
 	latest_cache="${cache_dir}/latest"
@@ -291,7 +291,7 @@ if ha_entity_enabled ota; then
 		printf '%s\n' "$next_check" >"$next_check_cache"
 	fi
 
-	sh -c "$mpub -t 'cameras/${HA_CAMERA_ID}/firmware/latest' -m '${latest:-$installed}'"
+	timeout "${HA_PUB_TIMEOUT:-4}" sh -c "$mpub -t 'cameras/${HA_CAMERA_ID}/firmware/latest' -m '${latest:-$installed}'"
 fi
 
 # Flush all queued state publishes with rate limiting.

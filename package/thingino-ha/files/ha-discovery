@@ -260,6 +260,6 @@ ha_pub_flush
 
 # Mark device online (published directly, not queued — must happen after flush)
 mpub=$(ha_mpub_cmd disc)
-sh -c "$mpub -r -t '${HA_AVAIL_TOPIC}' -m 'online'"
+timeout "${HA_PUB_TIMEOUT:-4}" sh -c "$mpub -r -t '${HA_AVAIL_TOPIC}' -m 'online'"
 
 echo "ha-discovery: registered ${DEVICE_NAME} (${HA_CAMERA_ID}) on ${HA_MQTT_HOST}:${HA_MQTT_PORT}"
