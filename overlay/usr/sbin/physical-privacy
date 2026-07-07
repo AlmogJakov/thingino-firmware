@@ -285,6 +285,7 @@ do_on() {
 }
 
 do_off() {
+	force=0; [ "$1" = "--force" ] && force=1
 	acquire_lock || return 0
 	if ! is_armed && [ "$(st_active)" != "true" ]; then release_lock; return 0; fi
 
@@ -316,7 +317,13 @@ do_off() {
 	    *)
 	      seek_tilt "$SY"; cur=$(get_tilt)        # confirm ARRIVAL at saved tilt
 	      case "$cur" in
-	        '' | *[!0-9-]*) cur='(unreadable)' ;; # unreadable -> fail closed (a retried off recovers)
+	        '' | *[!0-9-]*)
+	          cur='(unreadable)'                  # unreadable -> normally fail CLOSED (a retried off recovers)
+	          if [ "$force" = 1 ]; then
+	            log "do_off --force: tilt readback unverifiable (cur=$cur saved=$SY) - FORCING fail-open per operator override"
+	            clear=1                            # operator override: lift privacy despite unverified arrival
+	          fi
+	          ;;
 	        *) d=$((cur - SY)); ad=${d#-}; [ "$ad" -le "$POS_TOL" ] && clear=1 ;;
 	      esac
 	      ;;
@@ -402,7 +409,7 @@ do_set_pose() {  # store the current tilt as the privacy pose (privacy must be o
 
 case "$1" in
 	on)        do_on ;;
-	off)       do_off ;;
+	off)       do_off "$2" ;;
 	reenter)   do_reenter ;;
 	guard)     do_guard; exit $? ;;
 	status)    do_status ;;
