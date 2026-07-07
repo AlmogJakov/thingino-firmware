@@ -57,10 +57,22 @@ HEALTHY_STREAK_LIMIT=2
 # recovery before escalating to reboot (T23 VPU wedge is reboot-only).
 RESTART_LIMIT=3
 
-# Seconds to wait, then re-check, before treating a GONE observation as real.
-# Absorbs the start-stop-daemon fork race and an external `service restart
-# prudynt` (day/night, MQTT, web-UI) kill+reclaim window so we do not double-drive.
-GONE_CONFIRM_DELAY=5
+# GONE-confirmation: when prudynt looks absent, POLL before treating it as a real
+# crash so we never double-drive an in-flight external `service restart prudynt`
+# (day/night, MQTT, web-UI). confirm_gone() re-checks every GONE_CONFIRM_DELAY
+# seconds up to a total GONE_CONFIRM_BUDGET, returning the MOMENT prudynt reappears.
+# BUDGET must exceed S31prudynt's worst-case restart down-window (TERM_GRACE 2 +
+# KILL_GRACE 2 + RECLAIM_WAIT 15 = ~19s) so a legitimately-restarting prudynt is
+# seen coming back before we restart it; a genuine crash still restarts, just after
+# the bounded window.
+GONE_CONFIRM_DELAY=5      # seconds between re-checks
+GONE_CONFIRM_BUDGET=25    # total bounded confirm window (>= S31 down-window ~19s)
+
+# OOM shield for the long-running watch() subshell itself (applied in start() to the
+# backgrounded PID): protected enough to survive memory pressure that reaps
+# non-critical processes, but LESS than prudynt (-800) and dropbear (-500) so those
+# win first. Order: prudynt -800 < dropbear -500 < watchdog -300 < others 0.
+WATCHDOG_OOM_ADJ="-300"
 
 RTSP_HOST=""
 RTSP_PORT=""
@@ -269,12 +281,20 @@ do_reboot() {
 	done
 }
 
-# Confirm a GONE observation is real, not a mid-restart / fork-race transient.
-# Returns 0 only if prudynt is STILL gone after a short bounded re-check.
+# Confirm a GONE observation is real, not a mid-restart / fork-race / external
+# `service restart prudynt` transient. Poll prudynt_live every GONE_CONFIRM_DELAY
+# seconds up to GONE_CONFIRM_BUDGET and return 1 (NOT gone) the MOMENT it reappears
+# -- fast reaction to a quick relaunch, while still covering S31's ~15-19s restart
+# down-window. Returns 0 (confirmed gone) only if the whole bounded budget elapses
+# with no reappearance; never waits unbounded.
 confirm_gone() {
 	prudynt_live && return 1
-	sleep "$GONE_CONFIRM_DELAY"
-	prudynt_live && return 1
+	local _waited=0
+	while [ "$_waited" -lt "$GONE_CONFIRM_BUDGET" ]; do
+		sleep "$GONE_CONFIRM_DELAY"
+		_waited=$(( _waited + GONE_CONFIRM_DELAY ))
+		prudynt_live && return 1
+	done
 	return 0
 }
 
@@ -464,6 +484,14 @@ start() {
 	watch &
 	PID=$!
 	echo "$PID" >"$PID_FILE"   # store the PID of the background watch() subshell
+
+	# Shield the long-running watch() loop itself from the OOM killer: it IS the
+	# stream-recovery engine and must outlive non-critical processes under memory
+	# pressure -- but stay LESS protected than prudynt (-800) and dropbear (-500) so
+	# those win first. Best-effort: [ -w ]-guarded, rc ignored, applied to the
+	# backgrounded subshell $PID (NOT this parent init process, which exits now).
+	[ -w "/proc/$PID/oom_score_adj" ] && echo "$WATCHDOG_OOM_ADJ" > "/proc/$PID/oom_score_adj" 2>/dev/null
+	return 0
 }
 
 stop() {
