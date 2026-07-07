@@ -278,6 +278,27 @@ confirm_gone() {
 	return 0
 }
 
+# SSH is the remote-recovery path; keep the dropbear LISTENER shielded from the OOM
+# killer even after a mid-run dropbear restart (which resets oom_score_adj to 0).
+# Boot + manual protection is S33oomprotect (-500); this is the automatic re-assert
+# on the watchdog's existing loop. Check-then-set: a plain read each cycle, a WRITE
+# only when the value has drifted. Strictly best-effort: numeric- and [ -w ]-guarded,
+# treats missing/empty/non-numeric/exited PIDs as clean no-ops, ALWAYS returns 0, and
+# MUST NEVER influence the serving / restart / reboot decisions below.
+DROPBEAR_PIDFILE="/run/dropbear.pid"
+DROPBEAR_OOM_ADJ="-500"
+reassert_dropbear_oom() {
+	local _dbp _cur
+	_dbp=$(cat "$DROPBEAR_PIDFILE" 2>/dev/null)
+	case "$_dbp" in
+		'' | *[!0-9]*) return 0 ;;
+	esac
+	_cur=$(cat "/proc/$_dbp/oom_score_adj" 2>/dev/null)
+	[ "$_cur" = "$DROPBEAR_OOM_ADJ" ] && return 0
+	[ -w "/proc/$_dbp/oom_score_adj" ] && echo "$DROPBEAR_OOM_ADJ" > "/proc/$_dbp/oom_score_adj" 2>/dev/null
+	return 0
+}
+
 watch() {
 	local _slept
 
@@ -295,6 +316,11 @@ watch() {
 	if prudynt_live; then LAST_LIVE=1; else LAST_LIVE=0; fi
 
 	while true; do
+		# SSH recovery-path protection (best-effort, always rc 0): re-assert the
+		# dropbear listener's OOM shield each cycle so a mid-run dropbear restart
+		# cannot silently leave it at 0. Runs regardless of streamer state and
+		# cannot affect any decision below (its return value is never consulted).
+		reassert_dropbear_oom
 		# (0) Honor the kill-switch every cycle. While disabled we touch nothing.
 		if is_streamer_disabled; then
 			STREAMER_WAS_DISABLED=1
