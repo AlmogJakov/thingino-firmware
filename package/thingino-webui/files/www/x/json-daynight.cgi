@@ -23,10 +23,12 @@ printf 'Cache-Control: no-store\r\n'
 printf 'Connection: close\r\n'
 printf '\r\n'
 
-# Single in-memory query; no temp file, no writes. If prudynt is down/restarting
-# the output is empty -> both values fall back to null and the UI keeps its last
-# value (updateHeartbeatUi guards on hasTotalGain / hasBrightness).
-dn=$(prudyntctl json '{"daynight":{"status":null}}' 2>/dev/null)
+# Single in-memory query, hard-bounded by `timeout 2`. A healthy prudynt answers
+# in ~0-30ms; a wedged control socket is killed at 2s -> empty output -> both
+# values fall back to null and the UI keeps its last value (updateHeartbeatUi
+# guards reject null). Matches the SSE channel's `curl --max-time 2`, so this 5s
+# poll can never hang a uhttpd worker on a wedged prudynt. No temp file, no writes.
+dn=$(timeout 2 prudyntctl json '{"daynight":{"status":null}}' 2>/dev/null)
 gain=$(printf '%s' "$dn" | grep -o '"total_gain":[0-9-]*' | head -n 1 | cut -d: -f2)
 bright=$(printf '%s' "$dn" | grep -o '"brightness_percent":[0-9-]*' | head -n 1 | cut -d: -f2)
 
