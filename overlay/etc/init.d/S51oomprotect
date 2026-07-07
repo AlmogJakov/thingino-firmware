@@ -9,7 +9,7 @@
 #
 # Boot one-shot, and safe to re-run manually after any dropbear restart:
 #     /etc/init.d/S51oomprotect start        # (or restart)
-# It does NOT touch dropbear itself (no fork of the Buildroot S50dropbear) and adds
+# It does NOT touch dropbear itself (no fork of the S30dropbear init -- the overlay S50dropbear renamed at build) and adds
 # NO loop / daemon / cron. Best-effort: never fails, never blocks boot.
 
 DROPBEAR_PIDFILE="/run/dropbear.pid"
