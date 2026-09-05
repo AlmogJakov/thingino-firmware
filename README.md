@@ -1,82 +1,70 @@
-Thingino
---------
+Thingino — Sonoff CAM-PT2
+-------------------------
 
 Thingino (_/θinˈdʒiːno/_, _thin-jee-no_) is an open-source firmware for Ingenic SoC IP cameras.
+This is the **`pt2-firmware`** branch — Thingino hardened for the **Sonoff CAM-PT2**
+(Ingenic T23N / SC2336P / ATBM6012BX) for unattended, always-on use.
 
 ![Thingino Web UI][10]
 
-### Supported Hardware
+## What's changed in this branch
 
-Please find [the full list of supported cameras](docs/supported_hardware.md)
-in a separate document. Visit [our website][0] for an illustrated version of
-the list.
+Release notes for the Sonoff CAM-PT2 build. Full engineering detail lives in
+[`PT2-FIX-SET.md`](PT2-FIX-SET.md).
 
----
+### Streaming & startup reliability
+- **Fixed a startup crash-loop** where prudynt never served RTSP — root-caused to a miscompiled libc ABI shim (now a pinned prebuilt, `-flto` dropped).
+- **Reliable cold-boot streaming:** fail-fast if the encoder/ISP didn't come up, an anti-brick config restore, and a stream watchdog that checks real encoder frames (not just an RTSP probe) with a bounded restart→reboot ladder.
+- **prudynt patches 0001–0017:** cleaner VPU teardown/reclaim, live-apply OSD changes without tearing down the encoder, and related stream-config fixes.
 
-### Thingino Repository Branches Explaned
+### Day / night & optics
+- Day/night **survives reboot** and no longer rewrites config on every toggle (a tiny atomic sidecar → near-zero flash wear).
+- Correct **IR-cut / colour / IR-LED** behaviour; fixed an executor race and a stale-marker dedup that could leave the camera stuck after a Night→Day switch, plus a white-LED lighting at boot.
 
-We've split the Thingino repository into two branches: stable and master, to better manage development and provide reliable releases for users.
+### Physical privacy
+- Reboot-safe **lens-park privacy:** tilts the lens away and interlocks the IR/white emitters and mic so a parked sensor isn't warmed; fail-open manual escape.
 
-**Stable Branch**
+### Audio / video
+- Fixed **OPUS WebRTC stutter** (RTP-timestamp jitter); **mic-mute** now works without restarting the audio worker; live **audio-codec switching** no longer breaks the stream.
 
-Provides a reliable, tested version of Thingino for general use. It includes carefully selected, stable changes. It uses the original ONVIF server and Prudynt with libconfig.
-The stable branch will receive critical fixes. New features will only be added once they are thoroughly tested and mature in the master branch.
+### Home Assistant / MQTT
+- Reliable MQTT — **confirmed (QoS1) publishes**, per-entity publish locking, stale-poll protection, an availability/reconcile backstop, and write-on-change toggles — no more stuck retained states or publish hangs.
 
-For users who want a dependable version of Thingino without needing to build or contribute to development.
+### Web UI
+- Faster, honest live status (CPU / RAM / storage / gain); status and query CGIs are bounded with timeouts so a slow backend can't hang the page.
 
-**Master Branch**
+### Robustness under memory pressure
+- **OOM protection** for prudynt, the SSH listener, and the watchdog so recovery and remote access survive low-memory conditions.
 
-The development hub for new features and experimental changes. Includes advanced features like Matroska, Opus, and improved file recording for Prudynt. These are still in development and may not be stable.
+### Timezone
+- Local time instead of UTC (works around a uClibc DST-rule rejection).
 
-Only for developers and contributors who can build the project themselves and actively participate in improving the code.
+### Kernel D-state wedge — resilience (new)
+A rare Ingenic-3.10 kernel *lost-wakeup* could strand a task uninterruptibly and, via a `pidof` `/proc` scan behind it, wedge the day/night + config path until reboot.
+- **R1** — replaced the `pidof`-based singleton guard with a `flock` lock, removing that failure mode (the actual fix).
+- **R2** — cut Home-Assistant `jct` forks 12→1 per poll (less exposure to the trigger; behaviour unchanged).
+- **R3** — an independent detector reboots (SysRq-b) only on a clear, sustained wedge signature, leaving the hardware watchdog untouched.
 
-This structure allows us to maintain a reliable version (stable) for most users while continuing to innovate and test new features (master). Critical fixes and matured features from master will be gradually integrated into stable for broader use.
+All three are RAM-only (no added flash writes).
 
-> [!NOTE]
-> If you’re not contributing to development, we recommend sticking with the stable branch.
+## Building
 
-Thank you for using Thingino! For questions or contributions, please join our Discord community or check the GitHub issues page.
+Builds like upstream Thingino (Buildroot) — see [Building from sources][7].
+Board profile: `configs/cameras/sonoff_pt2_t23n_sc2336p_atbm6012bx`.
 
-### Building
+## Documentation
 
-```
-git clone -b stable --recurse-submodules https://github.com/themactep/thingino-firmware
-cd thingino-firmware
-make update
-make
-```
+- [`PT2-FIX-SET.md`](PT2-FIX-SET.md) — detailed engineering / incident record for this branch
+- [Firmware Image Structure](docs/firmware-image-structure.md)
+- [Camera Recovery](docs/camera-recovery.md)
 
-Read [Building from sources][7] article for more info.
+## Resources
 
-### Documentation
-
-- [Firmware Image Structure](docs/firmware-image-structure.md) - Partition layout and image assembly
-- [Firmware Dumping](docs/firmware.md) - How to backup existing firmware
-- [Camera Recovery](docs/camera-recovery.md) - Recovering from failed updates
-- [Local Build Settings](docs/local-build-settings.md) - Layered user-specific settings from `THINGINO_USER_DIR/common`, per camera, and per device IP
-
-### Resources
-
-- [Project Website][0]
-- [Project Wiki][1]
-- Buildroot Manual [HTML][5] [PDF][6]
-- [Discord channel][3]
-- [Telegram group][4]
-
-### GitHub CI Status
-
-[![toolchain-x86_64][11]][8]
-[![firmware-stable][12]][9]
+- [Project Website][0] · [Wiki][1] · [Discord][3] · [Telegram][4]
 
 [0]: https://thingino.com/
 [1]: https://github.com/themactep/thingino-firmware/wiki
 [3]: https://discord.gg/xDmqS944zr
 [4]: https://t.me/thingino
-[5]: https://buildroot.org/downloads/manual/manual.html
-[6]: https://nightly.buildroot.org/manual.pdf
 [7]: https://github.com/themactep/thingino-firmware/wiki/Building-from-sources
-[8]: https://github.com/themactep/thingino-firmware/actions/workflows/toolchain.yaml
-[9]: https://github.com/themactep/thingino-firmware/actions/workflows/firmware.yaml
 [10]: https://github.com/user-attachments/assets/5e74827c-47f9-4ea0-b523-d12a199a9974
-[11]: https://github.com/themactep/thingino-firmware/actions/workflows/toolchain-x86_64.yaml/badge.svg
-[12]: https://github.com/themactep/thingino-firmware/actions/workflows/firmware-stable.yml/badge.svg

@@ -1356,3 +1356,77 @@ After flashing and cold boot:
 - **prudynt patches:** `package/all-patches/prudynt-t/0001-*..0017-*.patch`, auto-applied by buildroot (`BR2_GLOBAL_PATCH_DIR`) over the git-fetched source `themactep/prudynt-t@f4b3228`. **Never hand-edit the prudynt source** — regenerate patches. The CI patch-gate enumerates `0001-0017`.
 - **`main.js` is BUILD-ONLY:** 107 KB > the config-overlay free space, so a modified `main.js` **cannot** be live-copied into the overlay — it ships only via a firmware build baked into `/rom`. (CGI / rootfs-script changes are small and *can* live-deploy, but for `f256057a9` everything is baked.)
 - **Line endings:** the repo is Windows `core.autocrlf=true`; working copies are CRLF but committed **blobs are LF** (`git ls-files --eol` → `i/lf`), which is what the Linux build needs. Overlay shell scripts **must** be LF (a CRLF shebang = "bad interpreter"). Verify blob EOL with `git ls-files --eol` or `git cat-file blob <oid> | tr -cd CR | wc -c` (want 0) — not `git show | grep` (unreliable under autocrlf).
+
+---
+
+## 14. Kernel D-state wedge — incident, investigation, and fixes R1/R2/R3 (2026-09)
+
+Investigated on **cam5** (`cam5-ing-sonoff-pt2-e214`, `192.168.1.139`, running build `pt2-firmware+f256057`). All investigation was read-only or reversible/RAM-only (SysRq dumps, raw MTD reads, `/proc` inspection); nothing was written to flash and no process was killed. Commit hashes: **R1 `e24ecd88f`**, **R2 `cf3034e0c`**, **R3 `2d795da45`**.
+
+### 14.1 Observed failure & symptoms
+- Day/night switching from the Web UI (or HA) stopped taking effect: after a Night→Day switch the camera stayed in night (IR-cut not restored), while HA/MQTT still reported `daynight=day`, `ircut=ON` — a **logical-vs-physical desync**.
+- Both mains-powered, always-streaming cameras (cam4 + cam5) were found wedged together; on-demand/battery cameras were unaffected.
+- The **video stream kept running** throughout; the fault was confined to the day/night + config-report path, load climbed over time, and it cleared **only on reboot**.
+
+### 14.2 The cascade (mechanism)
+1. A task (`jct`, spawned by `ha-state`) stuck in uninterruptible sleep (`D`, "disk sleep") **holding its `mmap_sem` in write mode**.
+2. `pidof`/`ps` read `/proc/<pid>/cmdline` of *every* process; reading the stuck task's cmdline needs that `mmap_sem`, so those readers wedged in `D` too.
+3. `/sbin/daynight`'s `singleton()` guard used `pidof`, so **every** day/night switch then wedged *before* touching the IR-cut. `ha-state` and the stream-watchdog `S32prudyntwd` wedged the same way. `D`-state tasks are unkillable → the pile grew and load climbed (6.8→10.8, pure `D`-state inflation, ≈0 real CPU) until reboot.
+
+### 14.3 Forensic evidence collected
+- **SysRq-w** (RAM-only) blocked-task dump: `jct`, several `pidof`, `ps`, `tr` all `D`; `isp_fw_process` `D` (its normal state).
+- For the stuck `jct`, `/proc/<pid>/{stat,status}` read fine but **`/cmdline` and `/maps` HANG** → it holds `mmap_sem` in write mode (exactly why `pidof`/`ps` wedge). Verified live that `cat /proc/<pid>/cmdline` hangs.
+- Raw `dd if=/dev/mtd2|4|5` reads return instantly → **flash hardware is fine** (not an SPI-NOR/jz_sfc hang).
+- `/proc/meminfo` `Dirty=0 Writeback=0`; `jffs2_gcd_*`, `kswapd`, `writeback` threads idle → **not** writeback/GC/reclaim.
+- Fresh `jct get`, `cat /etc/prudynt.json`, `ls` all succeed instantly → the resource is free; the task simply never woke.
+- go2rtc logs: cam4 (137) + cam5 (139) producers aborted within **20 ms** of each other → the "both at once" is a shared-cause event.
+- `uname` `3.10.14__isvp_pike_1.0__ #2 PREEMPT`; full `dmesg` since boot shows **no** oops/BUG/hung-task/jffs2/mtd error before the SysRq dump (only WiFi `AP lost`) → the wedge is silent.
+- Kernel config: `CONFIG_KALLSYMS`, `DEBUG_INFO`, `FRAME_POINTER`, `STACKTRACE`, `DETECT_HUNG_TASK` all **off**; `MAGIC_SYSRQ=y`; `LOCKUP_DETECTOR=y`+`BOOTPARAM_SOFTLOCKUP_PANIC=y` (soft-lockup only — does **not** catch a `D`-state sleep). No `/proc/kallsyms`, no `/proc/<pid>/stack`, **no RTC, no u-boot `bootcount`**.
+
+### 14.4 Root cause — proven vs inferred
+**Proven (evidence-backed, symbol-independent):**
+- A task is stuck in `D` **holding `mmap_sem`** (cmdline/maps hang; stat/status don't).
+- **Not** hardware (raw flash reads OK), **not** GC/writeback (Dirty=0, threads idle), **not** an ongoing lock or memory exhaustion (fresh identical ops succeed).
+- The cascade is real: reading the stuck task's `/proc/cmdline` hangs — exactly what `pidof` does — so the `pidof`-based `singleton` wedges. (This alone justifies R1, independent of the exact kernel bug.)
+- Recovery is **reboot-only** (D-state unkillable; the reboot confirmably cleared it).
+
+**Inferred (strongly implied, not symbolized):**
+- The exact kernel function/line, and that it is specifically a **lost-wakeup** in a process-startup mm path on the old Ingenic 3.10 vendor kernel. The signature (resource free + still stuck + holds `mmap_sem` write + wedged at fork/exec before opening any file) points to a lost wakeup, but *naming the site needs symbols* (R5/R6). Raw SysRq backtrace addresses were captured for later resolution.
+
+### 14.5 Why MQTT reboot failed but Web reboot worked
+`cameras/<id>/reboot/set` is handled by **`ha-commands`**, part of the same HA subsystem that forks `jct` heavily and was caught in the cascade — so the command reached the broker but cam5 never acted on it. The **Web UI** reboot runs under **uhttpd**, an independent process *outside* the wedged chain, so its CGI called `reboot` and succeeded. This is consistent with the root cause and directly motivates R3's subsystem-independent recovery.
+
+### 14.6 R1 — flock singleton *(the resilience fix)* — `e24ecd88f`
+- **File:** `package/prudynt-t/files/prudynt-helpers`, `singleton()`.
+- **Was:** `pids=$(pidof -o %PPID "$appname")` — `pidof` reads `/proc/<pid>/cmdline` of every process, so it blocks behind any task holding `mmap_sem`, wedging the guard and every caller (`daynight` ×4 variants, `formatsd`). **This is the exact failure mode above.**
+- **Now:** a non-blocking advisory `flock` on a tmpfs lock file (`exec 9>/run/lock/singleton.<name>; flock -n 9`). Touches **no `/proc`**; the kernel releases the lock on process exit (incl. SIGKILL/crash) — no stale lock, no reclaim, no trap; cheaper than the `/proc`-wide scan; **no flash write** (tmpfs).
+- **Why safer:** the guard can no longer wedge behind an unrelated stuck task. Verified `flock -n` works on this busybox; all current callers are short-lived with synchronous children (audited), so the lock releases promptly; fd-9 inheritance by a *future* long-lived child is documented (`9>&-` convention), since ash cannot mark a shell fd close-on-exec.
+
+### 14.7 R2 — jct fork reduction *(exposure reduction, not the fix)* — `cf3034e0c`
+- **File:** `package/thingino-ha/files/ha-common`, `ha_entity_enabled()`.
+- **Was:** one `jct` fork per entity — `ha-state` ~12 `jct`/poll, `ha-discovery` ~20/run.
+- **Now:** read the `ha` object **once** and parse the boolean `enable_*` flags in-shell (line-anchored `sed`), with a per-key fallback to the exact old `jct` read for anything not captured. Measured on cam5: **12 → 1 `jct`** for the 12 `ha-state` checks, with **identical** enabled/disabled results (0 mismatches across all 20 entities).
+- **Behaviour / staleness:** the cache is a per-process shell variable (no file, no persistence, reset on every `ha-common` source) → **no cross-invocation staleness**; `ha-daemon` reads `live_view` once at startup (unchanged); the only difference is a consistent intra-run snapshot bounded to a single poll (adversarially reviewed; benign). MQTT/password parsing was **deliberately left** on per-key `jct` (shell-parsing a password is unsafe).
+- **Role:** lowers the *probability* of hitting the kernel lost-wakeup (the `jct` that wedged was an `ha-state` `jct`); it does **not** remove the failure mode — **R1 does.**
+
+### 14.8 R3 — wedge-detector *(independent recovery)* — `2d795da45`
+- **Files:** `overlay/usr/sbin/wedge-detector` + `overlay/etc/init.d/S99wedge-detector` (board-scoped, executable, `sysinit`-independent — started by `rcS`'s `S*` loop).
+- **Detection:** every 15 s, count `D`-state tasks from `/proc/<pid>/stat` in **pure shell** (glob + one `read` per pid — **no fork/exec per pid, no `pidof`/`jct`/MQTT/`cmdline`**). State parsed as the field after the last `") "` (robust to comm spaces/parens); vanished/malformed entries are skipped (can only *lower* the count → never a false positive).
+- **Thresholds (v1, measured):** baseline `D=1` (always `isp_fw_process`), load ~3.3–3.5; the observed wedge reached `D~8`, load 6.8–10.8. Trigger = **`D≥5` (primary) AND `load1≥6` (supporting, never alone)** for **8 consecutive checks (=120 s)**, after a **600 s post-boot grace**, **skipped while `/tmp/webupgrade` exists**.
+- **Recovery:** on full confirmation, `echo b > /proc/sysrq-trigger` — an **immediate emergency reboot** (SysRq-b; **no sync/unmount**), reachable only through the complete sequence (any single normal check or parse error resets the streak to 0).
+- **Watchdog relationship:** it **never touches `/dev/watchdog`**. The busybox HW watchdog (`K99watchdog`) is unchanged and remains the independent **total-hang** safety net. (A shell servicer can't set the HW timeout via `WDIOC_SETTIMEOUT`, and the jz-wdt default isn't safely knowable — hence SysRq-b, not un-feeding the timer.)
+- **Limitations:** loop protection is the **600 s grace + 120 s confirmation only — NOT a hard cross-reboot counter**, because no flash-free persistent boot counter exists on this hardware (no RTC, no u-boot bootcount) and a flash write for it is intentionally excluded (cf. §13.4-A). A pathological loop is bounded to ≥~10 min streaming uptime/cycle, not prevented. Being RAM-only, the `/dev/kmsg` reason line is lost across the reboot.
+
+### 14.9 Measured impact + RAM-only confirmation
+- **R3 scan cost:** ~94 ms CPU (user+sys) per scan on cam5 (67 procs) once per 15 s = **~0.6 % of one core** (prudynt alone ≈25 %); ~183 ms wall on the load-3.3 unit.
+- **R1:** *lower* CPU than before (`flock`+`mkdir` vs a `/proc`-wide `pidof` scan).
+- **R2:** *lower* fork/`jct` activity (12→1 `jct`/poll).
+- **Flash:** all three are **RAM-only** — R1 writes only tmpfs `/run/lock`; R2 writes nothing (a shell variable); R3 writes only `/dev/kmsg`, `/proc/sys/kernel/sysrq`, `/proc/sysrq-trigger`. **No new persistent runtime flash writes.**
+
+### 14.10 Confirmed vs hypothesis vs follow-up
+- **Confirmed:** the cascade (pidof/cmdline → `mmap_sem` → wedge); not-hardware / not-GC / not-memory; reboot-only recovery; the 12→1 `jct` measurement; the R3 baseline/thresholds and ~0.6 %/core cost; `flock -n` semantics; HW-watchdog behaviour; no flash-free boot counter on this hardware.
+- **Hypothesis (needs symbols):** the exact kernel lost-wakeup site.
+- **Follow-up (deferred — fleet-wide/kernel, a separate project):**
+  - **R4** — `CONFIG_DETECT_HUNG_TASK=y` + a generous `hung_task_timeout` + hung-task **panic** (leveraging the existing `panic=10`): kernel-native bounded auto-recovery for *any* future hung task. **Fleet-wide** (~40 T23N boards share `board/ingenic/xburst1/kernel/3.10.14/t23.generic.config`) and rebuild-only; the panic timeout must be tuned against legitimate long `D` waits (OTA flash-erase). Note: existing `SOFTLOCKUP_PANIC` does not cover this class.
+  - **R5** — `CONFIG_KALLSYMS`(+`_ALL`) + `CONFIG_DEBUG_INFO` + `CONFIG_FRAME_POINTER`: makes the *next* wedge produce a resolvable backtrace on-device (and enables R6). Modest size cost; fleet-wide/rebuild-only.
+  - **R6** — resolve the captured SysRq backtrace with the build's `System.map` (needs R5 or the build artifact), identify the wait-queue/mm site, and backport the relevant 3.10.x stable fix. High effort; **R4 is the pragmatic substitute** (bounded recovery) until then.
