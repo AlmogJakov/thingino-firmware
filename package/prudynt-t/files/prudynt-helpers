@@ -46,9 +46,28 @@ singleton() {
 	fi
 
 	appname=$(basename "$1")
-	pids=$(pidof -o %PPID "$appname")
-	if [ -n "$pids" ]; then
-		echo_error "$appname is already running with PIDs $pids. Exiting"
+	# Mutual exclusion via an advisory flock on a tmpfs lock file, replacing the
+	# previous `pidof` check. `pidof` reads /proc/<pid>/cmdline of EVERY process;
+	# if any task is stuck in uninterruptible (D) sleep holding its mmap_sem, that
+	# read blocks, so pidof -- and every singleton-guarded script (daynight,
+	# formatsd, ...) -- wedges behind an unrelated stuck task. `flock` touches no
+	# /proc and is cheaper than the old /proc-wide scan. `-n` = non-blocking
+	# (busybox lacks `-w`); the lock file lives on tmpfs -> no flash writes.
+	#
+	# LOCK LIFETIME: the lock is held via fd 9 and the kernel releases it the moment
+	# the last open file description on fd 9 is closed -- which happens automatically
+	# when the holder exits, INCLUDING SIGKILL/crash (no stale lock, no reclaim, no
+	# trap). Every current caller is a short-lived script whose children are
+	# synchronous (they exit before the script), so the lock always disappears
+	# promptly on the caller's death. fd 9 IS inherited across fork/exec, so a future
+	# caller that BACKGROUNDS a long-lived process MUST start it with `9>&-` (verified
+	# here: an inherited fd 9 keeps the lock held past the parent's death; `9>&-`
+	# frees it). ash cannot mark a shell fd close-on-exec, so this close-per-child is
+	# the required convention for any long-lived spawned child.
+	mkdir -p /run/lock 2>/dev/null
+	exec 9>"/run/lock/singleton.$appname"
+	if ! flock -n 9; then
+		echo_error "$appname is already running. Exiting"
 		exit 1
 	fi
 }
