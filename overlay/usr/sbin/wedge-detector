@@ -1,0 +1,106 @@
+#!/bin/sh
+# wedge-detector (PT2, board-scoped) -- recovery for the kernel D-state "wedge".
+#
+# Background: a rare Ingenic 3.10 lost-wakeup can strand a task in uninterruptible
+# (D) sleep holding its mmap_sem. Anything that then reads that task's
+# /proc/<pid>/cmdline (pidof/ps) blocks too, the cascade grows, and the box
+# degrades until reboot -- a D-state task is unkillable, so reboot is the only cure.
+#
+# This detector watches ONLY for that clear, SUSTAINED signature and, once it is
+# fully confirmed, forces an IMMEDIATE hardware-level reboot via SysRq-b.
+#
+# SysRq-b is an EMERGENCY reboot: it does NOT sync or cleanly unmount filesystems.
+# That is acceptable here because it is reached ONLY after the sustained wedge
+# confirmation below -- the system is already degraded and reboot-only recoverable,
+# durable state already lives on flash, and runtime state is tmpfs.
+#
+# It is deliberately independent of everything that can be part of the wedge:
+#   * NO pidof, NO jct, NO MQTT/HA;
+#   * NO /proc/<pid>/cmdline (that is exactly what blocks behind a stuck mmap_sem);
+#     only /proc/<pid>/stat, whose state field never blocks;
+#   * the scan is pure shell (glob + one `read` redirection per pid) -- no fork or
+#     exec per pid.
+# It NEVER touches /dev/watchdog: the existing busybox HW watchdog keeps its own,
+# independent total-hang safety net entirely unchanged.
+#
+# Fail-safe by construction: EVERY path except the single fully-confirmed branch is
+# a no-op that clears the streak. Any missing/short/racy /proc read is skipped and
+# never counts toward a wedge.
+#
+# Reboot-loop protection is the 600 s post-boot grace + the 120 s sustained
+# confirmation only. This is NOT a hard cross-reboot counter: this hardware has no
+# flash-free persistent boot counter (no RTC, no u-boot bootcount), and a flash
+# write for that purpose is intentionally excluded. A pathological loop is thus
+# bounded to >= ~10 min of streaming uptime per cycle, not prevented outright.
+
+# ---- fixed v1 thresholds (measured baseline D=1 / load~3.3-3.5 vs observed wedge
+#      D~8 / load~6.8-10.8) ----
+INTERVAL=15          # seconds between checks
+D_THRESHOLD=5        # D-state task count treated as abnormal (baseline is 1)
+LOAD_THRESHOLD=6     # SUPPORTING gate: integer load1 must also be this high
+CONFIRM_CHECKS=8     # consecutive abnormal checks to confirm (8 * 15s = 120s)
+GRACE_SECONDS=600    # no reboot decision within this many seconds of boot
+UPGRADE_FLAG=/tmp/webupgrade
+
+log() { echo "wedge-detector: $*" >/dev/kmsg 2>/dev/null; }
+
+# Ensure SysRq (all functions) is enabled so 'b' is honoured. RAM-only sysctl
+# write (never flash); a no-op if already enabled.
+echo 1 >/proc/sys/kernel/sysrq 2>/dev/null
+
+# Count tasks in uninterruptible (D) sleep into $_dn. Pure shell: a glob over
+# /proc/[0-9]* and ONE `read` redirection per pid -- no fork/exec per pid, no
+# cmdline read. The state is the field after the LAST ") " in /proc/<pid>/stat, so
+# a comm containing spaces or ')' cannot shift the parse; a vanished/short/malformed
+# entry is skipped (never counted), so a transient error can only LOWER the count.
+count_d() {
+	_dn=0
+	for _dd in /proc/[0-9]*; do
+		# 2>/dev/null MUST precede the input redirect: redirects apply left-to-right,
+		# so this points stderr at /dev/null BEFORE the open, suppressing the shell's
+		# "can't open" message when a pid vanishes mid-scan. The failed open still
+		# makes `read` return non-zero, so `|| continue` skips it cleanly.
+		read -r _line 2>/dev/null <"$_dd/stat" || continue   # pid vanished -> skip
+		_rest=${_line##*) }                                  # "PID (comm) " stripped
+		[ "$_rest" = "$_line" ] && continue                  # no ") " -> malformed, skip
+		case "$_rest" in D\ *) _dn=$((_dn + 1)) ;; esac       # state field is exactly 'D'
+	done
+}
+
+streak=0
+log "started: reboot if D>=$D_THRESHOLD & load1>=$LOAD_THRESHOLD for ${CONFIRM_CHECKS}x${INTERVAL}s; grace ${GRACE_SECONDS}s; /dev/watchdog untouched"
+
+while :; do
+	sleep "$INTERVAL"
+
+	# gate 1 -- post-boot grace. Fail-safe: any parse issue is treated as in-grace.
+	read -r _up _r </proc/uptime 2>/dev/null || { streak=0; continue; }
+	_up=${_up%%.*}
+	case "$_up" in '' | *[!0-9]*) streak=0; continue ;; esac
+	[ "$_up" -lt "$GRACE_SECONDS" ] && { streak=0; continue; }
+
+	# gate 2 -- never act during a legitimate flash upgrade.
+	[ -f "$UPGRADE_FLAG" ] && { streak=0; continue; }
+
+	# primary signal -- D-state count (safe /proc/stat scan only).
+	count_d
+	case "$_dn" in '' | *[!0-9]*) streak=0; continue ;; esac
+
+	# supporting signal -- integer part of load1 (never the sole trigger).
+	read -r _load _r </proc/loadavg 2>/dev/null || { streak=0; continue; }
+	_loadi=${_load%%.*}
+	case "$_loadi" in '' | *[!0-9]*) streak=0; continue ;; esac
+
+	# decision -- BOTH must hold; anything else is a no-op that clears the streak.
+	if [ "$_dn" -ge "$D_THRESHOLD" ] && [ "$_loadi" -ge "$LOAD_THRESHOLD" ]; then
+		streak=$((streak + 1))
+		log "abnormal D=$_dn load=$_load streak=$streak/$CONFIRM_CHECKS"
+		if [ "$streak" -ge "$CONFIRM_CHECKS" ]; then
+			log "SUSTAINED WEDGE CONFIRMED (D=$_dn load=$_load ${CONFIRM_CHECKS}x${INTERVAL}s) -> SysRq-b EMERGENCY reboot (no sync/unmount)"
+			echo b >/proc/sysrq-trigger 2>/dev/null
+			sleep 30   # SysRq-b resets at once; guard against re-issuing in a tight loop
+		fi
+	else
+		streak=0
+	fi
+done

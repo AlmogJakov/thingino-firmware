@@ -1,0 +1,40 @@
+#!/bin/sh
+# Board-scoped (PT2) recovery detector for the kernel D-state wedge.
+# Runs a small shell daemon (/usr/sbin/wedge-detector) that reboots ONLY on the
+# clear, sustained wedge signature via SysRq-b. It does NOT touch /dev/watchdog:
+# the busybox hardware watchdog (K99watchdog) remains the independent total-hang
+# safety net, completely unchanged.
+
+DAEMON="/usr/sbin/wedge-detector"
+PIDFILE="/run/wedge-detector.pid"
+
+start() {
+	echo -c 15 "Starting wedge-detector"
+	start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON"
+}
+
+stop() {
+	echo -c 15 "Stopping wedge-detector"
+	start-stop-daemon -K -p "$PIDFILE" -x "$DAEMON"
+	rm -f "$PIDFILE"
+}
+
+case "$1" in
+	start)
+		start
+		;;
+	stop | kill)
+		stop
+		;;
+	restart)
+		stop
+		sleep 1
+		start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+		;;
+esac
+
+exit 0
