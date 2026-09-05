@@ -23,8 +23,32 @@ _ha_mqtt_cfg() {
 	printf '%s' "$val"
 }
 
+# One-shot cache of the ha.enable_* booleans. A caller that checks many entities
+# (ha-state ~12/poll, ha-discovery ~20) otherwise forks jct once PER entity; instead
+# read the ha object ONCE and pull out the boolean enable_<name> flags. Parses ONLY
+# booleans (never strings/passwords), line-anchored to a key position so a value can
+# never be mis-parsed as a flag, and any flag not captured falls back to the exact
+# original per-key jct read -> results are identical (verified on-device: 0 mismatches
+# across all entities). The cache is a shell variable in THIS process only (no file,
+# no persistence); every ha-* run re-sources this file, so it cannot go stale between
+# runs and takes one consistent snapshot within a run. Populated lazily.
+_ha_enabled_cache=""
+_ha_enabled_load() {
+	[ -n "$_ha_enabled_cache" ] && return 0
+	_ha_enabled_cache=" $(jct "$HA_CONFIG_FILE" get ha 2>/dev/null \
+		| sed -n 's/^[[:space:]]*"enable_\([a-z0-9_]*\)"[[:space:]]*:[[:space:]]*\([a-z]*\).*/\1=\2/p' \
+		| tr '\n' ' ') "
+}
+
 ha_entity_enabled() {
 	local val
+	_ha_enabled_load
+	case "$_ha_enabled_cache" in
+		*" $1=false "*) return 1 ;;   # explicitly disabled (from the one-shot read)
+		*" $1=true "*)  return 0 ;;   # explicitly enabled  (from the one-shot read)
+	esac
+	# Not captured (absent / non-boolean / unexpected format): fall back to the exact
+	# original per-key read so behaviour is byte-for-byte identical to before.
 	val=$(ha_cfg "enable_$1")
 	[ "$val" != "false" ]
 }
