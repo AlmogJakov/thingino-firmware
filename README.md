@@ -62,6 +62,39 @@ Board profile: `configs/cameras/sonoff_pt2_t23n_sc2336p_atbm6012bx`.
 
 - [Project Website][0] · [Wiki][1] · [Discord][3] · [Telegram][4]
 
+## Recommended settings
+
+Starting-point values that work well on the Sonoff CAM-PT2. Set them in the web UI
+under **Audio Settings**; each change requires a prudynt audio-thread restart, and
+**Save configuration to file** persists them.
+
+### Audio
+
+Microphone (sound captured by the camera):
+
+| Setting | Value |
+| --- | --- |
+| Codec | OPUS |
+| Sampling, Hz | 16000 |
+| Bitrate, kbps | 32 |
+| Mic volume | 90 |
+| Mic gain | 25 |
+| ALC gain | 0 |
+| Noise suppression | 2 |
+| Compression gain, dB | 0 |
+| Target level, dBfs | 10 |
+| AGC Enabled | Off |
+| High pass filter | On |
+| Force stereo | Off |
+
+Speaker (sound played on the camera speaker):
+
+| Setting | Value |
+| --- | --- |
+| Speaker volume | 65 |
+| Speaker gain | 25 |
+| Speaker sampling, Hz | 16000 |
+
 [0]: https://thingino.com/
 [1]: https://github.com/themactep/thingino-firmware/wiki
 [3]: https://discord.gg/xDmqS944zr
