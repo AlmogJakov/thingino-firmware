@@ -1,0 +1,122 @@
+diff --git a/src/AudioWorker.cpp b/src/AudioWorker.cpp
+index 6215a20..c9f46ff 100644
+--- a/src/AudioWorker.cpp
++++ b/src/AudioWorker.cpp
+@@ -570,6 +570,11 @@ void *AudioWorker::thread_entry(void *arg) {
+   AudioWorker worker(encChn);
+   worker.run();
+ 
++  // 0018: the capture loop has returned (a wedged worker never reaches here, so
++  // the supervisor's bounded wait times out and detaches instead of hanging).
++  // Signal a clean exit so the supervisor pthread_joins and reaps this thread.
++  global_audio[encChn]->thread_exited.store(true, std::memory_order_release);
++
+ #if defined(PLATFORM_T23)
+   if (global_shutdown_requested.load(std::memory_order_relaxed)) {
+     LOG_WARN("T23 shutdown: skipping audio teardown for channel " << encChn);
+diff --git a/src/globals.hpp b/src/globals.hpp
+index 52b3f69..cf30511 100644
+--- a/src/globals.hpp
++++ b/src/globals.hpp
+@@ -202,6 +202,17 @@ struct audio_stream {
+   std::atomic<int> rtsp_client_count{0};
+   std::atomic<bool> muted{false}; // physical-privacy software mute (PCM zeroed in AudioWorker)
+ 
++  // 0018 bounded-join / wedge isolation. thread_exited is set true by
++  // AudioWorker::thread_entry once its capture loop returns; the supervisor
++  // waits a bounded window on it instead of an unbounded pthread_join, so a
++  // capture thread wedged in an uninterruptible /dev/dsp read can never freeze
++  // the restart state machine. wedged latches when that bounded wait times out
++  // and the thread is detached; it gates every audio-subsystem (re)start so no
++  // second /dev/dsp handle is opened against the stuck one until the next
++  // process restart.
++  std::atomic<bool> thread_exited{false};
++  std::atomic<bool> wedged{false};
++
+   std::mutex tap_mutex;
+   std::vector<AudioTapEntry> audio_taps;
+ 
+diff --git a/src/main.cpp b/src/main.cpp
+index 2b35d77..a54da15 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -669,8 +669,16 @@ int main(int argc, const char *argv[]) {
+     // before the audio output thread initialises.  On platforms with a
+     // shared AI/AO CODEC clock (T10/T20/T21) the AO's
+     // IMP_AO_GetPubAttr will then return the actual running rate.
+-    if (cfg->audio.input_enabled && (global_restart_audio || startup)) {
++    // 0018: never (re)start any audio-subsystem thread once the capture thread
++    // has wedged -- the input start below AND the AO start (which blocks on
++    // ao_sh.has_started.acquire()) would otherwise be able to re-hang the
++    // supervisor or open a second /dev/dsp handle against the stuck one. wedged
++    // clears only on the next process restart (driven by the data-plane watchdog).
++    if (cfg->audio.input_enabled && (global_restart_audio || startup) &&
++        !global_audio[0]->wedged.load(std::memory_order_acquire)) {
+       StartHelper sh{0};
++      // arm the bounded-join handshake for THIS worker before creating it
++      global_audio[0]->thread_exited.store(false, std::memory_order_release);
+       int ret =
+           pthread_create(&global_audio[0]->thread, nullptr,
+                          AudioWorker::thread_entry, static_cast<void *>(&sh));
+@@ -679,7 +687,8 @@ int main(int argc, const char *argv[]) {
+       sh.has_started.acquire();
+     }
+ 
+-    if (cfg->audio.output_enabled && (global_restart_audio || startup)) {
++    if (cfg->audio.output_enabled && (global_restart_audio || startup) &&
++        !global_audio[0]->wedged.load(std::memory_order_acquire)) {
+       StartHelper ao_sh{0};
+       int ret = pthread_create(&audio_output_thread, nullptr,
+                                AudioOutputWorker::thread_entry,
+@@ -691,7 +700,8 @@ int main(int argc, const char *argv[]) {
+       ao_sh.has_started.acquire();
+     }
+ 
+-    if (cfg->audio.output_enabled && (global_restart_audio || startup)) {
++    if (cfg->audio.output_enabled && (global_restart_audio || startup) &&
++        !global_audio[0]->wedged.load(std::memory_order_acquire)) {
+       int ret = pthread_create(&backchannel_thread, nullptr,
+                                BackchannelWorker::thread_entry, NULL);
+       LOG_DEBUG_OR_ERROR(ret, "create backchannel thread");
+@@ -795,12 +805,37 @@ int main(int argc, const char *argv[]) {
+       }
+     }
+ 
+-    // stop audio
+-    if (global_audio[0]->imp_audio && global_restart_audio) {
++    // stop audio (0018: skip once wedged -- imp_audio is intentionally left
++    // non-null on the wedge path, so without the !wedged guard a subsequent
++    // reconfig would re-enter this block and pthread_detach an already-detached
++    // thread / pthread_join a stale tid = undefined behavior)
++    if (global_audio[0]->imp_audio && global_restart_audio &&
++        !global_audio[0]->wedged.load(std::memory_order_acquire)) {
+       global_audio[0]->running = false;
+       global_audio[0]->should_grab_frames.notify_one();
+-      int ret = pthread_join(global_audio[0]->thread, NULL);
+-      LOG_DEBUG_OR_ERROR(ret, "join audio thread");
++      // 0018: BOUNDED join. A wedged AudioWorker (uninterruptible /dev/dsp read
++      // in D-state) can never observe running=false, so an unbounded
++      // pthread_join here would hang this single supervisor thread and freeze
++      // the whole restart state machine -- RTSP and video would never be
++      // re-created. Wait a bounded window for a clean exit; on timeout DETACH
++      // and latch wedged so the video/RTSP restart below always proceeds. Do
++      // NOT delete imp_audio: the detached thread still owns it and /dev/dsp.
++      int _audio_wait_ms = 0;
++      while (!global_audio[0]->thread_exited.load(std::memory_order_acquire) &&
++             _audio_wait_ms < 2000 /* kAudioJoinTimeoutMs */) {
++        std::this_thread::sleep_for(milliseconds(10));
++        _audio_wait_ms += 10;
++      }
++      if (global_audio[0]->thread_exited.load(std::memory_order_acquire)) {
++        int ret = pthread_join(global_audio[0]->thread, NULL);
++        LOG_DEBUG_OR_ERROR(ret, "join audio thread");
++      } else {
++        pthread_detach(global_audio[0]->thread);
++        global_audio[0]->wedged.store(true, std::memory_order_release);
++        LOG_ERROR("audio thread wedged (/dev/dsp D-state?), detached after "
++                  "2000ms; imp_audio left owned by it. Video/RTSP restart "
++                  "continues; audio degraded until next process restart");
++      }
+     }
+ 
+     if (global_audio_output && global_audio_output->running &&

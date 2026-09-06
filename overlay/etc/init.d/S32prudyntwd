@@ -34,6 +34,18 @@ CHECK_TIMEOUT=5
 # as INCONCLUSIVE (never as "frozen"), so it can never cause a needless restart.
 FRAME_CHECK_TIMEOUT=3
 
+# Data-plane RTP-egress check (catches "encoder alive, zero RTP delivered").
+# RTP_WINDOW: seconds between the two rtp_pkts samples (patch 0019 exports rtp_pkts
+# AND subs=ch0-has-an-RTSP-subscriber in prudyntctl stats). Consulted ONLY after the
+# OPTIONS-200 + fps>0 gates, and ONLY while ch0 has its OWN RTSP subscriber (subs==1)
+# -- a viewerless or non-RTSP-warmed channel delivers no ch0 RTP by design, so that
+# is INCONCLUSIVE, never a stall. Every ambiguity (probe disabled / no ch0 subscriber
+# / no rtp_pkts field on an old binary / query error) is INCONCLUSIVE and stays
+# "serving", so this can NEVER self-inflict a restart. Feeds the unchanged
+# grace/DOWN_STREAK/RESTART_LIMIT/reboot ladder.
+RTP_PROBE_ENABLE=1
+RTP_WINDOW=4
+
 # Startup / post-relaunch GRACE (seconds), measured monotonically. MUST exceed
 # the worst-case HEALTHY bringup. With 0009: serial ch0(45s)+ch1(45s) ~= 90s,
 # plus cold/power-cut sensor IMP init (M1: wait_for_sensor_resolution +
@@ -201,23 +213,68 @@ check_frames() {
 	return 1                          # SUCCESSFUL query, fps==0 -> confirmed frozen
 }
 
+# Data-plane RTP-EGRESS liveness via the 0019 rtp_pkts counter (prudyntctl stats).
+# This is exactly the signal check_frames (encoder fps) is blind to: the encoder
+# can run at fps>0 while ZERO RTP reaches any client (audio-reconfig wedge,
+# live555 event-loop stall). Returns:
+#   0 = RTP flowing (rtp_pkts advanced across the window)
+#   1 = CONFIRMED stall (ch0 has its OWN RTSP subscriber, fps already >0, rtp FROZEN)
+#   2 = INCONCLUSIVE (disabled / no ch0 RTSP subscriber / no rtp_pkts field / error)
+# FAIL-SAFE: only "ch0 RTSP subscriber present AND counter frozen" returns 1; every
+# ambiguity is INCONCLUSIVE and never downgrades serving. Crucially it gates on ch0's
+# OWN subscriber (subs, from patch 0019 = video_stream hasDataCallback), NOT a
+# channel-agnostic :554 socket count: a channel kept warm by a NON-RTSP consumer
+# (MP4 recording / prebuffer / jpeg / bootstrap) reports fps>0 with rtp_pkts
+# legitimately frozen and MUST stay INCONCLUSIVE, else the camera would reboot-loop.
+# Cost: one RTP_WINDOW sample pair, and only while ch0 actually has an RTSP client.
+# KNOWN benign limitation: a genuine but IDLE ch0 client (RTSP PAUSE, or SETUP
+# without PLAY) keeps subs=1 while RTP legitimately does not flow; sustained past
+# grace for DOWN_STREAK_LIMIT cycles this triggers ONE restart (which drops the
+# idle client and re-arms the 200s grace -- NOT a reboot-loop). Far narrower than
+# the zero-client :554 bug this replaced; documented, not mitigated (an RTCP-RR
+# liveness gate would close it but is not worth the complexity for PAUSE-holding).
+check_video_rtp() {
+	local _sub _r1 _p1 _r2 _p2
+	[ "$RTP_PROBE_ENABLE" = "1" ] || return 2
+	command -v prudyntctl >/dev/null 2>&1 || return 2
+	_r1=$(timeout "$FRAME_CHECK_TIMEOUT" prudyntctl json '{"stream0":{"stats":null}}' 2>/dev/null) || return 2
+	# ch0 must have its OWN RTSP subscriber; else no RTP egress on ch0 is expected.
+	_sub=$(printf '%s' "$_r1" | grep -o '"subs":[0-9]*' | head -n 1 | cut -d: -f2)
+	[ "$_sub" = "1" ] || return 2                    # no ch0 RTSP subscriber / no field -> inconclusive
+	_p1=$(printf '%s' "$_r1" | grep -o '"rtp_pkts":[0-9]*' | head -n 1 | cut -d: -f2)
+	case "$_p1" in '' | *[!0-9]*) return 2 ;; esac   # no rtp_pkts field (pre-0019) -> inconclusive
+	sleep "$RTP_WINDOW"
+	_r2=$(timeout "$FRAME_CHECK_TIMEOUT" prudyntctl json '{"stream0":{"stats":null}}' 2>/dev/null) || return 2
+	_sub=$(printf '%s' "$_r2" | grep -o '"subs":[0-9]*' | head -n 1 | cut -d: -f2)
+	[ "$_sub" = "1" ] || return 2                    # ch0 client left mid-window -> inconclusive
+	_p2=$(printf '%s' "$_r2" | grep -o '"rtp_pkts":[0-9]*' | head -n 1 | cut -d: -f2)
+	case "$_p2" in '' | *[!0-9]*) return 2 ;; esac
+	[ "$_p2" != "$_p1" ] && return 0                 # any change = RTP is leaving (wrap-safe)
+	return 1                                          # ch0 subscriber + fps>0 + counter frozen -> stall
+}
+
 # One probe pass: OPTIONS socket liveness (curl, then raw-nc fallback) AND, when the
 # socket is up, a frame-liveness confirmation. A CONFIRMED-frozen encoder (fps==0)
 # now counts as NOT serving so the existing grace + DOWN_STREAK + reboot ladder can
 # act; an inconclusive frame check is treated as serving (fail-safe). Never itself a
 # restart trigger (only via the grace + streak gates in watch()).
 check_rtsp_stream() {
-	local _frc
+	local _frc _rrc
 	check_with_curl || check_with_nc || return 1   # socket down -> not serving
 	check_frames; _frc=$?                            # socket up -> confirm frames flowing
 	[ "$_frc" -eq 1 ] && return 1                    # CONFIRMED frozen (fps==0) -> not serving
+	check_video_rtp; _rrc=$?                          # data-plane: is RTP actually leaving?
+	[ "$_rrc" -eq 1 ] && return 1                    # encoder OK but zero RTP to a client -> not serving
 	return 0                                          # flowing OR inconclusive -> serving
 }
 
 # Up to RETRY_COUNT passes; success on any. Worst-case duration on a fully-down
 # socket: RETRY_COUNT * (curl CHECK_TIMEOUT + nc CHECK_TIMEOUT) + (RETRY_COUNT-1)
 # * RETRY_DELAY = 2*(5+5) + 1*5 = ~25s (well under the K99 ~60s budget, and the
-# nc leg IS counted here -- earlier ~40s claims omitted it).
+# nc leg IS counted here -- earlier ~40s claims omitted it). When the socket is UP
+# and ch0 has a subscriber, check_video_rtp adds one RTP_WINDOW (4s) sleep per pass
+# (its prudyntctl calls are FRAME_CHECK_TIMEOUT-bounded); ~2*4s=8s worst case, so
+# the pass stays ~33s -- still comfortably inside the 60s INTERVAL budget.
 probe_serving() {
 	local i
 	i=1

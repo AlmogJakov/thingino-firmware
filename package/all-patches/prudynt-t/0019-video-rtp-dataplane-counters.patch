@@ -1,0 +1,69 @@
+diff --git a/src/IMPDeviceSource.cpp b/src/IMPDeviceSource.cpp
+index b1a04cb..e3845ca 100644
+--- a/src/IMPDeviceSource.cpp
++++ b/src/IMPDeviceSource.cpp
+@@ -234,6 +234,14 @@ void IMPDeviceSource<FrameType, Stream>::deliverFrame() {
+     memcpy(fTo, &nal.data[0], fFrameSize);
+ 
+     if (fFrameSize > 0) {
++      if constexpr (std::is_same_v<FrameType, H264NALUnit>) {
++        // 0019: count this NAL at the last prudynt-owned step before live555
++        // hands it to the RTP sink -- ground truth for "video is leaving the
++        // process". Read by the data-plane watchdog via prudyntctl stats.
++        stream->rtp_pkts.fetch_add(1, std::memory_order_relaxed);
++        stream->rtp_bytes.fetch_add(static_cast<uint32_t>(fFrameSize),
++                                    std::memory_order_relaxed);
++      }
+       FramedSource::afterGetting(this);
+       return;
+     }
+diff --git a/src/JsonAPI.cpp b/src/JsonAPI.cpp
+index eef6ed8..826d17a 100644
+--- a/src/JsonAPI.cpp
++++ b/src/JsonAPI.cpp
+@@ -147,6 +147,25 @@ void handle_stream_stats(int idx, std::string &out) {
+   add_num(out, fps);
+   add_key(out, s, "Bps");
+   add_num(out, bps);
++  // 0019: RTP-egress counters (video streams only) for the data-plane watchdog.
++  // Masked to positive int (add_num is int); the watchdog uses the delta only.
++  if ((idx == 0 || idx == 1) && global_video[idx]) {
++    add_key(out, s, "rtp_pkts");
++    add_num(out, (int)(global_video[idx]->rtp_pkts.load(std::memory_order_relaxed) &
++                       0x7fffffffu));
++    add_key(out, s, "rtp_bytes");
++    add_num(out, (int)(global_video[idx]->rtp_bytes.load(std::memory_order_relaxed) &
++                       0x7fffffffu));
++    // subs = 1 when THIS channel has a live RTSP consumer (the IMPDeviceSource
++    // sets hasDataCallback on SETUP/PLAY, clears it on teardown). The watchdog
++    // gates the "rtp frozen -> stall" verdict on this so a channel kept warm by
++    // a NON-RTSP consumer (recording/prebuffer/jpeg) with no RTSP client is
++    // never mistaken for a wedge (which would otherwise reboot-loop).
++    add_key(out, s, "subs");
++    add_num(out,
++            global_video[idx]->hasDataCallback.load(std::memory_order_relaxed) ? 1
++                                                                               : 0);
++  }
+   out += "}";
+ }
+ 
+diff --git a/src/globals.hpp b/src/globals.hpp
+index cf30511..0782b0f 100644
+--- a/src/globals.hpp
++++ b/src/globals.hpp
+@@ -254,6 +254,15 @@ struct video_stream {
+   bool run_for_jpeg; // see comment in audio_stream
+   std::atomic<bool> bootstrap_requested{false};
+   std::atomic<bool> hasDataCallback; // see comment in audio_stream
++
++  // 0019: RTP-egress counters, bumped in IMPDeviceSource::deliverFrame at the
++  // afterGetting hand-off to the live555 RTP sink (video only). rtp_pkts
++  // advancing = video is actually leaving the process; frozen while fps>0 and a
++  // client is connected = the "encoder alive, zero RTP delivered" wedge the
++  // data-plane watchdog (S32prudyntwd) catches via prudyntctl stats. uint32,
++  // delta-based (this 32-bit MIPS SoC avoids 64-bit atomics, see frame_seq).
++  std::atomic<uint32_t> rtp_pkts{0};
++  std::atomic<uint32_t> rtp_bytes{0};
+   std::atomic<bool> mp4_waiting_for_idr;
+   std::atomic<int64_t> mp4_required_idr_ts_us;
+   std::atomic<int64_t> mp4_last_idr_ts_us;
