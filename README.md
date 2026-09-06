@@ -15,7 +15,7 @@ Release notes for the Sonoff CAM-PT2 build. Full engineering detail lives in
 ### Streaming & startup reliability
 - **Fixed a startup crash-loop** where prudynt never served RTSP - root-caused to a miscompiled libc ABI shim (now a pinned prebuilt, `-flto` dropped).
 - **Reliable cold-boot streaming:** fail-fast if the encoder/ISP didn't come up, an anti-brick config restore, and a stream watchdog that checks real encoder frames (not just an RTSP probe) with a bounded restart→reboot ladder.
-- **prudynt patches 0001-0017:** cleaner VPU teardown/reclaim, live-apply OSD changes without tearing down the encoder, and related stream-config fixes.
+- **prudynt patches 0001-0019:** cleaner VPU teardown/reclaim, live-apply OSD changes without tearing down the encoder, related stream-config fixes, and the audio-reconfig/RTP-watchdog work below.
 
 ### Day / night & optics
 - Day/night **survives reboot** and no longer rewrites config on every toggle (a tiny atomic sidecar → near-zero flash wear).
@@ -46,6 +46,13 @@ A rare Ingenic-3.10 kernel *lost-wakeup* could strand a task uninterruptibly and
 - **R3** - an independent detector reboots (SysRq-b) only on a clear, sustained wedge signature, leaving the hardware watchdog untouched.
 
 All three are RAM-only (no added flash writes).
+
+### Audio-reconfig resilience & RTP data-plane watchdog (new)
+An audio-settings **Save** (codec / sample-rate / bitrate / mic toggle) restarts the audio worker; if that worker was wedged in an uninterruptible `/dev/dsp` read, the single supervisor thread's `pthread_join` hung forever and the whole restart path froze - so RTSP + video stopped being served until prudynt was restarted.
+- **prudynt patch 0018** - the audio-worker join is now **bounded**: on timeout it detaches and latches a `wedged` flag that gates every audio (re)start, so a stuck audio thread can never hang the supervisor or open a second `/dev/dsp`. **Video and RTSP always keep running;** audio degrades until the next restart.
+- **prudynt patch 0019 + stream watchdog** - a **data-plane** liveness signal: prudynt exports a real per-stream RTP-egress counter (plus a "has an RTSP subscriber" flag), and the watchdog now treats "encoder alive (fps>0) but zero RTP delivered to a subscribed client" as not-serving - a blind spot the old fps/OPTIONS checks missed. Fail-safe (any ambiguity stays "serving"), feeding the existing grace/streak/reboot ladder.
+
+RAM-only (no added flash writes). The supervisor-deadlock fix is proven; the exact way a wedge also stalled *video* delivery is not fully proven, so the watchdog is the safety net that catches a silent no-RTP condition regardless of cause. Engineering detail: [`PT2-FIX-SET.md`](PT2-FIX-SET.md) §15.
 
 ## Building
 
