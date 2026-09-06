@@ -123,7 +123,7 @@ ha_msub_cmd() {
 # State cache
 #
 # Tracks the last published value for each entity so ha-state only publishes
-# on actual change — not on every poll cycle.
+# on actual change - not on every poll cycle.
 #
 # Why this matters:
 #   Without caching, ha-state publishes ALL entities every state_interval
@@ -148,7 +148,7 @@ ha_state_cache_clear() {
 # Return 0 if entity state changed since the last CONFIRMED publish (caller
 # should publish); return 1 if unchanged (skip). READ-ONLY: the cache is written
 # only by _ha_cache_write AFTER a confirmed publish (confirm-then-cache), never
-# here — so a value is remembered only once the broker has actually acked it.
+# here - so a value is remembered only once the broker has actually acked it.
 _ha_state_changed() {
 	local entity="$1" state="$2"
 	local cache_file="$_HA_STATE_CACHE_DIR/$entity"
@@ -271,7 +271,7 @@ _ha_unlock() {
 # the broker PUBACKs, so its exit code is real confirmation (was QoS0, exit
 # ignored). Wrapped in `timeout` so an unreachable/hung broker can't block for
 # minutes (validated: a publish to an unroutable host hangs until killed). On
-# success — and only then — the cache is updated (confirm-then-cache); a dropped
+# success - and only then - the cache is updated (confirm-then-cache); a dropped
 # publish leaves the cache stale so the next poll re-publishes. Failures are
 # logged. entity="" (e.g. discovery) publishes normally but is never cached.
 _ha_pub_confirm() {
@@ -334,7 +334,7 @@ ha_pub_flush() {
 # Publish a state value.
 #
 # By default, publishes only if the value changed since last time (change-
-# detection via cache). Pass force=1 to always publish regardless of cache —
+# detection via cache). Pass force=1 to always publish regardless of cache -
 # used on daemon startup for a full sync and by ha-commands for optimistic
 # updates after a command.
 #

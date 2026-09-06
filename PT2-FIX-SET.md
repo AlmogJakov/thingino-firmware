@@ -98,7 +98,7 @@ is **not** installed into the firmware image.
   atomicity comes from the `daynight-state` helper's own write; other rarely-changed keys still
   ride **stock** jct (the atomic-write jct fork was dropped - see §5). Executor-invocation changes
   stay deferred.
-- **No separate persistence for `color` / `ircut` / IR-LED — by design, not a gap.** Only the
+- **No separate persistence for `color` / `ircut` / IR-LED - by design, not a gap.** Only the
   day/night mode and the physical-privacy state are persisted. `color`, `ircut` and the 850 nm
   LED are **derived runtime effects** of the selected auto/day/night mode (day ⇒ ir-cut on,
   color on, 850 off; night ⇒ ir-cut off, color off, 850 on), exactly as before this change.
@@ -285,7 +285,7 @@ stock build has no watchdog. We add it via the overlay (no `.mk` change needed).
   IR-cut latch has no GPIO read-back**, so `set_ircut_verified` can only confirm the `ircut`
   **invocation** ran (it catches a crashed/missing call), not that the mechanical latch physically
   flipped; `ircut read` reflects the last commanded state (`/tmp/ircutmode.txt`). A dropped pulse on
-  a healthy latch is therefore not software-detectable — an accepted HW limitation, behavior
+  a healthy latch is therefore not software-detectable - an accepted HW limitation, behavior
   unchanged (see memory `ircut-dualpin-verify-lies`).
 - **Files:** `package/prudynt-t/files/daynight`.
 - **Notes:** the executor **does not write flash** (it reads config and drives GPIO/runtime),
@@ -361,10 +361,10 @@ stock build has no watchdog. We add it via the overlay (no `.mk` change needed).
   the only event that changes the negotiated codec. Every **involuntary** disruption (reboot, power-cut,
   network drop, prudynt crash/wedge/restart) keeps the same codec → go2rtc reconnects and re-binds both
   tracks → audio+video recover. Prerequisite: the **off-camera** go2rtc must be supervised
-  (auto-restart) **on its own host** — go2rtc is not installed or run on this camera, so on-camera
+  (auto-restart) **on its own host** - go2rtc is not installed or run on this camera, so on-camera
   supervision is out of scope. The camera's responsibility is to keep prudynt's RTSP (`:554`) up,
   which the watchdog (§B) probes directly, complementing prudynt fail-fast (§A). (Confirmed in the
-  pre-release audit — see §8.7 — that go2rtc is not in the PT2 image, so the earlier "unsupervised
+  pre-release audit - see §8.7 - that go2rtc is not in the PT2 image, so the earlier "unsupervised
   go2rtc" finding is not applicable to the firmware.)
 
 ### H. Live-reconfig / stream seamlessness (T23)
@@ -613,7 +613,7 @@ orphan reclaim) and a one-time `migrate`. prudynt reads the sidecar **directly**
 | read at boot (IR-cut/IR-LED optics) | `S56ircut` | `daynight-state get` (same sidecar prudynt reads → optics & ISP can't disagree) |
 | write (manual/MQTT runtime toggle) | agent adapter, `physical-privacy` freeze/restore | `daynight-state set` only (live apply via `prudyntctl json -`; **no** `prudynt.json` rewrite - this is the flash-wear win) |
 | read (HA state / API) | `ha-state`, adapter status + per-setting GET | `daynight-state get` / sidecar-derived helpers |
-| ensure a valid sidecar at boot | `S31prudynt start()` → `daynight-state migrate` | leaves a valid sidecar untouched; seeds forced **`day`** when it is **missing or corrupt** (self-heal); reclaims an orphaned temp. Does **not** read `prudynt.json` — the legacy daynight keys are **dead** |
+| ensure a valid sidecar at boot | `S31prudynt start()` → `daynight-state migrate` | leaves a valid sidecar untouched; seeds forced **`day`** when it is **missing or corrupt** (self-heal); reclaims an orphaned temp. Does **not** read `prudynt.json` - the legacy daynight keys are **dead** |
 
 The `0015` overlay maps the sidecar to prudynt's members the same way `IMPSystem::init` consumes
 them (`force_mode` applied **regardless of** `enabled`): `auto` → `force_mode_cfg=""` +
@@ -621,7 +621,7 @@ them (`force_mode` applied **regardless of** `enabled`): `auto` → `force_mode_
 + `enabled=false`. It allocates nothing (static string literals) and frees nothing, so it adds no
 memory leak and cannot use-after-free the lock-free readers. A missing / unreadable / malformed
 sidecar falls back to **forced `day`** (`force_mode_cfg="day"` + `enabled=false`) and never crashes
-— the chosen safe default for broken persistence, applied identically by the overlay, the
+- the chosen safe default for broken persistence, applied identically by the overlay, the
 `daynight-state get` helper, and `migrate` (which self-heals a missing/corrupt sidecar to `day` at
 boot). A legitimate `mode=auto` is preserved as auto.
 
@@ -1105,7 +1105,7 @@ Session 2026-07-06. Splits the fast-changing gain/brightness out of the heavy ~6
 
 ---
 
-## 12. Reliability safety batch — Steps 1-5 (2026-07-07)
+## 12. Reliability safety batch - Steps 1-5 (2026-07-07)
 Staged from the 2026-07-07 production-readiness audit (46 review agents, 27 confirmed findings).
 Each fix is its own commit with a `/opt/wd-bak/<name>.orig` backup, validated before deploy and
 verified after. **Branch `pt2-firmware` - always build from the current branch TIP (do NOT pin an older per-step SHA such as `af35c0ad6`).** Batch commit range
@@ -1113,44 +1113,44 @@ verified after. **Branch `pt2-firmware` - always build from the current branch T
 System invariants held throughout: prudynt PID unchanged, RTSP 200, SSH connected, no unexpected
 restart/reboot, no new errors.
 
-### 12.1 Deployed LIVE to cam4 (active now — rootfs; took effect without a build)
-- **Step 1 — watchdog frame-liveness probe** (`5a7a58477`, `overlay/etc/init.d/S32prudyntwd`):
+### 12.1 Deployed LIVE to cam4 (active now - rootfs; took effect without a build)
+- **Step 1 - watchdog frame-liveness probe** (`5a7a58477`, `overlay/etc/init.d/S32prudyntwd`):
   detects a socket-up-but-frozen/black stream that the OPTIONS-only probe was blind to, via a
   local `prudyntctl` `stream0.stats.fps` check, and arms the reboot ladder. Fail-safe: only a
   CONFIRMED `fps==0` downgrades "serving"; any query hiccup is INCONCLUSIVE (treated as serving),
   so it can never cause a self-inflicted restart.
-- **Step 2a — prudynt OOM protection `oom_score_adj=-800`** (`083677018`, `package/prudynt-t/files/S31prudynt`):
+- **Step 2a - prudynt OOM protection `oom_score_adj=-800`** (`083677018`, `package/prudynt-t/files/S31prudynt`):
   makes prudynt a near-last-resort OOM victim (was `oom_score` 197 = first victim on this 36 MB
   no-swap box); re-applied on every start/restart; `start-stop-daemon` return code preserved.
-- **Step 2b — dropbear SSH-listener OOM protection `-500`** (`2fbba09ef`, renamed to `S51oomprotect` in `2dfd2c2bd`; ships as `overlay/etc/init.d/S51oomprotect`, executable + ordered after `S50dropbear`):
+- **Step 2b - dropbear SSH-listener OOM protection `-500`** (`2fbba09ef`, renamed to `S51oomprotect` in `2dfd2c2bd`; ships as `overlay/etc/init.d/S51oomprotect`, executable + ordered after `S50dropbear`):
   keeps remote-recovery SSH out of the OOM killer's first picks; children inherit the score.
-- **Step 2b-ii — watchdog auto-re-asserts dropbear `-500` ≤60 s** (`b6776c415`, `S32prudyntwd`):
+- **Step 2b-ii - watchdog auto-re-asserts dropbear `-500` ≤60 s** (`b6776c415`, `S32prudyntwd`):
   a check-then-set line in the existing loop re-applies the shield after a mid-run dropbear restart.
-- **Step 3b — `agent.cgi` non-streaming curl bounded** `--connect-timeout 2 --max-time 8`
+- **Step 3b - `agent.cgi` non-streaming curl bounded** `--connect-timeout 2 --max-time 8`
   (`79d0734bb`): a stalled/deadlocked agent can no longer hang the Web UI. The SSE `curl -N`
   streaming path is deliberately left unbounded.
-- **Step 3c — all 8 HA direct publishes wrapped in `timeout ${HA_PUB_TIMEOUT:-4}`** (`bc42afe36`,
+- **Step 3c - all 8 HA direct publishes wrapped in `timeout ${HA_PUB_TIMEOUT:-4}`** (`bc42afe36`,
   `ha-common`/`ha-state`/`ha-daemon`/`ha-discovery`): a broker/Wi-Fi outage can no longer stall the
   synchronous ha-daemon loop for minutes. `_ha_pub_confirm` was already wrapped.
-- **Step 5 — `physical-privacy off --force` explicit fail-open escape** (`af35c0ad6`,
+- **Step 5 - `physical-privacy off --force` explicit fail-open escape** (`af35c0ad6`,
   `overlay/usr/sbin/physical-privacy`): a motor-readback fault can no longer pin the camera blind
   with no software override. Default `off` stays fail-CLOSED; `do_guard` never force-opens; no
   automatic fail-open, no persistent state.
 
-### 12.2 BUILD-ONLY — active only AFTER the firmware build + flash
+### 12.2 BUILD-ONLY - active only AFTER the firmware build + flash
 - **Option B Web-UI live-status split** (`bd2dde208`): LiveGain 5 s channel + `json-daynight.cgi`
   + full SSE heartbeat slowed to 15 s w/ 5 s keepalive + null-guard. Build-only because `main.js`
   (~104 KB) exceeds the ~92 KB overlay free and cannot be live-copied.
-- **Step 3a — `json-daynight.cgi` prudyntctl `timeout 2`** (`08a7eee2a`): ships with Option B
+- **Step 3a - `json-daynight.cgi` prudyntctl `timeout 2`** (`08a7eee2a`): ships with Option B
   (the CGI is not on the live device).
-- **Step 4 — prudynt patch `0005` bounded VPU-stall exit** (`777c6427a`): after 3 in-process
+- **Step 4 - prudynt patch `0005` bounded VPU-stall exit** (`777c6427a`): after 3 in-process
   rebuilds that don't restore a frame, raise `kill(getpid(), SIGTERM)` (the `0011` clean-exit
   idiom) so a hard VPU wedge recovers via S31/S32 instead of looping alive-but-frameless. Baked
   into the prudynt binary. Regenerated from `themactep/prudynt-t@f4b3228` + `0001-0004`,
   `git apply --check` clean. NOTE: `0005` is the broader **T23 life-guard fault-tolerance** patch (it also carries the bounded prudyntctl IPC socket timeout, honour-actuation-result day/night switch, and persist-forced-mode - see section 3-G); this batch ADDED its bounded VPU-stall exit.
 
-### 12.3 Deferred (agreed — not in this batch)
-- **2c `vm.min_free_kbytes`** — delicate reclaim knob on a 36 MB no-swap box; the real OOM safety
+### 12.3 Deferred (agreed - not in this batch)
+- **2c `vm.min_free_kbytes`** - delicate reclaim knob on a 36 MB no-swap box; the real OOM safety
   (victim ordering) is already done.
 - Watchdog **over-count** (counts legitimate external restarts) + **cross-boot circuit-breaker**
   (needs a new persistent write).
@@ -1172,10 +1172,10 @@ restart/reboot, no new errors.
 ### 12.5 Operational notes
 - **Overlay usage rose on the live unit** to ~75 % (168 KB used / 56 KB free) from the live rootfs
   deploys (copy-ups of the modified scripts). Still safe, but monitor.
-- **The firmware build reclaims overlay space** — once the fixes bake into `/rom`, the overlay
+- **The firmware build reclaims overlay space** - once the fixes bake into `/rom`, the overlay
   copies are redundant and can be removed, dropping the overlay back to a few KB.
 - **DO NOT FLASH without:** (a) off-device backups of mtd2 `config` + mtd3 `kernel` + mtd4 `rootfs`;
-  (b) a **verified config-preserving** `sysupgrade` plan — mtd2 holds Wi-Fi `Zoe2.4` + the SSH
+  (b) a **verified config-preserving** `sysupgrade` plan - mtd2 holds Wi-Fi `Zoe2.4` + the SSH
   authorized_keys, so losing it means losing the remote camera; and (c) confirmed physical
   UART/U-Boot recovery access. `sysupgrade` also requires `fw_setenv enable_updates true` + a reboot
   first.
@@ -1206,17 +1206,17 @@ restart/reboot, no new errors.
   with **no** `prudynt.json` size change, physical-privacy enter/exit keeps the mode, a
   power-cut mid-toggle leaves a valid mode, `tz-update` date math, rcK stop < 60 s, motors interlock.
 
-## 13. Engineering Record — complete reference (branch tip `f256057a9`)
+## 13. Engineering Record - complete reference (branch tip `f256057a9`)
 
 *Consolidated 2026-07-08. Standalone current record for the `pt2-firmware` branch: every problem
 fixed, why it mattered, the fix, its deployment status, how it was validated, remaining risk, and
-open follow-ups. §1–§12 hold the deeper historical detail and are cross-referenced where useful.*
+open follow-ups. §1-§12 hold the deeper historical detail and are cross-referenced where useful.*
 
 ### 13.0 Overview
-- **Branch / base:** `pt2-firmware`, based on upstream `12445a6`. This file is a repo document only — **not** installed into the image.
-- **Hardware / role:** Sonoff CAM-PT2 — Ingenic **T23N**, **SC2336P** sensor, **ATBM6012BX** Wi-Fi, **ir850-only** illuminator, stepper PTZ. **Life-safety** camera. Path: Thingino + prudynt (`f4b3228`, live555 RTSP) → *(off-camera)* go2rtc → WebRTC / Home Assistant. go2rtc is **not** on the camera (absent from the PT2 defconfig).
+- **Branch / base:** `pt2-firmware`, based on upstream `12445a6`. This file is a repo document only - **not** installed into the image.
+- **Hardware / role:** Sonoff CAM-PT2 - Ingenic **T23N**, **SC2336P** sensor, **ATBM6012BX** Wi-Fi, **ir850-only** illuminator, stepper PTZ. **Life-safety** camera. Path: Thingino + prudynt (`f4b3228`, live555 RTSP) → *(off-camera)* go2rtc → WebRTC / Home Assistant. go2rtc is **not** on the camera (absent from the PT2 defconfig).
 - **Current branch tip:** `f256057a9`.
-- **Currently-flashed build (validated live, cam4):** `BUILD_ID="pt2-firmware+f256057, 2026-07-07 21:14:20 +0000"`. Build via GitHub Actions `pt2-build-artifact` (workflow_dispatch → branch `pt2-firmware`, ~1–2 h, artifact `pt2-firmware-images`). Flashing is performed by the operator (the assistant does prep/validation only).
+- **Currently-flashed build (validated live, cam4):** `BUILD_ID="pt2-firmware+f256057, 2026-07-07 21:14:20 +0000"`. Build via GitHub Actions `pt2-build-artifact` (workflow_dispatch → branch `pt2-firmware`, ~1-2 h, artifact `pt2-firmware-images`). Flashing is performed by the operator (the assistant does prep/validation only).
 - **Status legend:** **BAKED** = in the flashed image (rootfs / overlay / prudynt patch); **BUILD-ONLY** = ships only via a firmware build, never live-copied (e.g. `main.js` is 107 KB > overlay free, and prudynt patches are compiled in); **ROOTFS/LIVE-CAPABLE** = a small overlay/CGI file that *can* be live-copied but for `f256057a9` is baked.
 
 ### 13.1 Safety-batch summary
@@ -1231,91 +1231,91 @@ open follow-ups. §1–§12 hold the deeper historical detail and are cross-refe
 | 7 | prudynt VPU stall recovery | patch `0005`: bounded stall restarts → clean `SIGTERM` self-exit for VPU reclaim | `777c6427a` | BAKED (patch) |
 | 8 | Physical privacy | explicit manual-only `off --force`; default `off` stays fail-closed; no auto fail-open | `af35c0ad6` | BAKED |
 | 9 | Storage / flash / overlay | write-on-change discipline; status-channel UI is read-only; no cleanup performed | (see §5, §11.6) | BAKED |
-| — | Docs / CI + dropbear naming | build-from-tip, patch-gate `0001-0017`, S51oomprotect comment `S30dropbear` | `a71f7e2a9`,`5c1ff8336` | doc/CI only |
+| - | Docs / CI + dropbear naming | build-from-tip, patch-gate `0001-0017`, S51oomprotect comment `S30dropbear` | `a71f7e2a9`,`5c1ff8336` | doc/CI only |
 
 ### 13.2 Fixes by subsystem
 
 **1. Watchdog / stream-liveness** (`overlay/etc/init.d/S32prudyntwd`, `5a7a58477`).
 - *Problem / why it mattered:* the old watchdog probed only RTSP `OPTIONS`. A socket-alive but **black/frozen** stream (VPU stall, stopped encoder channel) still answered `OPTIONS 200`, so a life-safety camera could show no usable video while the watchdog believed it healthy.
 - *Fix:* `check_frames()` queries the local `prudyntctl` `stream0.stats.fps`; `probe_serving()` now requires both a serving socket **and** live frames.
-- *Fail-safe:* only a **confirmed numeric `fps==0`** downgrades "serving." Any hiccup — empty/non-numeric output, timeout, `prudyntctl` missing — returns **INCONCLUSIVE** and is treated as *serving*, so a probe glitch can never cause a self-inflicted restart.
-- *Validation:* live cam4 — RTSP `200`, both streams 16–18 FPS, `0` watchdog restarts over baseline + soak (§13.3).
+- *Fail-safe:* only a **confirmed numeric `fps==0`** downgrades "serving." Any hiccup - empty/non-numeric output, timeout, `prudyntctl` missing - returns **INCONCLUSIVE** and is treated as *serving*, so a probe glitch can never cause a self-inflicted restart.
+- *Validation:* live cam4 - RTSP `200`, both streams 16-18 FPS, `0` watchdog restarts over baseline + soak (§13.3).
 
 **2. Watchdog SSH / SIGPIPE safety** (boot path).
 - *Problem:* if the watchdog is (re)started from an **interactive SSH** session, its backgrounded `watch()` subshell inherits the SSH pty as stdout/stderr; when the session closes, the next `echo` writes to a dead pipe → **SIGPIPE** → the watchdog dies silently.
-- *Fix:* the boot-started watchdog inherits init's descriptors, so `watch()`'s fd1/fd2 are **`/dev/console`** (fd0 `/dev/null`) — never an SSH pipe. Manual restarts during testing are done detached to `/dev/console` (never left attached to an SSH pty).
+- *Fix:* the boot-started watchdog inherits init's descriptors, so `watch()`'s fd1/fd2 are **`/dev/console`** (fd0 `/dev/null`) - never an SSH pipe. Manual restarts during testing are done detached to `/dev/console` (never left attached to an SSH pty).
 - *Validation:* `ls -l /proc/<wpid>/fd/{1,2}` → `/dev/console` at first boot **and** after a controlled reboot (§13.3).
 
 **3. OOM protection** (36 MB box, no swap).
 - *Problem / why it mattered:* under memory pressure the kernel OOM killer picks the largest-RSS process; killing prudynt loses video, and killing dropbear loses the **remote-recovery path**. On this box that made the two most critical processes the *first* victims.
-- *Fix + ordering:* `prudynt oom_score_adj=-800` (`package/prudynt-t/files/S31prudynt`, re-applied on every start/restart, `start-stop-daemon` rc preserved) < `dropbear -500` < **watchdog subshell `-300`** (`WATCHDOG_OOM_ADJ`, set in `S32prudyntwd` `start()` on `PID=$!` — the backgrounded loop, not the parent init; `[ -w ]`-guarded, `start()` ends `return 0` so it can never fail service startup) < everything else `0`. Rationale: keep the video pipeline last to die, the SSH listener second-last, and the recovery watchdog third — each strictly less protected than the thing it guards.
+- *Fix + ordering:* `prudynt oom_score_adj=-800` (`package/prudynt-t/files/S31prudynt`, re-applied on every start/restart, `start-stop-daemon` rc preserved) < `dropbear -500` < **watchdog subshell `-300`** (`WATCHDOG_OOM_ADJ`, set in `S32prudyntwd` `start()` on `PID=$!` - the backgrounded loop, not the parent init; `[ -w ]`-guarded, `start()` ends `return 0` so it can never fail service startup) < everything else `0`. Rationale: keep the video pipeline last to die, the SSH listener second-last, and the recovery watchdog third - each strictly less protected than the thing it guards.
 - *`S51oomprotect`:* boot one-shot + manually re-runnable; reads `/run/dropbear.pid`, pins the dropbear **listener** to `-500` (session children inherit at fork). Best-effort, never blocks boot. The watchdog *also* re-asserts dropbear `-500` each loop (`b6776c415`) in case a mid-run dropbear restart resets it to 0.
-- *Why `S50dropbear` stays in the repo but the device shows `S30dropbear`:* `overlay/etc/init.d/S50dropbear` is thingino's **customized** dropbear init (port 22, no-blank-password login, display-default-creds) that intentionally overrides the buildroot package default; `scripts/rootfs_script.sh` then **renames `S50dropbear` → `S30dropbear`** at build finalize (to start dropbear earlier). So the file must be kept — removing it reverts dropbear to the buildroot default and loses the security customizations (`docs/overlayfs.md` documents this pattern). Ordering therefore holds: dropbear at order **30**, `S51oomprotect` at order **51** (shield applied after dropbear is up). *(The `S51oomprotect` header comment was corrected to reference `S30dropbear` in `5c1ff8336`. Earlier, the `S33oomprotect`→`S51oomprotect` rename + `chmod +x` in `2dfd2c2bd` fixed an inert shield — as `S33`, mode 100644 + ordered before dropbear, rcS skipped it and it no-op'd.)*
-- *Validation:* live — `-800`/`-500`/`-300` all correct at first boot **and** re-applied after a controlled reboot (§13.3).
+- *Why `S50dropbear` stays in the repo but the device shows `S30dropbear`:* `overlay/etc/init.d/S50dropbear` is thingino's **customized** dropbear init (port 22, no-blank-password login, display-default-creds) that intentionally overrides the buildroot package default; `scripts/rootfs_script.sh` then **renames `S50dropbear` → `S30dropbear`** at build finalize (to start dropbear earlier). So the file must be kept - removing it reverts dropbear to the buildroot default and loses the security customizations (`docs/overlayfs.md` documents this pattern). Ordering therefore holds: dropbear at order **30**, `S51oomprotect` at order **51** (shield applied after dropbear is up). *(The `S51oomprotect` header comment was corrected to reference `S30dropbear` in `5c1ff8336`. Earlier, the `S33oomprotect`→`S51oomprotect` rename + `chmod +x` in `2dfd2c2bd` fixed an inert shield - as `S33`, mode 100644 + ordered before dropbear, rcS skipped it and it no-op'd.)*
+- *Validation:* live - `-800`/`-500`/`-300` all correct at first boot **and** re-applied after a controlled reboot (§13.3).
 
 **4. `confirm_gone` / restart timing** (`S32prudyntwd`, `b03793670` + `1985c7d84`).
 - *Problem / why it mattered:* the watchdog's GONE-confirm was a single 5 s re-check. But an external `service restart prudynt` (day/night, MQTT, Web UI) holds prudynt genuinely down for `S31prudynt`'s `TERM_GRACE 2 + KILL_GRACE 2 + RECLAIM_WAIT 15 ≈ 19 s`. A 5 s window expired mid-restart, so the watchdog could **double-drive** its own restart on a perfectly normal event, thrashing the VPU and eroding the reboot backstop.
-- *Fix:* `confirm_gone()` now **bounded-polls** `prudynt_live` every `GONE_CONFIRM_DELAY=5 s` up to `GONE_CONFIRM_BUDGET=25 s`, returning "alive" the instant prudynt reappears and "gone" only after the full bounded window (never unbounded). 25 s > S31's ~19 s down-window. Complementarily (`b03793670`), when prudynt reappears during the confirm window the code treats it as a fresh incarnation: `arm_grace` + reset `DOWN_STREAK` (mirrors the new-incarnation handler), so the next slow cold-start interval isn't counted as a serving failure. Trade-off: a genuine crash's restart latency rises ~+20 s (bounded) — acceptable, since the watchdog is prudynt's only respawner.
+- *Fix:* `confirm_gone()` now **bounded-polls** `prudynt_live` every `GONE_CONFIRM_DELAY=5 s` up to `GONE_CONFIRM_BUDGET=25 s`, returning "alive" the instant prudynt reappears and "gone" only after the full bounded window (never unbounded). 25 s > S31's ~19 s down-window. Complementarily (`b03793670`), when prudynt reappears during the confirm window the code treats it as a fresh incarnation: `arm_grace` + reset `DOWN_STREAK` (mirrors the new-incarnation handler), so the next slow cold-start interval isn't counted as a serving failure. Trade-off: a genuine crash's restart latency rises ~+20 s (bounded) - acceptable, since the watchdog is prudynt's only respawner.
 - *Validation:* live controlled `prudynt` restart (down+up 17 s) **absorbed with 0 spurious watchdog restarts**; prudynt PID stable 90 s, RTSP recovered, `-800` re-applied (§13.3). Bench harness pre-flash: true-gone → bounded gone; quick/mid reappear → early alive; no infinite wait.
 
 **5. Web UI / LiveGain / first-load performance** (`main.js`, `json-daynight.cgi`, `agent.cgi`).
 - *Option B split (`bd2dde208`, BUILD-ONLY):* the heavy ~650 ms agent SSE no longer runs every 5 s. Fast-changing **gain/brightness** moved to a cheap dedicated `json-daynight.cgi` (single `prudyntctl` query, `timeout 2`, read-only, no writes) polled by a 5 s **LiveGain** channel; the full SSE heartbeat slowed to 15 s with 5 s keepalive slices.
 - *`json-daynight.cgi` install rule (`2dfd2c2bd`, Fix C):* the CGI had **no `$(INSTALL)` line** in `thingino-webui.mk` → it would have been missing from `/var/www/x` (LiveGain 404). Added. (`timeout 2` was `08a7eee2a`.)
 - *`agent.cgi` timeout (`79d0734bb`):* the **non-streaming** curl carries `--connect-timeout 2 --max-time 8` so a stalled agent can't hang the Web UI. The **SSE `exec curl -N` streaming path is intentionally left unbounded** (a `--max-time` would kill a healthy long-lived stream).
-- *First-load issue + fix (`f256057a9`, BUILD-ONLY):* CPU/RAM/storage/date-time are **single-sourced** from the 7 s HealthStatus channel (`json-status-health.cgi`), whereas gain is triple-sourced (fast 2 s + LiveGain 5 s + SSE). On a **cold** page load (uncached 107 KB `main.js` + assets consuming the browser's ~6 connections), `heartbeat()` opened the **persistent SSE first** and the ~0.7 s agent-backed slow-heartbeat second, so the cheap health fetch (dispatched 4th) queued behind them → the four badges lagged ~1.5 s+. On **refresh** (warm cache, free connections) they painted in ~0.15 s — hence "slow first load, fast refresh." **Fix:** reorder `heartbeat()` to start the cheap fetches (`startFastStatus`, `startHealthStatus`, `startLiveGainStatus`) **before** the SSE + slow-heartbeat, so the badges grab a connection first. Minimal: only the 5 startup calls reordered — no logic/guard/interval/endpoint change; `document.hidden` gating, `passwordCheckComplete` gating, single-in-flight guards, and SSE `onerror` reconnect all unchanged.
-- *Validation:* live authenticated CGI timing (session 0.09 s, fast 0.17 s, health 0.15 s, daynight 0.16 s, slow-heartbeat 0.70 s, SSE first-data +0–1 s); contended cold-load **model** time-to-health **1.66 s (old order) → 0.35 s (new order)**; warm/uncontended ~0.14 s either order. Deployed `main.js` md5 == committed `f256057a9` blob (reorder confirmed live). *Note:* the real browser first-paint improvement is verified after the next build; the reorder does not remove the inherent cold-asset download cost.
+- *First-load issue + fix (`f256057a9`, BUILD-ONLY):* CPU/RAM/storage/date-time are **single-sourced** from the 7 s HealthStatus channel (`json-status-health.cgi`), whereas gain is triple-sourced (fast 2 s + LiveGain 5 s + SSE). On a **cold** page load (uncached 107 KB `main.js` + assets consuming the browser's ~6 connections), `heartbeat()` opened the **persistent SSE first** and the ~0.7 s agent-backed slow-heartbeat second, so the cheap health fetch (dispatched 4th) queued behind them → the four badges lagged ~1.5 s+. On **refresh** (warm cache, free connections) they painted in ~0.15 s - hence "slow first load, fast refresh." **Fix:** reorder `heartbeat()` to start the cheap fetches (`startFastStatus`, `startHealthStatus`, `startLiveGainStatus`) **before** the SSE + slow-heartbeat, so the badges grab a connection first. Minimal: only the 5 startup calls reordered - no logic/guard/interval/endpoint change; `document.hidden` gating, `passwordCheckComplete` gating, single-in-flight guards, and SSE `onerror` reconnect all unchanged.
+- *Validation:* live authenticated CGI timing (session 0.09 s, fast 0.17 s, health 0.15 s, daynight 0.16 s, slow-heartbeat 0.70 s, SSE first-data +0-1 s); contended cold-load **model** time-to-health **1.66 s (old order) → 0.35 s (new order)**; warm/uncontended ~0.14 s either order. Deployed `main.js` md5 == committed `f256057a9` blob (reorder confirmed live). *Note:* the real browser first-paint improvement is verified after the next build; the reorder does not remove the inherent cold-asset download cost.
 
 **6. HA / MQTT timeout hardening** (`package/thingino-ha/files/*`, `bc42afe36`).
 - *Problem / why it mattered:* a broker/Wi-Fi outage could block a **synchronous** direct `mosquitto_pub` for minutes, stalling the `ha-daemon` loop (and any HA-triggered action) indefinitely.
 - *Fix:* all **9** direct publish sites (in `ha-common` helpers, sourced by `ha-state`/`ha-daemon`/`ha-discovery`) are wrapped with `timeout "${HA_PUB_TIMEOUT:-4}"`; on timeout the entity keeps its last value. `_ha_pub_confirm` is **not double-wrapped**. Deployed HA scripts are byte-identical to the committed blobs (md5 verified).
-- *Validation:* live — daemon up, broker `ESTABLISHED`, `ha-state force` completes in ~5 s (rc 0, no hang), **0 publish-storm / 0 reconnect-loop**; one benign startup `TIME_WAIT` → `ESTABLISHED` (§13.3).
+- *Validation:* live - daemon up, broker `ESTABLISHED`, `ha-state force` completes in ~5 s (rc 0, no hang), **0 publish-storm / 0 reconnect-loop**; one benign startup `TIME_WAIT` → `ESTABLISHED` (§13.3).
 
 **7. prudynt VPU stall recovery** (patch `0005`, `777c6427a`).
 - *Problem / why it mattered:* on a hard T23 VPU wedge, prudynt's in-process pipeline-rebuild loop could retry **forever**, leaving the daemon alive-but-frameless with no external recovery.
-- *Fix:* `0005` bounds in-process stall restarts — after **3** rebuilds that don't restore a frame it logs `... pipeline rebuilds did not restore frames; raising SIGTERM ...` and calls `kill(getpid(), SIGTERM)`, handing recovery to `S31prudynt`/`S32prudyntwd` (which do a proper VPU reclaim). The stall counter resets on a delivered frame and on subscriber-connect (bounds only true stalls, not idle).
-- *Why `kill(getpid(), SIGTERM)` and not `_exit`/`abort`:* `SIGTERM` runs prudynt's **normal signal handler / clean shutdown** (release IMP/VPU/encoder groups, RTSP teardown) so the kernel-held VPU is properly relinquished before S31's reclaim + relaunch. `_exit()` skips cleanup — risking a VPU still held by the dead PID, the exact wedge we're recovering from; `abort()` would SIGABRT/coredump (unclean, no graceful release). Mirrors the `0011` clean-exit idiom.
+- *Fix:* `0005` bounds in-process stall restarts - after **3** rebuilds that don't restore a frame it logs `... pipeline rebuilds did not restore frames; raising SIGTERM ...` and calls `kill(getpid(), SIGTERM)`, handing recovery to `S31prudynt`/`S32prudyntwd` (which do a proper VPU reclaim). The stall counter resets on a delivered frame and on subscriber-connect (bounds only true stalls, not idle).
+- *Why `kill(getpid(), SIGTERM)` and not `_exit`/`abort`:* `SIGTERM` runs prudynt's **normal signal handler / clean shutdown** (release IMP/VPU/encoder groups, RTSP teardown) so the kernel-held VPU is properly relinquished before S31's reclaim + relaunch. `_exit()` skips cleanup - risking a VPU still held by the dead PID, the exact wedge we're recovering from; `abort()` would SIGABRT/coredump (unclean, no graceful release). Mirrors the `0011` clean-exit idiom.
 - *Validation:* patch applies cleanly on `f4b3228 + 0001-0004` (`git apply --check`); the deployed binary contains the escalation string `raising SIGTERM for VPU reclaim` (grep on `/usr/bin/prudynt`); the SIGTERM→S31/S32 recovery path is exercised indirectly by the controlled-restart test (§13.3). The pathological "prudynt never recovers" path remains untested by design (see gap **A**).
 
 **8. Physical privacy** (`overlay/usr/sbin/physical-privacy`, `af35c0ad6`).
 - *Problem / why it mattered:* a motor/tilt **readback fault** could leave the lens parked (camera blind) with no software escape.
 - *Fix:* an **explicit, manual-only** `physical-privacy off --force` that lets `do_off` proceed even when the tilt can't be verified. `force=1` is set **only** by the `--force` flag (line 288); nothing sets it automatically.
 - *Unchanged:* the default `off` (no flag) stays **fail-closed** (refuses to open on an unreadable tilt); `do_guard` never force-opens; no automatic fail-open was added; no new persistent state.
-- *Validation:* argument-parse + guard inspection confirmed; current state `active:false` preserved across reboot. The **motor actuation path was deliberately not exercised** (no motor movement during validation) — a coverage note, not a defect (degraded branches are fail-safe).
+- *Validation:* argument-parse + guard inspection confirmed; current state `active:false` preserved across reboot. The **motor actuation path was deliberately not exercised** (no motor movement during validation) - a coverage note, not a defect (degraded branches are fail-safe).
 
 **9. Storage / flash / overlay behavior.**
 - *Overlay usage:* pre-flash the 224 KB jffs2 config overlay had been near-full (75 %, the flash-overlay-space wedge). After the fresh flash it sits at **50 %** (112 K used / 112 K free, 27 files); jffs2 GC reclaims lazily on reboot.
 - *Write discipline:* all persistent writes are **write-on-change / recovery-only**; runtime state lives on tmpfs (`/tmp`, `/run`). Status-channel Web-UI activity produced **zero** overlay writes (verified by md5-snapshot diff around a UI burst).
-- *Overlay cleanup was NOT performed* (operator has not approved it; jffs2 GC handles reclaim). Only `/etc/passwd` (390 B) is a redundant copy identical to `/rom` — negligible; cleanup not recommended.
-- *Recommendation:* avoid unnecessary flash writes — `main.js`/large assets ship via **build only** (never live-copied into the overlay); config saves go through `jct` (see write-path coverage gap **D**).
+- *Overlay cleanup was NOT performed* (operator has not approved it; jffs2 GC handles reclaim). Only `/etc/passwd` (390 B) is a redundant copy identical to `/rom` - negligible; cleanup not recommended.
+- *Recommendation:* avoid unnecessary flash writes - `main.js`/large assets ship via **build only** (never live-copied into the overlay); config saves go through `jct` (see write-path coverage gap **D**).
 
-### 13.3 Validation evidence — post-install on `f256057a9` (cam4, 2026-07-08)
-Method: direct SSH (read-only + serialized controlled tests) + an 11-agent adversarial review of the captured evidence and code paths. Only two live actions were taken — one `prudynt` service restart and one controlled reboot (both self-restoring); no config values were changed.
+### 13.3 Validation evidence - post-install on `f256057a9` (cam4, 2026-07-08)
+Method: direct SSH (read-only + serialized controlled tests) + an 11-agent adversarial review of the captured evidence and code paths. Only two live actions were taken - one `prudynt` service restart and one controlled reboot (both self-restoring); no config values were changed.
 
 - **Build identity:** `pt2-firmware+f256057` (matches tip `f256057a9`).
 - **Baseline:** Wi-Fi `192.168.1.137/24`, single boot banner, dmesg/logread clean, `0` watchdog restarts.
-- **RTSP / FPS:** OPTIONS `200`; stream0 & stream1 both 16–18 FPS.
+- **RTSP / FPS:** OPTIONS `200`; stream0 & stream1 both 16-18 FPS.
 - **OOM (first boot AND after controlled reboot):** prudynt `-800`, dropbear `-500`, watchdog `-300`; watchdog fd1/2 → `/dev/console`.
 - **Web UI:** deployed `main.js` md5 == committed `f256057a9` blob (reorder live); CGI timings as in §13.2 #5.
 - **CPU / memory:** prudynt ~29 % of one core quiescent (matches the ~25 % HW-encoder baseline); system ~40 % quiescent / ~50 % under an aggressive UI burst; **no leak** (prudynt RSS flat 8040 KB, sysmem steady over ~75 s).
 - **Concurrency:** 24/24 concurrent status-CGI requests → `200`, no hang/stale.
 - **HA / MQTT:** daemon up; broker `192.168.1.133:1883` `ESTABLISHED`; `ha-state force` rc 0 in 5 s (no hang); 0 storm / 0 reconnect-loop.
-- **Reliability — controlled `prudynt` restart:** down+up 17 s → **absorbed, 0 spurious watchdog restarts**; PID stable 90 s, RTSP 200 throughout, `-800` re-applied.
-- **Reliability — controlled reboot:** Wi-Fi/SSH/RTSP/uhttpd/HA all returned; all 3 OOM shields re-applied; state preserved (privacy `off`, daynight `day`); single boot, no reboot loop.
+- **Reliability - controlled `prudynt` restart:** down+up 17 s → **absorbed, 0 spurious watchdog restarts**; PID stable 90 s, RTSP 200 throughout, `-800` re-applied.
+- **Reliability - controlled reboot:** Wi-Fi/SSH/RTSP/uhttpd/HA all returned; all 3 OOM shields re-applied; state preserved (privacy `off`, daynight `day`); single boot, no reboot loop.
 - **Storage:** UI status activity → 0 overlay writes; overlay steady 50 % before/after all tests incl. reboot; test artifacts were `/tmp`-only (cleared by reboot).
-- **Benign false-positives characterized:** a transient `ps` "1 zombie" (targeted `/proc` scan = 0 persistent — a short-lived reaped child); two "wlan/wpa" log lines (a boot button-config load + normal dropbear session disconnects); a "1 error" log hit that is `loops_per_jiffy` matching `/oops/i`; and the HA startup `TIME_WAIT`→`ESTABLISHED`.
-- **Verdict:** **0 blockers, 0 confirmed majors** (both candidate majors downgraded on verification), **4 minors** (all non-blocking; §13.4 A–D).
+- **Benign false-positives characterized:** a transient `ps` "1 zombie" (targeted `/proc` scan = 0 persistent - a short-lived reaped child); two "wlan/wpa" log lines (a boot button-config load + normal dropbear session disconnects); a "1 error" log hit that is `loops_per_jiffy` matching `/oops/i`; and the HA startup `TIME_WAIT`→`ESTABLISHED`.
+- **Verdict:** **0 blockers, 0 confirmed majors** (both candidate majors downgraded on verification), **4 minors** (all non-blocking; §13.4 A-D).
 
 ### 13.4 Known gaps / deferred work
 The four minors from the final reliability review (all **build-only** fixes, none block normal use):
 
 **A. Cross-boot reboot circuit-breaker** *(the long-deferred item; most worthwhile).*
-- *Problem:* `RESTART_COUNT`/`RESTART_LIMIT=3` are process-local to the `watch()` subshell and reset to 0 every boot. A **deterministically un-startable** prudynt (a bringup-crash regression, a corrupt config on a full overlay that can't self-heal, a reboot-surviving VPU wedge) climbs to 3 restarts (~3 min), reboots, and repeats **indefinitely** — a ~3–4 min reboot loop with no video and no operator-visible "give up and stay reachable" state.
-- *Suggested direction:* a **persistent, self-decaying reboot counter** (small file, e.g. `/overlay/etc/wd_reboot_count`, or U-Boot env) + timestamp; if N reboots occur within a window (e.g. 3 in 30 min) **stop escalating to reboot** — keep slow-restarting prudynt but leave SSH/HA/uhttpd reachable for diagnosis; decay/reset after a sustained-healthy interval. For a life-safety unit, prefer "stuck alive + reachable" over "perpetual reboot loop."
-- *Note:* requires a **new persistent write** — design carefully (atomicity, overlay-space, no steady-state churn). This is why it was deferred.
+- *Problem:* `RESTART_COUNT`/`RESTART_LIMIT=3` are process-local to the `watch()` subshell and reset to 0 every boot. A **deterministically un-startable** prudynt (a bringup-crash regression, a corrupt config on a full overlay that can't self-heal, a reboot-surviving VPU wedge) climbs to 3 restarts (~3 min), reboots, and repeats **indefinitely** - a ~3-4 min reboot loop with no video and no operator-visible "give up and stay reachable" state.
+- *Suggested direction:* a **persistent, self-decaying reboot counter** (small file, e.g. `/overlay/etc/wd_reboot_count`, or U-Boot env) + timestamp; if N reboots occur within a window (e.g. 3 in 30 min) **stop escalating to reboot** - keep slow-restarting prudynt but leave SSH/HA/uhttpd reachable for diagnosis; decay/reset after a sustained-healthy interval. For a life-safety unit, prefer "stuck alive + reachable" over "perpetual reboot loop."
+- *Note:* requires a **new persistent write** - design carefully (atomicity, overlay-space, no steady-state churn). This is why it was deferred.
 
 **B. Warm-restart grace duration.**
-- *Problem:* `do_restart` re-arms the full **200 s cold-boot** `GRACE` after every *warm* restart. An alive-but-streamless prudynt (fps==0 after a restart) then takes ~10–14 min (≈3× the 200 s grace) before the reboot backstop clears it.
-- *Suggested direction:* keep `GRACE=200` as the cold-boot seed, but arm a shorter `RESTART_GRACE` (~90–120 s) on warm restarts (the VPU/ISP were just reclaimed and bring up faster). Measure warm-restart bringup on-device before pinning the value.
+- *Problem:* `do_restart` re-arms the full **200 s cold-boot** `GRACE` after every *warm* restart. An alive-but-streamless prudynt (fps==0 after a restart) then takes ~10-14 min (≈3× the 200 s grace) before the reboot backstop clears it.
+- *Suggested direction:* keep `GRACE=200` as the cold-boot seed, but arm a shorter `RESTART_GRACE` (~90-120 s) on warm restarts (the VPU/ISP were just reclaimed and bring up faster). Measure warm-restart bringup on-device before pinning the value.
 
 **C. `S31prudynt` concurrency lock.**
 - *Problem:* `service restart prudynt` execs `S31prudynt restart` with **no lock**. Two concurrent external callers (e.g. two Web-UI actions / `preview.cgi` uploads) can interleave: the second SIGTERMs the first's freshly-launched prudynt → doubled downtime + 2× VPU teardown churn. (The watchdog's own path is already defended by the `confirm_gone` bounded poll.)
@@ -1323,48 +1323,48 @@ The four minors from the final reliability review (all **build-only** fixes, non
 
 **D. Write-path validation gap** *(coverage, not a confirmed defect).*
 - *Problem:* the "UI activity produced no persistent writes" evidence covers only the **read-only status channels**. The ~17 **writer** CGIs (e.g. `json-prudynt-save.cgi`, which does a full-file `jct import` rewrite of `/etc/prudynt.json`) were **not** exercised, so their overlay-write cost/atomicity is unverified on this build.
-- *Suggested direction:* re-run overlay write-monitoring while performing representative **safe** config saves (photosensing/RTSP/network/motion), snapshotting overlay used/free + file count before/after and confirming atomicity; then restore original values. Context: overlay-exhaustion is a *pre-existing* constraint (separately audited 07-03 as "won't fill under normal use"), and the C1 config-heal in `S31prudynt` covers a torn config at the next restart — so this is a verification gap, not a known break.
+- *Suggested direction:* re-run overlay write-monitoring while performing representative **safe** config saves (photosensing/RTSP/network/motion), snapshotting overlay used/free + file count before/after and confirming atomicity; then restore original values. Context: overlay-exhaustion is a *pre-existing* constraint (separately audited 07-03 as "won't fill under normal use"), and the C1 config-heal in `S31prudynt` covers a torn config at the next restart - so this is a verification gap, not a known break.
 
-**Refuted during review (investigated, not real defects):** the physical-privacy motor path (no code defect; degraded branches fail-safe; the `--force`-manual-only invariant *was* verified — live actuation is a coverage note only); the `confirm_gone` 25 s margin vs a corrupt-config heal (`jct` returns immediately on a corrupt file, real down-window ~16–18 s < 25 s — only a doc nit: the `S32prudyntwd:283` comment "~19 s" omits validate+migrate); and an alleged `ha-daemon` `/tmp` temp leak (every temp is `rm`'d unconditionally).
+**Refuted during review (investigated, not real defects):** the physical-privacy motor path (no code defect; degraded branches fail-safe; the `--force`-manual-only invariant *was* verified - live actuation is a coverage note only); the `confirm_gone` 25 s margin vs a corrupt-config heal (`jct` returns immediately on a corrupt file, real down-window ~16-18 s < 25 s - only a doc nit: the `S32prudyntwd:283` comment "~19 s" omits validate+migrate); and an alleged `ha-daemon` `/tmp` temp leak (every temp is `rm`'d unconditionally).
 
 **Other deferred items (agreed, pre-existing):**
-- **RTSP `max_clients` cap** — bound concurrent RTSP clients (DoS / resource hygiene).
-- **Watchdog cross-boot breaker** — same item as **A**.
-- **Watchdog restart over-counting** — `do_restart` counts *legitimate* external restarts toward the reboot ladder; largely mitigated by the `confirm_gone` bounded poll + grace-reset (fix #4), but a dedicated "don't count an operator-initiated restart" refinement is still open.
-- **Wi-Fi power-save / `bgscan` review** — verify power-save / background-scan settings don't cause latency or drops on the ATBM6012BX.
-- **DHCP-renew stale address** — confirm address flush / re-acquire behavior on lease renewal.
-- **`S00blink`** — cosmetic boot-LED init (dead / no-op code); tidy or remove.
-- **Web UI session expiry / cleanup** — confirm session-store expiry + cleanup (no unbounded session accumulation).
-- **`2c vm.min_free_kbytes`** — a delicate reclaim knob on 36 MB no-swap; deferred because the real OOM safety (victim ordering, fix #3) is already in place.
+- **RTSP `max_clients` cap** - bound concurrent RTSP clients (DoS / resource hygiene).
+- **Watchdog cross-boot breaker** - same item as **A**.
+- **Watchdog restart over-counting** - `do_restart` counts *legitimate* external restarts toward the reboot ladder; largely mitigated by the `confirm_gone` bounded poll + grace-reset (fix #4), but a dedicated "don't count an operator-initiated restart" refinement is still open.
+- **Wi-Fi power-save / `bgscan` review** - verify power-save / background-scan settings don't cause latency or drops on the ATBM6012BX.
+- **DHCP-renew stale address** - confirm address flush / re-acquire behavior on lease renewal.
+- **`S00blink`** - cosmetic boot-LED init (dead / no-op code); tidy or remove.
+- **Web UI session expiry / cleanup** - confirm session-store expiry + cleanup (no unbounded session accumulation).
+- **`2c vm.min_free_kbytes`** - a delicate reclaim knob on 36 MB no-swap; deferred because the real OOM safety (victim ordering, fix #3) is already in place.
 
 ### 13.5 Post-flash checklist
 After flashing and cold boot:
-1. **SSH** reachable (`ssh root@<cam>`) — the whole recovery guarantee hinges on it.
+1. **SSH** reachable (`ssh root@<cam>`) - the whole recovery guarantee hinges on it.
 2. **OOM:** `cat /proc/$(pidof prudynt)/oom_score_adj` = `-800`; `cat /proc/$(cat /run/dropbear.pid)/oom_score_adj` = `-500`; `cat /proc/$(cat /run/rtsp_watchdog.pid)/oom_score_adj` = `-300`.
 3. **Init:** `/etc/init.d/` shows `S30dropbear`, `S31prudynt`, `S32prudyntwd`, and **`S51oomprotect`** (executable, order 51 > 30). *(Verify `S51oomprotect`, not the old `S33oomprotect`.)*
 4. **Watchdog:** running with the frame probe; fd1/2 → `/dev/console` (not an SSH pty); `S32prudyntwd` carries `GONE_CONFIRM_DELAY=5` + `GONE_CONFIRM_BUDGET=25` + `WATCHDOG_OOM_ADJ="-300"`.
 5. **RTSP:** OPTIONS `200`; both streams non-zero FPS.
 6. **Web UI:** `/var/www/x/json-daynight.cgi` present (not 404) with `timeout 2`; `main.js` `heartbeat()` order = fast, health, LiveGain, SSE, slow.
-7. **prudynt patches `0001`–`0017`** applied (build gate `.applied_patches_list`); binary contains `raising SIGTERM for VPU reclaim`.
+7. **prudynt patches `0001`-`0017`** applied (build gate `.applied_patches_list`); binary contains `raising SIGTERM for VPU reclaim`.
 8. **HA:** entities publish; broker connection `ESTABLISHED`; no publish hang.
 9. **Privacy:** default `off` fail-closed; `off --force` exists and is manual-only.
-10. **Soak:** short run — no crash-loop, no spurious watchdog restart, overlay not growing.
+10. **Soak:** short run - no crash-loop, no spurious watchdog restart, overlay not growing.
 
 ### 13.6 Build notes / branch-tip notes
 - **Build the branch TIP**, not an older per-step SHA: GitHub Actions `pt2-build-artifact` (workflow_dispatch → branch `pt2-firmware`) resolves to the tip. Current tip: **`f256057a9`**. (An older pin such as `af35c0ad6` omits the `2dfd2c2bd` packaging fixes and later hardening.)
 - **Commit lineage since the previously-flashed `1985c7d84`:** `5c1ff8336` (S51oomprotect dropbear comment `S30dropbear`, comment-only) → `f256057a9` (`heartbeat()` reorder, `main.js`, build-only). Both are documentation / frontend-only relative to the validated `1985c7d84` runtime.
-- **prudynt patches:** `package/all-patches/prudynt-t/0001-*..0017-*.patch`, auto-applied by buildroot (`BR2_GLOBAL_PATCH_DIR`) over the git-fetched source `themactep/prudynt-t@f4b3228`. **Never hand-edit the prudynt source** — regenerate patches. The CI patch-gate enumerates `0001-0017`.
-- **`main.js` is BUILD-ONLY:** 107 KB > the config-overlay free space, so a modified `main.js` **cannot** be live-copied into the overlay — it ships only via a firmware build baked into `/rom`. (CGI / rootfs-script changes are small and *can* live-deploy, but for `f256057a9` everything is baked.)
-- **Line endings:** the repo is Windows `core.autocrlf=true`; working copies are CRLF but committed **blobs are LF** (`git ls-files --eol` → `i/lf`), which is what the Linux build needs. Overlay shell scripts **must** be LF (a CRLF shebang = "bad interpreter"). Verify blob EOL with `git ls-files --eol` or `git cat-file blob <oid> | tr -cd CR | wc -c` (want 0) — not `git show | grep` (unreliable under autocrlf).
+- **prudynt patches:** `package/all-patches/prudynt-t/0001-*..0017-*.patch`, auto-applied by buildroot (`BR2_GLOBAL_PATCH_DIR`) over the git-fetched source `themactep/prudynt-t@f4b3228`. **Never hand-edit the prudynt source** - regenerate patches. The CI patch-gate enumerates `0001-0017`.
+- **`main.js` is BUILD-ONLY:** 107 KB > the config-overlay free space, so a modified `main.js` **cannot** be live-copied into the overlay - it ships only via a firmware build baked into `/rom`. (CGI / rootfs-script changes are small and *can* live-deploy, but for `f256057a9` everything is baked.)
+- **Line endings:** the repo is Windows `core.autocrlf=true`; working copies are CRLF but committed **blobs are LF** (`git ls-files --eol` → `i/lf`), which is what the Linux build needs. Overlay shell scripts **must** be LF (a CRLF shebang = "bad interpreter"). Verify blob EOL with `git ls-files --eol` or `git cat-file blob <oid> | tr -cd CR | wc -c` (want 0) - not `git show | grep` (unreliable under autocrlf).
 
 ---
 
-## 14. Kernel D-state wedge — incident, investigation, and fixes R1/R2/R3 (2026-09)
+## 14. Kernel D-state wedge - incident, investigation, and fixes R1/R2/R3 (2026-09)
 
 Investigated on **cam5** (`cam5-ing-sonoff-pt2-e214`, `192.168.1.139`, running build `pt2-firmware+f256057`). All investigation was read-only or reversible/RAM-only (SysRq dumps, raw MTD reads, `/proc` inspection); nothing was written to flash and no process was killed. Commit hashes: **R1 `e24ecd88f`**, **R2 `cf3034e0c`**, **R3 `2d795da45`**.
 
 ### 14.1 Observed failure & symptoms
-- Day/night switching from the Web UI (or HA) stopped taking effect: after a Night→Day switch the camera stayed in night (IR-cut not restored), while HA/MQTT still reported `daynight=day`, `ircut=ON` — a **logical-vs-physical desync**.
+- Day/night switching from the Web UI (or HA) stopped taking effect: after a Night→Day switch the camera stayed in night (IR-cut not restored), while HA/MQTT still reported `daynight=day`, `ircut=ON` - a **logical-vs-physical desync**.
 - Both mains-powered, always-streaming cameras (cam4 + cam5) were found wedged together; on-demand/battery cameras were unaffected.
 - The **video stream kept running** throughout; the fault was confined to the day/night + config-report path, load climbed over time, and it cleared **only on reboot**.
 
@@ -1381,52 +1381,55 @@ Investigated on **cam5** (`cam5-ing-sonoff-pt2-e214`, `192.168.1.139`, running b
 - Fresh `jct get`, `cat /etc/prudynt.json`, `ls` all succeed instantly → the resource is free; the task simply never woke.
 - go2rtc logs: cam4 (137) + cam5 (139) producers aborted within **20 ms** of each other → the "both at once" is a shared-cause event.
 - `uname` `3.10.14__isvp_pike_1.0__ #2 PREEMPT`; full `dmesg` since boot shows **no** oops/BUG/hung-task/jffs2/mtd error before the SysRq dump (only WiFi `AP lost`) → the wedge is silent.
-- Kernel config: `CONFIG_KALLSYMS`, `DEBUG_INFO`, `FRAME_POINTER`, `STACKTRACE`, `DETECT_HUNG_TASK` all **off**; `MAGIC_SYSRQ=y`; `LOCKUP_DETECTOR=y`+`BOOTPARAM_SOFTLOCKUP_PANIC=y` (soft-lockup only — does **not** catch a `D`-state sleep). No `/proc/kallsyms`, no `/proc/<pid>/stack`, **no RTC, no u-boot `bootcount`**.
+- Kernel config: `CONFIG_KALLSYMS`, `DEBUG_INFO`, `FRAME_POINTER`, `STACKTRACE`, `DETECT_HUNG_TASK` all **off**; `MAGIC_SYSRQ=y`; `LOCKUP_DETECTOR=y`+`BOOTPARAM_SOFTLOCKUP_PANIC=y` (soft-lockup only - does **not** catch a `D`-state sleep). No `/proc/kallsyms`, no `/proc/<pid>/stack`, **no RTC, no u-boot `bootcount`**.
 
-### 14.4 Root cause — proven vs inferred
+### 14.4 Root cause - proven vs inferred
 **Proven (evidence-backed, symbol-independent):**
 - A task is stuck in `D` **holding `mmap_sem`** (cmdline/maps hang; stat/status don't).
 - **Not** hardware (raw flash reads OK), **not** GC/writeback (Dirty=0, threads idle), **not** an ongoing lock or memory exhaustion (fresh identical ops succeed).
-- The cascade is real: reading the stuck task's `/proc/cmdline` hangs — exactly what `pidof` does — so the `pidof`-based `singleton` wedges. (This alone justifies R1, independent of the exact kernel bug.)
+- The cascade is real: reading the stuck task's `/proc/cmdline` hangs - exactly what `pidof` does - so the `pidof`-based `singleton` wedges. (This alone justifies R1, independent of the exact kernel bug.)
 - Recovery is **reboot-only** (D-state unkillable; the reboot confirmably cleared it).
 
 **Inferred (strongly implied, not symbolized):**
 - The exact kernel function/line, and that it is specifically a **lost-wakeup** in a process-startup mm path on the old Ingenic 3.10 vendor kernel. The signature (resource free + still stuck + holds `mmap_sem` write + wedged at fork/exec before opening any file) points to a lost wakeup, but *naming the site needs symbols* (R5/R6). Raw SysRq backtrace addresses were captured for later resolution.
 
 ### 14.5 Why MQTT reboot failed but Web reboot worked
-`cameras/<id>/reboot/set` is handled by **`ha-commands`**, part of the same HA subsystem that forks `jct` heavily and was caught in the cascade — so the command reached the broker but cam5 never acted on it. The **Web UI** reboot runs under **uhttpd**, an independent process *outside* the wedged chain, so its CGI called `reboot` and succeeded. This is consistent with the root cause and directly motivates R3's subsystem-independent recovery.
+`cameras/<id>/reboot/set` is handled by **`ha-commands`**, part of the same HA subsystem that forks `jct` heavily and was caught in the cascade - so the command reached the broker but cam5 never acted on it. The **Web UI** reboot runs under **uhttpd**, an independent process *outside* the wedged chain, so its CGI called `reboot` and succeeded. This is consistent with the root cause and directly motivates R3's subsystem-independent recovery.
 
-### 14.6 R1 — flock singleton *(the resilience fix)* — `e24ecd88f`
+### 14.6 R1 - flock singleton *(the resilience fix)* - `e24ecd88f`
 - **File:** `package/prudynt-t/files/prudynt-helpers`, `singleton()`.
-- **Was:** `pids=$(pidof -o %PPID "$appname")` — `pidof` reads `/proc/<pid>/cmdline` of every process, so it blocks behind any task holding `mmap_sem`, wedging the guard and every caller (`daynight` ×4 variants, `formatsd`). **This is the exact failure mode above.**
-- **Now:** a non-blocking advisory `flock` on a tmpfs lock file (`exec 9>/run/lock/singleton.<name>; flock -n 9`). Touches **no `/proc`**; the kernel releases the lock on process exit (incl. SIGKILL/crash) — no stale lock, no reclaim, no trap; cheaper than the `/proc`-wide scan; **no flash write** (tmpfs).
+- **Was:** `pids=$(pidof -o %PPID "$appname")` - `pidof` reads `/proc/<pid>/cmdline` of every process, so it blocks behind any task holding `mmap_sem`, wedging the guard and every caller (`daynight` ×4 variants, `formatsd`). **This is the exact failure mode above.**
+- **Now:** a non-blocking advisory `flock` on a tmpfs lock file (`exec 9>/run/lock/singleton.<name>; flock -n 9`). Touches **no `/proc`**; the kernel releases the lock on process exit (incl. SIGKILL/crash) - no stale lock, no reclaim, no trap; cheaper than the `/proc`-wide scan; **no flash write** (tmpfs).
 - **Why safer:** the guard can no longer wedge behind an unrelated stuck task. Verified `flock -n` works on this busybox; all current callers are short-lived with synchronous children (audited), so the lock releases promptly; fd-9 inheritance by a *future* long-lived child is documented (`9>&-` convention), since ash cannot mark a shell fd close-on-exec.
 
-### 14.7 R2 — jct fork reduction *(exposure reduction, not the fix)* — `cf3034e0c`
+### 14.7 R2 - jct fork reduction *(exposure reduction, not the fix)* - `cf3034e0c`
 - **File:** `package/thingino-ha/files/ha-common`, `ha_entity_enabled()`.
-- **Was:** one `jct` fork per entity — `ha-state` ~12 `jct`/poll, `ha-discovery` ~20/run.
+- **Was:** one `jct` fork per entity - `ha-state` ~12 `jct`/poll, `ha-discovery` ~20/run.
 - **Now:** read the `ha` object **once** and parse the boolean `enable_*` flags in-shell (line-anchored `sed`), with a per-key fallback to the exact old `jct` read for anything not captured. Measured on cam5: **12 → 1 `jct`** for the 12 `ha-state` checks, with **identical** enabled/disabled results (0 mismatches across all 20 entities).
 - **Behaviour / staleness:** the cache is a per-process shell variable (no file, no persistence, reset on every `ha-common` source) → **no cross-invocation staleness**; `ha-daemon` reads `live_view` once at startup (unchanged); the only difference is a consistent intra-run snapshot bounded to a single poll (adversarially reviewed; benign). MQTT/password parsing was **deliberately left** on per-key `jct` (shell-parsing a password is unsafe).
-- **Role:** lowers the *probability* of hitting the kernel lost-wakeup (the `jct` that wedged was an `ha-state` `jct`); it does **not** remove the failure mode — **R1 does.**
+- **Role:** lowers the *probability* of hitting the kernel lost-wakeup (the `jct` that wedged was an `ha-state` `jct`); it does **not** remove the failure mode - **R1 does.**
 
-### 14.8 R3 — wedge-detector *(independent recovery)* — `2d795da45`
-- **Files:** `overlay/usr/sbin/wedge-detector` + `overlay/etc/init.d/S99wedge-detector` (board-scoped, executable, `sysinit`-independent — started by `rcS`'s `S*` loop).
-- **Detection:** every 15 s, count `D`-state tasks from `/proc/<pid>/stat` in **pure shell** (glob + one `read` per pid — **no fork/exec per pid, no `pidof`/`jct`/MQTT/`cmdline`**). State parsed as the field after the last `") "` (robust to comm spaces/parens); vanished/malformed entries are skipped (can only *lower* the count → never a false positive).
-- **Thresholds (v1, measured):** baseline `D=1` (always `isp_fw_process`), load ~3.3–3.5; the observed wedge reached `D~8`, load 6.8–10.8. Trigger = **`D≥5` (primary) AND `load1≥6` (supporting, never alone)** for **8 consecutive checks (=120 s)**, after a **600 s post-boot grace**, **skipped while `/tmp/webupgrade` exists**.
-- **Recovery:** on full confirmation, `echo b > /proc/sysrq-trigger` — an **immediate emergency reboot** (SysRq-b; **no sync/unmount**), reachable only through the complete sequence (any single normal check or parse error resets the streak to 0).
-- **Watchdog relationship:** it **never touches `/dev/watchdog`**. The busybox HW watchdog (`K99watchdog`) is unchanged and remains the independent **total-hang** safety net. (A shell servicer can't set the HW timeout via `WDIOC_SETTIMEOUT`, and the jz-wdt default isn't safely knowable — hence SysRq-b, not un-feeding the timer.)
-- **Limitations:** loop protection is the **600 s grace + 120 s confirmation only — NOT a hard cross-reboot counter**, because no flash-free persistent boot counter exists on this hardware (no RTC, no u-boot bootcount) and a flash write for it is intentionally excluded (cf. §13.4-A). A pathological loop is bounded to ≥~10 min streaming uptime/cycle, not prevented. Being RAM-only, the `/dev/kmsg` reason line is lost across the reboot.
+### 14.8 R3 - wedge-detector *(independent recovery)* - `2d795da45`
+- **Files:** `overlay/usr/sbin/wedge-detector` + `overlay/etc/init.d/S99wedge-detector` (board-scoped, executable, `sysinit`-independent - started by `rcS`'s `S*` loop).
+- **Detection:** every 15 s, count `D`-state tasks from `/proc/<pid>/stat` in **pure shell** (glob + one `read` per pid - **no fork/exec per pid, no `pidof`/`jct`/MQTT/`cmdline`**). State parsed as the field after the last `") "` (robust to comm spaces/parens); vanished/malformed entries are skipped (can only *lower* the count → never a false positive).
+- **Thresholds (v1, measured):** baseline `D=1` (always `isp_fw_process`), load ~3.3-3.5; the observed wedge reached `D~8`, load 6.8-10.8. Trigger = **`D≥5` (primary) AND `load1≥6` (supporting, never alone)** for **8 consecutive checks (=120 s)**, after a **600 s post-boot grace**, **skipped while `/tmp/webupgrade` exists**.
+- **Recovery:** on full confirmation, `echo b > /proc/sysrq-trigger` - an **immediate emergency reboot** (SysRq-b; **no sync/unmount**), reachable only through the complete sequence (any single normal check or parse error resets the streak to 0).
+- **Watchdog relationship:** it **never touches `/dev/watchdog`**. The busybox HW watchdog (`K99watchdog`) is unchanged and remains the independent **total-hang** safety net. (A shell servicer can't set the HW timeout via `WDIOC_SETTIMEOUT`, and the jz-wdt default isn't safely knowable - hence SysRq-b, not un-feeding the timer.)
+- **Limitations:** loop protection is the **600 s grace + 120 s confirmation only - NOT a hard cross-reboot counter**, because no flash-free persistent boot counter exists on this hardware (no RTC, no u-boot bootcount) and a flash write for it is intentionally excluded (cf. §13.4-A). A pathological loop is bounded to ≥~10 min streaming uptime/cycle, not prevented. Being RAM-only, the `/dev/kmsg` reason line is lost across the reboot.
 
 ### 14.9 Measured impact + RAM-only confirmation
 - **R3 scan cost:** ~94 ms CPU (user+sys) per scan on cam5 (67 procs) once per 15 s = **~0.6 % of one core** (prudynt alone ≈25 %); ~183 ms wall on the load-3.3 unit.
 - **R1:** *lower* CPU than before (`flock`+`mkdir` vs a `/proc`-wide `pidof` scan).
 - **R2:** *lower* fork/`jct` activity (12→1 `jct`/poll).
-- **Flash:** all three are **RAM-only** — R1 writes only tmpfs `/run/lock`; R2 writes nothing (a shell variable); R3 writes only `/dev/kmsg`, `/proc/sys/kernel/sysrq`, `/proc/sysrq-trigger`. **No new persistent runtime flash writes.**
+- **Flash:** all three are **RAM-only** - R1 writes only tmpfs `/run/lock`; R2 writes nothing (a shell variable); R3 writes only `/dev/kmsg`, `/proc/sys/kernel/sysrq`, `/proc/sysrq-trigger`. **No new persistent runtime flash writes.**
 
-### 14.10 Confirmed vs hypothesis vs follow-up
+### 14.10 Confirmed vs hypothesis
 - **Confirmed:** the cascade (pidof/cmdline → `mmap_sem` → wedge); not-hardware / not-GC / not-memory; reboot-only recovery; the 12→1 `jct` measurement; the R3 baseline/thresholds and ~0.6 %/core cost; `flock -n` semantics; HW-watchdog behaviour; no flash-free boot counter on this hardware.
 - **Hypothesis (needs symbols):** the exact kernel lost-wakeup site.
-- **Follow-up (deferred — fleet-wide/kernel, a separate project):**
-  - **R4** — `CONFIG_DETECT_HUNG_TASK=y` + a generous `hung_task_timeout` + hung-task **panic** (leveraging the existing `panic=10`): kernel-native bounded auto-recovery for *any* future hung task. **Fleet-wide** (~40 T23N boards share `board/ingenic/xburst1/kernel/3.10.14/t23.generic.config`) and rebuild-only; the panic timeout must be tuned against legitimate long `D` waits (OTA flash-erase). Note: existing `SOFTLOCKUP_PANIC` does not cover this class.
-  - **R5** — `CONFIG_KALLSYMS`(+`_ALL`) + `CONFIG_DEBUG_INFO` + `CONFIG_FRAME_POINTER`: makes the *next* wedge produce a resolvable backtrace on-device (and enables R6). Modest size cost; fleet-wide/rebuild-only.
-  - **R6** — resolve the captured SysRq backtrace with the build's `System.map` (needs R5 or the build artifact), identify the wait-queue/mm site, and backport the relevant 3.10.x stable fix. High effort; **R4 is the pragmatic substitute** (bounded recovery) until then.
+
+### 14.11 NOT IMPLEMENTED - optional future kernel / fleet-wide hardening (R4 / R5 / R6)
+> None of the items below is implemented. They are recorded only as *possible future work*, to be pursued as a **separate project only if we decide to**. They are a different class from R1/R2/R3: all are kernel-config / kernel changes that are **fleet-wide** (they would modify `board/ingenic/xburst1/kernel/3.10.14/t23.generic.config`, shared by ~40 T23N boards) and **rebuild-only** - not board-scoped or testable without flashing. R1 already removes the observed failure mode and R3 gives bounded recovery, so none of these is required; they are purely optional hardening / diagnostics.
+
+- **R4 (not implemented)** - `CONFIG_DETECT_HUNG_TASK=y` + a generous `hung_task_timeout` + hung-task **panic** (leveraging the existing `panic=10`): kernel-native bounded auto-recovery for *any* future hung task. The panic timeout would need tuning against legitimate long `D` waits (OTA flash-erase). Note: the existing `SOFTLOCKUP_PANIC` does not cover this class.
+- **R5 (not implemented)** - `CONFIG_KALLSYMS`(+`_ALL`) + `CONFIG_DEBUG_INFO` + `CONFIG_FRAME_POINTER`: would make the *next* wedge produce a resolvable backtrace on-device (and enable R6). Modest size cost. Lowest-risk of the three (diagnostics only, no behaviour change) - the sensible first step if pursued.
+- **R6 (not implemented)** - resolve the captured SysRq backtrace with the build's `System.map` (needs R5 or the build artifact), identify the wait-queue / mm site, and backport the relevant 3.10.x stable fix. Highest effort; **R4 is the pragmatic substitute** (bounded recovery) if R6 is not pursued.
