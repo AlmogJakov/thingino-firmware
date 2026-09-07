@@ -1,0 +1,211 @@
+diff --git a/src/AudioOutputWorker.cpp b/src/AudioOutputWorker.cpp
+index ecdfb48..5eb827e 100644
+--- a/src/AudioOutputWorker.cpp
++++ b/src/AudioOutputWorker.cpp
+@@ -13,6 +13,11 @@ void *AudioOutputWorker::thread_entry(void *arg) {
+   StartHelper *sh = static_cast<StartHelper *>(arg);
+   AudioOutputWorker worker;
+   worker.run(sh);
++  // 0020: signal clean exit so the supervisor's bounded stop-join reaps this
++  // thread; a wedged AO thread never reaches here, so the bounded wait times out
++  // and detaches instead of hanging the single restart thread.
++  if (global_audio_output)
++    global_audio_output->thread_exited.store(true, std::memory_order_release);
+   return nullptr;
+ }
+ 
+diff --git a/src/BackchannelWorker.cpp b/src/BackchannelWorker.cpp
+index 7135618..e39cb69 100644
+--- a/src/BackchannelWorker.cpp
++++ b/src/BackchannelWorker.cpp
+@@ -240,6 +240,10 @@ void *BackchannelWorker::thread_entry(void *arg) {
+ 
+     BackchannelWorker processor;
+     processor.run();
++    // 0020: signal clean exit for the supervisor's bounded stop-join; a wedged
++    // backchannel thread never reaches here, so the bounded wait detaches instead
++    // of hanging the restart loop.
++    global_backchannel->thread_exited.store(true, std::memory_order_release);
+ 
+ #if defined(PLATFORM_T23)
+     if (global_shutdown_requested.load(std::memory_order_relaxed)) {
+diff --git a/src/globals.hpp b/src/globals.hpp
+index 0782b0f..08b2a80 100644
+--- a/src/globals.hpp
++++ b/src/globals.hpp
+@@ -16,6 +16,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <chrono>
+ #include <condition_variable>
+ #include <cstdint>
+ #include <deque>
+@@ -56,6 +57,18 @@ public:
+     count = 0;
+   }
+ 
++  // 0020: bounded acquire. Returns false on timeout (count left at 0) instead of
++  // blocking forever, so a supervisor wait on an AO start handshake can never
++  // hang the single restart thread if the worker's IMP init stalls.
++  bool try_acquire_for(int ms) {
++    std::unique_lock<std::mutex> lock(m);
++    if (!cv.wait_for(lock, std::chrono::milliseconds(ms),
++                     [&] { return count > 0; }))
++      return false;
++    count = 0;
++    return true;
++  }
++
+ private:
+   std::mutex m;
+   std::condition_variable cv;
+@@ -312,6 +325,14 @@ struct backchannel_stream {
+   std::mutex mutex;
+   std::condition_variable should_grab_frames;
+   std::atomic<unsigned int> is_sending{0};
++  // 0020 bounded-join / wedge isolation (mirrors 0018 audio_stream). thread_exited
++  // is set by BackchannelWorker::thread_entry when run() returns; the supervisor
++  // bounded-waits on it at stop so a wedged decode/IMP_AO thread cannot freeze the
++  // restart loop. wedged latches when that bounded wait times out and the thread
++  // is detached; it gates this worker's OWN (re)start/stop (NOT the mic wedge), so
++  // a mic-capture wedge never disables backchannel recovery.
++  std::atomic<bool> thread_exited{false};
++  std::atomic<bool> wedged{false};
+ 
+   backchannel_stream()
+       : inputQueue(std::make_shared<MsgChannel<BackchannelFrame>>(
+@@ -333,6 +354,13 @@ struct audio_output_stream {
+   /// the configured output_sample_rate on platforms where the CODEC clock
+   /// is shared between AI and AO (T10/T20/T21).
+   std::atomic<int> hardwareSampleRate{0};
++  // 0020 bounded-join / wedge isolation (mirrors 0018 audio_stream). thread_exited
++  // set by AudioOutputWorker::thread_entry when run() returns; supervisor bounded-
++  // waits on it at stop so a wedged IMP_AO thread cannot freeze the restart loop.
++  // wedged latches on a bounded-join timeout+detach and gates this worker's OWN
++  // (re)start/stop, NOT the mic wedge, so a mic wedge never disables AO recovery.
++  std::atomic<bool> thread_exited{false};
++  std::atomic<bool> wedged{false};
+ 
+   audio_output_stream()
+       : jobQueue(std::make_shared<MsgChannel<AudioPlaybackJob>>(
+diff --git a/src/main.cpp b/src/main.cpp
+index a54da15..e5902b3 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -687,21 +687,37 @@ int main(int argc, const char *argv[]) {
+       sh.has_started.acquire();
+     }
+ 
++    // 0020: AO start is gated on the AO worker's OWN wedged latch, NOT the mic
++    // (global_audio[0]->wedged). A mic-capture wedge must not disable speaker
++    // recovery: AO init touches only IMP_AO_* (a different device than the wedged
++    // /dev/dsp capture handle), so it is safe to (re)start after a mic wedge.
+     if (cfg->audio.output_enabled && (global_restart_audio || startup) &&
+-        !global_audio[0]->wedged.load(std::memory_order_acquire)) {
++        !global_audio_output->wedged.load(std::memory_order_acquire)) {
+       StartHelper ao_sh{0};
++      // arm the bounded stop-join handshake for THIS worker before creating it
++      global_audio_output->thread_exited.store(false, std::memory_order_release);
+       int ret = pthread_create(&audio_output_thread, nullptr,
+                                AudioOutputWorker::thread_entry,
+                                static_cast<void *>(&ao_sh));
+       LOG_DEBUG_OR_ERROR(ret, "create audio output thread");
+-      // Wait for AO hardware init to complete before starting video.
+-      // The IMP SDK shares internal state between AO and encoder
+-      // subsystems; concurrent init causes memory corruption.
+-      ao_sh.has_started.acquire();
++      // Wait (BOUNDED) for AO hardware init before starting video. The IMP SDK
++      // shares internal state between AO and encoder subsystems; concurrent init
++      // causes memory corruption. 0020: bounded (try_acquire_for) so a stalled AO
++      // init can never freeze the single supervisor thread now that this start is
++      // reachable in the mic-wedged state; on timeout proceed (AO degraded).
++      if (!ao_sh.has_started.try_acquire_for(2000))
++        LOG_ERROR("audio output init did not signal within 2000ms; proceeding "
++                  "(AO degraded until next restart)");
+     }
+ 
++    // 0020: backchannel start is gated on the backchannel worker's OWN wedged
++    // latch, NOT the mic (global_audio[0]->wedged). A mic-capture wedge must not
++    // disable talk/backchannel recovery: the backchannel path is decode + AO
++    // playback (IMP_ADEC/IMP_AO), independent of the wedged mic capture handle.
+     if (cfg->audio.output_enabled && (global_restart_audio || startup) &&
+-        !global_audio[0]->wedged.load(std::memory_order_acquire)) {
++        !global_backchannel->wedged.load(std::memory_order_acquire)) {
++      // arm the bounded stop-join handshake for THIS worker before creating it
++      global_backchannel->thread_exited.store(false, std::memory_order_release);
+       int ret = pthread_create(&backchannel_thread, nullptr,
+                                BackchannelWorker::thread_entry, NULL);
+       LOG_DEBUG_OR_ERROR(ret, "create backchannel thread");
+@@ -838,20 +854,64 @@ int main(int argc, const char *argv[]) {
+       }
+     }
+ 
++    // stop audio output (0020: BOUNDED join, mirrors the 0018 mic pattern above).
++    // The AO worker can block in an IMP_AO_* HW call (playSamples/flush) that may
++    // stall on a wedged CODEC; an unbounded pthread_join here would hang the single
++    // supervisor thread and freeze the whole restart state machine. Skip once
++    // wedged (imp_audio_output is left owned by the detached thread on that path,
++    // so re-entry must not re-join a stale tid = UB). Gate on the AO worker's OWN
++    // wedged latch so a mic wedge never blocks AO recovery.
+     if (global_audio_output && global_audio_output->running &&
+-        global_restart_audio) {
++        global_restart_audio &&
++        !global_audio_output->wedged.load(std::memory_order_acquire)) {
+       AudioOutputWorker::signalShutdown();
+-      int ret = pthread_join(audio_output_thread, NULL);
+-      LOG_DEBUG_OR_ERROR(ret, "join audio output thread");
++      int _ao_wait_ms = 0;
++      while (!global_audio_output->thread_exited.load(std::memory_order_acquire) &&
++             _ao_wait_ms < 2000 /* kAudioJoinTimeoutMs */) {
++        std::this_thread::sleep_for(milliseconds(10));
++        _ao_wait_ms += 10;
++      }
++      if (global_audio_output->thread_exited.load(std::memory_order_acquire)) {
++        int ret = pthread_join(audio_output_thread, NULL);
++        LOG_DEBUG_OR_ERROR(ret, "join audio output thread");
++      } else {
++        pthread_detach(audio_output_thread);
++        global_audio_output->wedged.store(true, std::memory_order_release);
++        LOG_ERROR("audio output thread wedged (IMP_AO stall?), detached after "
++                  "2000ms. Video/RTSP restart continues; audio output degraded "
++                  "until next process restart");
++      }
+     }
+ 
+-    // stop backchannel
+-    if (global_backchannel->imp_backchannel && global_restart_audio) {
++    // stop backchannel (0020: BOUNDED join, mirrors the 0018 mic pattern above).
++    // The backchannel processor can block in IMP_ADEC_SendStream/GetStream(BLOCK)
++    // or an AO enqueue path; an unbounded pthread_join here would hang the single
++    // supervisor thread and freeze the restart state machine. Skip once wedged
++    // (imp_backchannel is left owned by the detached thread on that path, so
++    // re-entry must not re-join a stale tid = UB). The imp_backchannel guard alone
++    // is insufficient because it stays non-null after a wedge+detach -- gate on the
++    // backchannel worker's OWN wedged latch so a mic wedge never blocks recovery.
++    if (global_backchannel->imp_backchannel && global_restart_audio &&
++        !global_backchannel->wedged.load(std::memory_order_acquire)) {
+       global_backchannel->running = false;
+       BackchannelWorker::signalShutdown();
+       global_backchannel->should_grab_frames.notify_one();
+-      int ret = pthread_join(backchannel_thread, NULL);
+-      LOG_DEBUG_OR_ERROR(ret, "join backchannel thread");
++      int _bc_wait_ms = 0;
++      while (!global_backchannel->thread_exited.load(std::memory_order_acquire) &&
++             _bc_wait_ms < 2000 /* kAudioJoinTimeoutMs */) {
++        std::this_thread::sleep_for(milliseconds(10));
++        _bc_wait_ms += 10;
++      }
++      if (global_backchannel->thread_exited.load(std::memory_order_acquire)) {
++        int ret = pthread_join(backchannel_thread, NULL);
++        LOG_DEBUG_OR_ERROR(ret, "join backchannel thread");
++      } else {
++        pthread_detach(backchannel_thread);
++        global_backchannel->wedged.store(true, std::memory_order_release);
++        LOG_ERROR("backchannel thread wedged (IMP_ADEC/AO stall?), detached after "
++                  "2000ms; imp_backchannel left owned by it. Video/RTSP restart "
++                  "continues; backchannel degraded until next process restart");
++      }
+     }
+ 
+     if (global_restart_video) {
