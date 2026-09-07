@@ -108,6 +108,18 @@ start() {
 		unset MOTION_VIDEO_FILE
 	fi
 
+	# B3/R1: release the singleton flock BEFORE the asynchronous notify/upload fan-out.
+	# The singleton (prudynt-helpers) holds an advisory flock on fd 9. The send2*/
+	# playonspeaker/cleanup children below are backgrounded and would INHERIT fd 9
+	# (shell fds are not close-on-exec), keeping the exclusive lock held for the whole
+	# upload window (tens of seconds per curl retry). A second motion event in that
+	# window would then hit `flock -n` and be dropped (lost recording + alerts).
+	# Closing fd 9 here releases the lock right after the SYNCHRONOUS capture -- the
+	# section the singleton is meant to serialize -- so no backgrounded child inherits
+	# it and clustered motion events are no longer suppressed during uploads. Capture
+	# files are per-invocation timestamped, so overlapping events do not race.
+	exec 9>&-
+
 	# send2 actions
 	send2_pids=""
 

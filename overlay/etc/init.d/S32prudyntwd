@@ -196,21 +196,33 @@ check_with_nc() {
 # emitting) it reads 0 while RTSP OPTIONS still returns 200 -- the exact life-safety
 # blind spot this watchdog otherwise misses. Returns:
 #   0 = frames flowing (fps > 0)
-#   1 = CONFIRMED frozen (SUCCESSFUL query, fps == 0)
-#   2 = INCONCLUSIVE (no prudyntctl / query failed / timeout / non-numeric)
-# FAIL-SAFE: only an explicit fps==0 from a SUCCESSFUL query is treated as frozen;
-# every hiccup is INCONCLUSIVE and never downgrades serving, so a transient control-
-# socket stall can NOT drive a self-inflicted restart. Cost is a ~0ms local query.
+#   1 = CONFIRMED frozen (ch0 has its OWN RTSP subscriber [subs==1] AND fps == 0)
+#   2 = INCONCLUSIVE (no prudyntctl / query failed / timeout / non-numeric / fps==0
+#       with NO ch0 RTSP subscriber = the legitimate viewerless VIDEO-LOCK idle state)
+# FAIL-SAFE: fps==0 is treated as frozen ONLY when ch0 actually has an RTSP subscriber
+# (B4: same subs gate as check_video_rtp); a healthy viewerless camera (fps==0, subs!=1)
+# is INCONCLUSIVE, and every hiccup is INCONCLUSIVE and never downgrades serving, so
+# neither a transient control-socket stall NOR an idle viewerless channel can drive a
+# self-inflicted restart. Cost is a ~0ms local query.
 check_frames() {
 	command -v prudyntctl >/dev/null 2>&1 || return 2
-	local _out _fps
+	local _out _fps _sub
 	_out=$(timeout "$FRAME_CHECK_TIMEOUT" prudyntctl json '{"stream0":{"stats":null}}' 2>/dev/null) || return 2
 	_fps=$(printf '%s' "$_out" | grep -o '"fps":[0-9]*' | head -n 1 | cut -d: -f2)
 	case "$_fps" in
 		'' | *[!0-9]*) return 2 ;;   # no numeric fps -> inconclusive (do NOT penalize)
 	esac
 	[ "$_fps" -gt 0 ] && return 0    # frames flowing
-	return 1                          # SUCCESSFUL query, fps==0 -> confirmed frozen
+	# B4: fps==0 is ALSO the LEGITIMATE viewerless state -- VideoWorker's VIDEO LOCK
+	# branch sets stats.fps=0 whenever ch0 has no consumer (recorder/prebuffer default
+	# off). Only treat fps==0 as CONFIRMED frozen when ch0 actually has its OWN RTSP
+	# subscriber (subs==1, patch 0019 hasDataCallback) -- the same ch0-specific gate
+	# check_video_rtp applies -- so a HEALTHY viewerless camera stays INCONCLUSIVE and
+	# never drives a false-positive restart->reboot. A present subscriber with fps==0
+	# is still a genuine freeze and is reported.
+	_sub=$(printf '%s' "$_out" | grep -o '"subs":[0-9]*' | head -n 1 | cut -d: -f2)
+	[ "$_sub" = "1" ] || return 2    # no ch0 RTSP subscriber -> fps==0 expected -> inconclusive
+	return 1                          # ch0 subscriber present + fps==0 -> confirmed frozen
 }
 
 # Data-plane RTP-EGRESS liveness via the 0019 rtp_pkts counter (prudyntctl stats).

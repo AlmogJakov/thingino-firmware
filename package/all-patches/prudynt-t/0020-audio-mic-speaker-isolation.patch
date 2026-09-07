@@ -1,11 +1,33 @@
 diff --git a/src/AudioOutputWorker.cpp b/src/AudioOutputWorker.cpp
-index ecdfb48..5eb827e 100644
+index ecdfb48..d17f79a 100644
 --- a/src/AudioOutputWorker.cpp
 +++ b/src/AudioOutputWorker.cpp
-@@ -13,6 +13,11 @@ void *AudioOutputWorker::thread_entry(void *arg) {
-   StartHelper *sh = static_cast<StartHelper *>(arg);
+@@ -5,14 +5,31 @@
+ #include "Logger.hpp"
+ #include "WorkerUtils.hpp"
+ 
++#include <memory>
+ #include <thread>
+ 
+ #define MODULE "AudioOutputWorker"
+ 
+ void *AudioOutputWorker::thread_entry(void *arg) {
+-  StartHelper *sh = static_cast<StartHelper *>(arg);
++  // 0020/B2: take SHARED ownership of the heap StartHelper wrapper the supervisor
++  // handed us, then free the wrapper (a shared_ptr) -- NOT the StartHelper, which
++  // our shared_ptr `sh` keeps alive for as long as this thread may touch it
++  // (run() calls sh->has_started.release()). This guarantees the handshake object
++  // outlives the supervisor's bounded try_acquire_for, so a slow-but-not-permanent
++  // IMP_AO init that releases just past the timeout cannot use-after-free it.
++  std::shared_ptr<StartHelper> sh;
++  if (arg) {
++    auto *p = static_cast<std::shared_ptr<StartHelper> *>(arg);
++    sh = *p;
++    delete p;
++  }
    AudioOutputWorker worker;
-   worker.run(sh);
+-  worker.run(sh);
++  worker.run(sh.get());
 +  // 0020: signal clean exit so the supervisor's bounded stop-join reaps this
 +  // thread; a wedged AO thread never reaches here, so the bounded wait times out
 +  // and detaches instead of hanging the single restart thread.
@@ -14,6 +36,51 @@ index ecdfb48..5eb827e 100644
    return nullptr;
  }
  
+@@ -183,7 +200,7 @@ bool AudioOutputWorker::waitForPlaybackCompletion(
+   return true;
+ }
+ 
+-void AudioOutputWorker::signalShutdown() {
++void AudioOutputWorker::signalShutdown(bool wait_for_flush) {
+   if (!global_audio_output || !global_audio_output->jobQueue) {
+     return;
+   }
+@@ -202,7 +219,18 @@ void AudioOutputWorker::signalShutdown() {
+   }
+ #endif
+ 
+-  clearQueue(true);
++  // B1: on the supervisor RESTART stop-path (wait_for_flush=false) do NOT block on
++  // clearQueue(true)'s promise -- a wedged AO worker (stuck in an IMP_AO playSamples/
++  // flush HW call) never drains the CLEAR job, so that wait is unbounded and would
++  // freeze the single supervisor thread BEFORE the 0020 bounded join could run. Drop
++  // pending jobs non-blockingly and enqueue STOP; the worker still flushes on STOP,
++  // and a wedged worker is handled by the bounded join+detach that follows. Other
++  // callers (talk/playback control threads) keep the blocking flush (default true).
++  if (wait_for_flush) {
++    clearQueue(true);
++  } else {
++    global_audio_output->jobQueue->clear();
++  }
+ 
+   AudioPlaybackJob job;
+   job.type = AudioPlaybackJobType::STOP;
+diff --git a/src/AudioOutputWorker.hpp b/src/AudioOutputWorker.hpp
+index bee2f70..ad38dd4 100644
+--- a/src/AudioOutputWorker.hpp
++++ b/src/AudioOutputWorker.hpp
+@@ -40,7 +40,10 @@ public:
+       std::chrono::milliseconds waitDuration, bool flushAfterWait,
+       std::chrono::milliseconds silencePadding = std::chrono::milliseconds(0));
+ 
+-  static void signalShutdown();
++  // B1: wait_for_flush=false enqueues the STOP sentinel WITHOUT the blocking
++  // clearQueue(true) drain, so a supervisor restart never blocks on a wedged AO
++  // worker that cannot process the CLEAR job. The worker still flushes on STOP.
++  static void signalShutdown(bool wait_for_flush = true);
+ 
+ private:
+   void run(struct StartHelper *sh = nullptr);
 diff --git a/src/BackchannelWorker.cpp b/src/BackchannelWorker.cpp
 index 7135618..e39cb69 100644
 --- a/src/BackchannelWorker.cpp
@@ -90,10 +157,10 @@ index 0782b0f..08b2a80 100644
    audio_output_stream()
        : jobQueue(std::make_shared<MsgChannel<AudioPlaybackJob>>(
 diff --git a/src/main.cpp b/src/main.cpp
-index a54da15..e5902b3 100644
+index a54da15..6f0377b 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
-@@ -687,21 +687,37 @@ int main(int argc, const char *argv[]) {
+@@ -687,21 +687,51 @@ int main(int argc, const char *argv[]) {
        sh.has_started.acquire();
      }
  
@@ -103,26 +170,43 @@ index a54da15..e5902b3 100644
 +    // /dev/dsp capture handle), so it is safe to (re)start after a mic wedge.
      if (cfg->audio.output_enabled && (global_restart_audio || startup) &&
 -        !global_audio[0]->wedged.load(std::memory_order_acquire)) {
+-      StartHelper ao_sh{0};
 +        !global_audio_output->wedged.load(std::memory_order_acquire)) {
-       StartHelper ao_sh{0};
++      // 0020/B2: the AO StartHelper is HEAP-owned via shared_ptr, not a stack
++      // local. Because the wait below is bounded (try_acquire_for), a stalled
++      // IMP_AO init that completes JUST PAST the 2000ms timeout would, with a
++      // stack StartHelper, run sh->has_started.release() on a destroyed
++      // mutex/cv = use-after-free. The worker takes its OWN shared_ptr ref in
++      // thread_entry and drops it only after it is done touching sh, so the
++      // handshake object outlives both the supervisor timeout and the worker's
++      // last use -- no dangling reference on any path.
++      auto ao_sh = std::make_shared<StartHelper>();
++      ao_sh->encChn = 0;
 +      // arm the bounded stop-join handshake for THIS worker before creating it
 +      global_audio_output->thread_exited.store(false, std::memory_order_release);
++      auto *ao_sh_arg = new std::shared_ptr<StartHelper>(ao_sh);
        int ret = pthread_create(&audio_output_thread, nullptr,
                                 AudioOutputWorker::thread_entry,
-                                static_cast<void *>(&ao_sh));
-       LOG_DEBUG_OR_ERROR(ret, "create audio output thread");
+-                               static_cast<void *>(&ao_sh));
+-      LOG_DEBUG_OR_ERROR(ret, "create audio output thread");
 -      // Wait for AO hardware init to complete before starting video.
 -      // The IMP SDK shares internal state between AO and encoder
 -      // subsystems; concurrent init causes memory corruption.
 -      ao_sh.has_started.acquire();
-+      // Wait (BOUNDED) for AO hardware init before starting video. The IMP SDK
-+      // shares internal state between AO and encoder subsystems; concurrent init
-+      // causes memory corruption. 0020: bounded (try_acquire_for) so a stalled AO
-+      // init can never freeze the single supervisor thread now that this start is
-+      // reachable in the mic-wedged state; on timeout proceed (AO degraded).
-+      if (!ao_sh.has_started.try_acquire_for(2000))
++                               static_cast<void *>(ao_sh_arg));
++      if (ret != 0) {
++        // worker never started: reclaim the wrapper and skip the wait
++        delete ao_sh_arg;
++        LOG_ERROR("create audio output thread failed: " << ret);
++      } else if (!ao_sh->has_started.try_acquire_for(2000)) {
++        // Wait (BOUNDED) for AO hardware init before starting video. The IMP SDK
++        // shares internal state between AO and encoder subsystems; concurrent init
++        // causes memory corruption. 0020: bounded (try_acquire_for) so a stalled AO
++        // init can never freeze the single supervisor thread now that this start is
++        // reachable in the mic-wedged state; on timeout proceed (AO degraded).
 +        LOG_ERROR("audio output init did not signal within 2000ms; proceeding "
 +                  "(AO degraded until next restart)");
++      }
      }
  
 +    // 0020: backchannel start is gated on the backchannel worker's OWN wedged
@@ -137,7 +221,7 @@ index a54da15..e5902b3 100644
        int ret = pthread_create(&backchannel_thread, nullptr,
                                 BackchannelWorker::thread_entry, NULL);
        LOG_DEBUG_OR_ERROR(ret, "create backchannel thread");
-@@ -838,20 +854,64 @@ int main(int argc, const char *argv[]) {
+@@ -838,20 +868,68 @@ int main(int argc, const char *argv[]) {
        }
      }
  
@@ -150,11 +234,16 @@ index a54da15..e5902b3 100644
 +    // wedged latch so a mic wedge never blocks AO recovery.
      if (global_audio_output && global_audio_output->running &&
 -        global_restart_audio) {
-+        global_restart_audio &&
-+        !global_audio_output->wedged.load(std::memory_order_acquire)) {
-       AudioOutputWorker::signalShutdown();
+-      AudioOutputWorker::signalShutdown();
 -      int ret = pthread_join(audio_output_thread, NULL);
 -      LOG_DEBUG_OR_ERROR(ret, "join audio output thread");
++        global_restart_audio &&
++        !global_audio_output->wedged.load(std::memory_order_acquire)) {
++      // B1: NON-BLOCKING shutdown signal (no clearQueue(true) promise wait). The
++      // bounded join below is the ONLY wait, so a wedged AO cannot freeze the
++      // supervisor before it (previously signalShutdown()->clearQueue(true)->
++      // get_future().wait() was unbounded and defeated the bounded join).
++      AudioOutputWorker::signalShutdown(/*wait_for_flush=*/false);
 +      int _ao_wait_ms = 0;
 +      while (!global_audio_output->thread_exited.load(std::memory_order_acquire) &&
 +             _ao_wait_ms < 2000 /* kAudioJoinTimeoutMs */) {
