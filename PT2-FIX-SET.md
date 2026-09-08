@@ -1512,27 +1512,10 @@ cannot carry AAC and go2rtc does not transcode on the direct path). Re-saving OP
 workaround is part of this candidate; do not reopen or redesign this unless a real regression appears.**
 Full RCA: `review/forensics-noaudio-20260907/RCA-codec-stuck-aac.md`.
 
-### 16.5 go2rtc Two-Way Audio - FUTURE WORK (documented, intentionally NOT implemented here)
-Reproduced RCA (source-verified vs go2rtc b5948cf; runtime-reproduced on cam5): talk/backchannel works only
-the FIRST WebRTC session per go2rtc restart. A persistent consumer (a viewer, or the `:8554/fifth-source`
-loopback transcoder) PINS the single shared `fifth-source` producer in `StatePlay` (`stopProducers` keeps a
-producer while any track has `Senders()>0`); adding the mic (sendonly) to an already-PLAYing producer forces
-`AddTrack`->`Reconnect` (Close+re-Dial the shared socket); the camera RSTs the 2nd backchannel, go2rtc's
-Dahua/Amcrest fallback truncates `c.Medias`, the mic media becomes `wrong media: audio, sendonly, PCMU/8000`
-and the producer is left in `start from CONN state` - so no PCMU reaches the camera. A FRESH producer (talk
-after all consumers drain) always works (Gate-0: cam5/ch0 serves concurrent play + a fresh backchannel).
-Camera single-speaker (`currentSessionId` first-wins) is correct and must be preserved.
-**PROVEN** (source): the shared-producer pin + mid-PLAY add-track Reconnect + media-truncation chain.
-**OBSERVED** (runtime): the log signature + the A/B reproduction. Design options: **A** generic go2rtc
-shared-source fix (verdict: fork-scale, high regression risk) vs **B** split (backchannel=0 always-on
-downlink `fifth-video` for viewers + on-demand backchannel=1 `fifth-source` for talk + app-level first-wins
-serialization; verdict: low-risk, recommended). **Not implemented** because it is a go2rtc/HA-topology
-change out of the camera-firmware scope, the architecture is deferred pending the user's decision, and it
-does not block the firmware candidate (no interaction/regression with the camera-side work). Future
-acceptance: many concurrent viewers keep Video+Audio; Two-Way Audio reliable regardless of viewer count; a
-2nd talk is deterministically refused (first-wins) without breaking the active talker/RTSP/video/audio,
-without leaving StateConn, and without restart/save/reboot. Full record:
-`review/GO2RTC-TWO-WAY-AUDIO-FUTURE-WORK.md`.
+### 16.5 go2rtc Two-Way Audio - deferred future work
+This is a go2rtc streaming-bridge item, NOT a camera-firmware change, and is intentionally deferred. It does
+not block or interact with this candidate. The full future-work record (problem, proven RCA, camera facts,
+options A/B/C, recommendation, status, acceptance criteria) is **§17** below.
 
 ### 16.6 Other explicitly deferred future work (NOT fixed in this candidate)
 - The old camera-side "adopt-most-recent-session" `currentSessionId` idea - deliberately NOT implemented (would break the correct first-wins single-talker semantics).
@@ -1549,3 +1532,63 @@ go2rtc/HA-topology/codec/`currentSessionId` change; no unrelated refactor. Three
 NO-GO->fixed, 1 independent GO). **NOT built, NOT flashed** - build is the user's GitHub Actions
 `pt2-build-artifact` dispatch; flashing stays user-performed. Reports: `review/FINAL-CANDIDATE-REPORT.md`,
 `FINAL-REVIEW-REPORT.md`, `POST-FLASH-VALIDATION-PLAN.md`, `GO2RTC-TWO-WAY-AUDIO-FUTURE-WORK.md`.
+
+## 17. FUTURE WORK - go2rtc Two-Way Audio (RCA documented, fix intentionally DEFERRED)
+
+**NOT IMPLEMENTED.** No go2rtc code/config, HA topology, camera firmware, camera config, or codec setting was
+changed. This is a streaming-bridge (go2rtc) item, out of the camera-firmware scope; it does not block or
+interact with the current candidate. go2rtc source revision used for the RCA: **`b5948cf`** (v1.9.14).
+
+**1. Problem.** Two-Way Audio (browser mic -> camera speaker) fails intermittently: talk works reliably only
+for the FIRST WebRTC session after a go2rtc (re)start. It fails once the shared `fifth-source#backchannel=1`
+producer is already pinned in `StatePlay` by a persistent consumer.
+
+**2. Proven RCA** (source-verified, go2rtc `b5948cf`): a persistent consumer (any viewer, or the
+`:8554/fifth-source` loopback transcoder) pins the single shared producer in `StatePlay`
+(`internal/streams/stream.go` `stopProducers:97` keeps a producer while any track has `Senders()>0`)
+-> adding the mic mid-PLAY hits `pkg/rtsp/consumer.go` `AddTrack:28` which, at `StatePlay`, calls
+`pkg/rtsp/producer.go` `Reconnect:116` (in-place Close+re-Dial of the SHARED socket)
+-> the camera RSTs the 2nd backchannel and go2rtc's Dahua/Amcrest fallback (`pkg/rtsp/client.go:309-317`)
+truncates `c.Medias` (`client.go:212-216`)
+-> the mic media is then not found (`client.go:270`) and SetupMedia returns `wrong media: audio, sendonly,
+PCMU/8000` (`client.go:282`)
+-> the producer is left in `start from CONN state` (`pkg/rtsp/producer.go:64`)
+-> zero PCMU reaches the camera. A FRESH producer (talk after all consumers drain) always works.
+
+**3. Camera facts** (cam5, runtime-verified): supports multiple concurrent RTSP sessions; normal Video+Audio
+works concurrently; a backchannel can coexist with playback; the speaker is single-talker / first-current-wins
+/ hold-until-release (prudynt `currentSessionId`). **`currentSessionId` was NOT changed** and must be preserved.
+
+**4. Future options.**
+- **A - generic shared-source go2rtc lifecycle fix** (keep one shared `fifth-source#backchannel=1`). Two variants:
+  **A-i** pre-negotiate the backchannel at initial PLAY then data-attach the talker's PCMU (never Reconnect on
+  mic-add); **A-ii** per-track in-session SETUP on the live socket (mid-PLAY, no Reconnect).
+- **B - source split:** persistent consumers use a `#backchannel=0` viewer source; Talk uses a separate on-demand
+  `#backchannel=1` source dialed fresh per talk.
+- **C - single-speaker serialization:** the first talker owns the speaker; additional talkers are rejected cleanly
+  (reject-before-mutate), mirroring the camera's first-wins `currentSessionId`. Enforced app/go2rtc-side; the
+  camera semantics are unchanged.
+
+**5. Current recommendation.**
+- **B + C is the currently preferred, lower-risk direction** (failure isolation: A rides the same single-owner
+  read loop `pkg/rtsp/conn.go` `Handle:141` that serves video to every viewer, so a defect there degrades "talk
+  fails" into "all viewers lose video"). Both directions REQUIRE C.
+- **A-i** may be revisited ONLY after a live probe proves the camera tolerates an idle backchannel SETUP held for
+  the whole viewer lifetime (and accepts pre-SETUP at connect); until proven, do not adopt A-i.
+- **A-ii** requires redesigning go2rtc's core client I/O (`Handle` blocking read loop + synchronous `Do()` with no
+  CSeq request/response correlation, `conn.go`/`client.go`/`producer.go`/`consumer.go`) - **high-risk / fork-scale,
+  NOT currently recommended.**
+- Companion hardening (independently shippable, insufficient alone): pin `c.Medias` by kind/direction instead of
+  truncating (`client.go:212-216`) to remove the `wrong media` string.
+
+**6. Current status.** RCA documented (this section); no go2rtc code/config changed; no HA topology changed; no
+codec change; intentionally deferred pending a decision to pursue B+C (and, for A-i, a camera idle-backchannel
+probe).
+
+**7. Future acceptance criteria** (a fix is acceptable only if ALL hold): multiple simultaneous viewers work;
+Video+Audio for all viewers; Talk works while viewers are connected; a second talker CANNOT break the active
+talker; no `wrong media`; no `start from CONN state`; no manual go2rtc restart; no camera audio Save; no camera
+reboot for normal recovery.
+
+(Detailed working analysis retained outside the repo in `review/GO2RTC-TWA-A-PLUS-C-DESIGN.md` and
+`review/GO2RTC-TWO-WAY-AUDIO-FUTURE-WORK.md`; this section is the self-sufficient repo record.)
