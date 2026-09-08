@@ -60,6 +60,9 @@ RAM-only (no added flash writes). The supervisor-deadlock fix is proven; the exa
 ### Known limitation / future work: two-way audio over WebRTC
 Two-way audio (browser mic -> camera speaker) via the go2rtc WebRTC bridge has been **investigated and reproduced**; the root cause is in the **go2rtc producer lifecycle** (a shared upstream producer is reconnected when a mic track is added mid-stream), **not** a camera fault. The fix is **intentionally deferred** and **no go2rtc or Home Assistant change is part of the current firmware candidate**. Full RCA, options, recommendation, and acceptance criteria: [`PT2-FIX-SET.md`](PT2-FIX-SET.md) §17. The camera's single-speaker semantics are intentionally preserved.
 
+### Known limitation / workaround: no speaker sound on the first talk after a flash
+Right after flashing, the first two-way-audio talk may play nothing on the camera speaker. **Workaround:** open **Audio Settings** and re-save any speaker/audio setting once (this restarts the audio pipeline); the speaker then works and stays working until the next flash. Root cause is a camera-side audio-output first-init after a cold boot (not go2rtc, not the config, not the amplifier) - full RCA in [`PT2-FIX-SET.md`](PT2-FIX-SET.md) §18. An automatic fix is deferred (not part of the current candidate).
+
 ## Building
 
 Builds like upstream Thingino (Buildroot) - see [Building from sources][7].

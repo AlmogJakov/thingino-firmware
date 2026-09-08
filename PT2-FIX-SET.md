@@ -1592,3 +1592,69 @@ reboot for normal recovery.
 
 (Detailed working analysis retained outside the repo in `review/GO2RTC-TWA-A-PLUS-C-DESIGN.md` and
 `review/GO2RTC-TWO-WAY-AUDIO-FUTURE-WORK.md`; this section is the self-sufficient repo record.)
+
+## 18. Post-flash Two-Way-Audio speaker silence - camera AO first-init (RCA documented, workaround known, fix DEFERRED)
+
+**Symptom.** Immediately after a firmware flash, the first Two-Way-Audio talk plays NOTHING on the camera
+speaker (the mic/downstream and video are fine). It happens ONLY on the first boot after a flash, not on
+subsequent reboots, and is cleared by re-saving ANY Audio setting (e.g. Speaker sampling Hz) in the web UI.
+RCA done READ-ONLY on cam5 2026-09-09 with the failing state preserved (no camera change); full evidence in
+`review/forensics-postflash-speaker-20260909/` (SNAPSHOT.md + live_fail_full.txt + live_work_full.txt).
+
+### 18.1 Root cause (PROVEN, camera-side, first AO init after a cold/flash boot)
+The mic reaches the camera and the whole DIGITAL playback path is alive, yet the first-boot AO playback produces
+no analog output:
+- **go2rtc delivers the PCMU to the camera.** The `fifth-source` producer's `pcm_mulaw` sender climbed
+  4226 -> 4772 packets during the failing talk over an ESTABLISHED `:554`, and go2rtc's log is CLEAN (no
+  `wrong media`, no `start from CONN state`). So this is NOT go2rtc and NOT the go2rtc "works once" bug (§17).
+- **Camera digital path healthy during the failing talk:** `ao_play_thr` thread alive (S); the AIC replay is
+  active (AICCR=c9d803, the FIFO AICDR moving) and UNMUTED (`/proc/jz/audio/audio_aic_info` replay mute=No,
+  rate 16000, gain 25); the inner codec is fully programmed (full T23 codec register dump captured); no
+  underrun/error in dmesg.
+- **The workaround is a runtime AO restart, not a config change.** The Audio page saves LIVE-only via
+  `json-prudynt.cgi` -> `prudyntctl` (no disk write) and `spk_sample_rate` raises `global_restart_audio`
+  (JsonAPI.cpp:997). That respawns the audio workers - PROVEN by new thread ids across the fix
+  (`ao_play_thr` 4043 -> 24331, `ai_record` 4040 -> 24291). IMPAudioOutput re-init does
+  `deinit()` -> `configureHardwareAtRate` = an IMP_AO **Disable -> Enable** cycle, versus the first boot init's
+  Enable-without-a-prior-Disable (IMPAudioOutput.cpp:50-168).
+- **Driver failure signature:** the ingenic audio driver dumped the AIC + inner-codec registers
+  ("T31 AIC registers list" / "Dump T23 Codec register") on EACH of the 3 failing talks (uptimes 1703/2191/2570s)
+  and NOT on the working post-fix talk. So that dump marks the broken first-boot playback; a healthy session
+  does not dump (hence no "working" codec dump exists to diff).
+
+Conclusion: the FIRST IMP_AO enable after a cold/flash boot fails to bring the DAC/analog playback out; the
+Disable -> Enable re-init from `global_restart_audio` recovers it.
+
+### 18.2 Ruled out (PROVEN)
+- **Config value / persist-split** - disk `/etc/prudynt.json` == running (`prudyntctl`): `spk_enabled=true`,
+  `spk_sample_rate=16000`, `spk_vol=65`, `mic_format=OPUS`. The re-saved value is identical and live-only.
+- **Speaker amplifier (GPIO7)** - the amp is kernel-owned (`audio.ko` params `spk_gpio=7, spk_level=1`
+  active-high, from `/etc/modules.d/40-audio`; BR2_THINGINO_AUDIO_GPIO=7). The raw GPIO port-A register was
+  **byte-identical failing vs working** (PAT0=0x1984b0c0), so the amp did NOT change and is not the cause.
+- **go2rtc / mute / our patches** - go2rtc clean (above); AIC unmuted; and **0020 never touched
+  IMPAudioOutput::init/configureHardwareAtRate**, so this is a pre-existing prudynt/IMP_AO first-init behaviour,
+  not a regression. (Bonus: the user's fix exercised 0020 + B1 + B2's AO restart path live and it recovered
+  cleanly - a first positive RUNTIME-ON-CAM5 datapoint for that path.)
+
+### 18.3 Verification levels
+SOURCE VERIFIED (config keys, restart-flag plumbing, IMPAudioOutput init vs reconfigure) + RUNTIME VERIFIED ON
+CAM5 (go2rtc PCMU delivery, AIC/codec/thread/GPIO reads, the new-tid restart proof, the failure-signature dump).
+INFERRED / NOT yet proven: the exact driver-internal reason the first cold-boot IMP_AO enable does not output
+(DAC/I2S-replay clock not locking until a Disable->Enable, or a codec analog bit latching only on the 2nd init).
+That lives in the ingenic-sdk `audio.ko` (themactep/ingenic-sdk @ 0a402bf, kernel 3.10.14), git-fetched at build
+and not analysed here.
+
+### 18.4 Workaround (current) and candidate FUTURE fix (NOT in this candidate)
+- **Workaround:** after a flash, re-save any Audio setting once (raises `global_restart_audio`); the speaker then
+  works and stays working until the next flash. It is live-only (does not persist), which is fine because the
+  bug only reappears on the next flash.
+- **Candidate future fix (deferred; needs its own patch + review + build + on-device verification):** make
+  prudynt's AO FIRST init perform the same Disable->Enable cycle the restart does - e.g. an `IMP_AO_Disable(devId)`
+  before the initial `IMP_AO_Enable` in `configureHardwareAtRate`, or a one-shot deinit->reinit warm-up on the
+  first `AudioOutputWorker` start - so the speaker works right after a flash WITHOUT the manual re-save. Must be
+  verified against a real post-flash cold boot (that is the whole point).
+
+### 18.5 Status
+RCA documented; NOT fixed in this candidate; the camera was investigated READ-ONLY (no config/save/restart/reboot
+by the assistant - the user applied the workaround and confirmed recovery). See
+`review/forensics-postflash-speaker-20260909/`.
