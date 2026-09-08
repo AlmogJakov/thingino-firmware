@@ -15,7 +15,7 @@ Release notes for the Sonoff CAM-PT2 build. Full engineering detail lives in
 ### Streaming & startup reliability
 - **Fixed a startup crash-loop** where prudynt never served RTSP - root-caused to a miscompiled libc ABI shim (now a pinned prebuilt, `-flto` dropped).
 - **Reliable cold-boot streaming:** fail-fast if the encoder/ISP didn't come up, an anti-brick config restore, and a stream watchdog that checks real encoder frames (not just an RTSP probe) with a bounded restart→reboot ladder.
-- **prudynt patches 0001-0019:** cleaner VPU teardown/reclaim, live-apply OSD changes without tearing down the encoder, related stream-config fixes, and the audio-reconfig/RTP-watchdog work below.
+- **prudynt patches 0001-0020:** cleaner VPU teardown/reclaim, live-apply OSD changes without tearing down the encoder, related stream-config fixes, and the audio-reconfig / RTP-watchdog / mic-speaker-isolation work below.
 
 ### Day / night & optics
 - Day/night **survives reboot** and no longer rewrites config on every toggle (a tiny atomic sidecar → near-zero flash wear).
@@ -51,8 +51,14 @@ All three are RAM-only (no added flash writes).
 An audio-settings **Save** (codec / sample-rate / bitrate / mic toggle) restarts the audio worker; if that worker was wedged in an uninterruptible `/dev/dsp` read, the single supervisor thread's `pthread_join` hung forever and the whole restart path froze - so RTSP + video stopped being served until prudynt was restarted.
 - **prudynt patch 0018** - the audio-worker join is now **bounded**: on timeout it detaches and latches a `wedged` flag that gates every audio (re)start, so a stuck audio thread can never hang the supervisor or open a second `/dev/dsp`. **Video and RTSP always keep running;** audio degrades until the next restart.
 - **prudynt patch 0019 + stream watchdog** - a **data-plane** liveness signal: prudynt exports a real per-stream RTP-egress counter (plus a "has an RTSP subscriber" flag), and the watchdog now treats "encoder alive (fps>0) but zero RTP delivered to a subscribed client" as not-serving - a blind spot the old fps/OPTIONS checks missed. Fail-safe (any ambiguity stays "serving"), feeding the existing grace/streak/reboot ladder.
+- **prudynt patch 0020 - mic/speaker isolation** - the audio-output (speaker) and two-way-audio (backchannel) workers are now decoupled from the mic-capture wedge: each gates its own (re)start and stop on its own `wedged` latch and every wait is bounded, so a stuck mic can no longer disable speaker/talk recovery and no audio wedge can freeze the supervisor.
 
-RAM-only (no added flash writes). The supervisor-deadlock fix is proven; the exact way a wedge also stalled *video* delivery is not fully proven, so the watchdog is the safety net that catches a silent no-RTP condition regardless of cause. Engineering detail: [`PT2-FIX-SET.md`](PT2-FIX-SET.md) §15.
+RAM-only (no added flash writes). The supervisor-deadlock fix is proven; the exact way a wedge also stalled *video* delivery is not fully proven, so the watchdog is the safety net that catches a silent no-RTP condition regardless of cause. Engineering detail: [`PT2-FIX-SET.md`](PT2-FIX-SET.md) §15-16.
+
+> **Reviewed before build.** This change set (R1-R3, patches 0018/0019/0020, the watchdog) went through three adversarial code-review rounds; the first two caught and fixed four defects (two in patch 0020 itself - a moved deadlock and a use-after-free - plus a motion-alert-suppression regression and a false-reboot watchdog path), and an independent third round returned no blockers. See [`PT2-FIX-SET.md`](PT2-FIX-SET.md) §16.
+
+### Known limitation / future work: two-way audio over WebRTC
+Two-way audio (browser mic -> camera speaker) via the go2rtc WebRTC bridge currently works reliably only for the first talk session after a go2rtc restart, because go2rtc reconnects a shared upstream producer when a mic track is added mid-stream. This is a **go2rtc-side** streaming-bridge limitation, not a camera fault (the camera serves concurrent sessions and a fresh backchannel fine), and it is **not** addressed in this firmware - it is documented as future work with a proposed fix (a dedicated on-demand talk source) in the engineering record. The camera's single-speaker semantics are intentionally preserved.
 
 ## Building
 

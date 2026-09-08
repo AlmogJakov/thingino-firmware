@@ -1469,3 +1469,83 @@ CPU: negligible - 0019 adds two relaxed atomic adds per delivered video NAL (~60
 
 ### 15.10 Status
 Committed `13785375c`, pushed to `origin/pt2-firmware` (three files: patches 0018 + 0019, and the watchdog). Scope limited by directive to P2 (0018, the proven fix) + P4 (0019 + watchdog, the detection safety net); additional designed-but-deferred items (bounded/interruptible capture read, dropping `mutex_main` from the source lifecycle, audio-SDP null-guard) are recorded in RCA-AND-FIX.md §5 as future work, NOT implemented. NOT built, flashed, or runtime-tested on the patched binary - that stays user-performed via GitHub Actions.
+
+## 16. Mic/speaker isolation (patch 0020) + pre-build adversarial review (2026-09-08)
+
+Extends the §15 audio-supervisor hardening to the audio-OUTPUT (AO) and backchannel workers, then a
+three-round adversarial review found and fixed four defects (two in 0020 itself) before build. Candidate
+git revision: **`b5562e5178fe352218273a8691c6068555fa1dee`** on branch `pt2-firmware`.
+
+### 16.1 What is implemented (source-verified change set)
+- **R1** `e24ecd88f` - prudynt-helpers singleton: `pidof` guard -> tmpfs `flock -n` on fd 9 (immune to the D-state `/proc`-scan wedge). §14.6.
+- **R2** `cf3034e0c` - ha-common `ha_entity_enabled` one-shot cache (12->1 jct forks), byte-identical fallback. §14.7.
+- **R3** `2d795da45` - `overlay/usr/sbin/wedge-detector` + `S99`: SysRq-b only on a sustained kernel D-state cascade; HW watchdog untouched. §14.8.
+- **P2 / 0018** - mic (AudioWorker) bounded-join + `wedged` isolation. §15.5.
+- **P4 / 0019** - video `rtp_pkts`/`rtp_bytes` data-plane counters + `S32prudyntwd` data-plane check. §15.6-15.8.
+- **0020** - AO + backchannel workers each get their OWN `thread_exited`/`wedged` atomics; AO/BC (re)start and stop gate on their OWN `wedged` (not the mic's), and every AO/BC wait is bounded, so a mic `/dev/dsp` wedge cannot disable speaker/backchannel recovery and no audio wedge can freeze the single supervisor thread. `currentSessionId` (camera single-talker semantics) UNCHANGED.
+
+### 16.2 The four defects found in adversarial review, and their corrections (B1-B4)
+Round 1 (10-lens + adversarial verify) returned NO-GO; all four were adversarially CONFIRMED:
+- **B1 (BLOCKER, 0020)** - the AO stop deadlock was MOVED, not removed: `AudioOutputWorker::signalShutdown()` -> `clearQueue(true)` -> `completion->get_future().wait()` was UNBOUNDED and ran BEFORE the bounded join, so a wedged speaker/CODEC still froze the supervisor. **Fix:** `signalShutdown(bool wait_for_flush=true)`; the supervisor AO-stop calls `signalShutdown(false)` = non-blocking `jobQueue->clear()` + `write(STOP)` (the worker still flushes on STOP), so the only wait is the bounded 2000 ms join+detach. The three talk/playback `clearQueue(true)` callers are unchanged.
+- **B2 (HIGH, 0020, memory-safety)** - use-after-free of the STACK `StartHelper`: the bounded AO-start `try_acquire_for(2000)` destroyed `ao_sh` on timeout while the worker could still call `has_started.release()` on the freed mutex/cv. **Fix:** heap-own the `StartHelper` via `std::shared_ptr`; `thread_entry` takes shared ownership (`sh=*p; delete p`) and holds a ref across `run()`, so the object outlives the bounded wait even if init completes just past the timeout. `pthread_create` failure reclaims the wrapper; exactly one bounded leak on a permanent wedge. Mic (stack helper, unbounded acquire) and backchannel (NULL arg) paths unaffected.
+- **B3 (HIGH regression, R1/motion)** - the flock fd 9 was INHERITED by the backgrounded `send2*`/`playonspeaker`/cleanup children, holding the singleton lock through the whole upload fan-out (~90 s/service) so a clustered second motion event was DROPPED (lost recording + alerts). **Fix:** `exec 9>&-` in `package/prudynt-t/files/motion` right after the synchronous capture and before the async fan-out. Per-invocation timestamped capture files (no race).
+- **B4 (HIGH false-positive, S32prudyntwd)** - `check_frames()` flagged `fps==0` as frozen WITHOUT the `subs==1` gate its sibling `check_video_rtp()` uses, so a HEALTHY viewerless camera (recorder/prebuffer default off -> VideoWorker VIDEO-LOCK sets `fps=0`) drove restart -> reboot. **Fix:** gate the `fps==0` -> frozen verdict on `subs==1` (identical ch0 gate); viewerless idle is now INCONCLUSIVE, a subscribed genuine freeze is still detected. Recovery ladder byte-identical.
+
+Round 2 (of the corrected tree, 9-lens + verify) = NO-BLOCKER, all B1-B4 FIXED-CLEAN. Round 3 (fresh
+INDEPENDENT 12-lens + verify, not relying on prior rounds) = **GO**: zero surviving blocker/high defects
+across all 18 audited axes (R1, R2, R3, P2, P4, 0020, B1, B2, B3, B4, thread/wait safety, memory safety,
+recovery hierarchy, watchdog safety, resource usage, persistent I/O, patch integrity, scope/security).
+
+### 16.3 Verification levels (what is and is NOT proven)
+- **SOURCE VERIFIED** - all of R1/R2/R3/0018/0019/0020/B1-B4 and every review axis (three adversarial rounds, source-cited).
+- **PATCH VERIFIED** - the full prudynt series 0001-0020 (with B1+B2) applies cleanly from base `f4b32289`, is byte-identical to the reviewed source, no duplicate/missing patches, LF blobs, `sh -n` clean on the rootfs scripts.
+- **BUILD VERIFIED** - NOT yet. The firmware has not been built.
+- **RUNTIME VERIFIED ON CAM5** - NOT yet for the patched binary. (The AAC/OPUS codec state below IS runtime-verified on cam5, but that is a device-config observation, not the patched-binary behaviour.)
+
+### 16.4 Codec / persistence state (AAC/OPUS incident - CLOSED, no codec change in the candidate)
+Current cam5 state, runtime-verified: persisted `mic_format`=OPUS, running `mic_format`=OPUS, RTSP `/ch0`
+downstream=OPUS, go2rtc `fifth-source`=OPUS, direct WebRTC `fifth-source`=Video+Audio. The earlier AAC
+downstream was a **configuration-persistence/state** issue (the web-UI audio codec dropdown applies live
+in-memory via `json-prudynt.cgi`/`prudyntctl` with no disk write; a prudynt restart reloaded the on-disk
+value while the UI showed the intended OPUS), NOT a camera hardware fault and NOT a go2rtc fault (WebRTC
+cannot carry AAC and go2rtc does not transcode on the direct path). Re-saving OPUS committed it. **No codec
+workaround is part of this candidate; do not reopen or redesign this unless a real regression appears.**
+Full RCA: `review/forensics-noaudio-20260907/RCA-codec-stuck-aac.md`.
+
+### 16.5 go2rtc Two-Way Audio - FUTURE WORK (documented, intentionally NOT implemented here)
+Reproduced RCA (source-verified vs go2rtc b5948cf; runtime-reproduced on cam5): talk/backchannel works only
+the FIRST WebRTC session per go2rtc restart. A persistent consumer (a viewer, or the `:8554/fifth-source`
+loopback transcoder) PINS the single shared `fifth-source` producer in `StatePlay` (`stopProducers` keeps a
+producer while any track has `Senders()>0`); adding the mic (sendonly) to an already-PLAYing producer forces
+`AddTrack`->`Reconnect` (Close+re-Dial the shared socket); the camera RSTs the 2nd backchannel, go2rtc's
+Dahua/Amcrest fallback truncates `c.Medias`, the mic media becomes `wrong media: audio, sendonly, PCMU/8000`
+and the producer is left in `start from CONN state` - so no PCMU reaches the camera. A FRESH producer (talk
+after all consumers drain) always works (Gate-0: cam5/ch0 serves concurrent play + a fresh backchannel).
+Camera single-speaker (`currentSessionId` first-wins) is correct and must be preserved.
+**PROVEN** (source): the shared-producer pin + mid-PLAY add-track Reconnect + media-truncation chain.
+**OBSERVED** (runtime): the log signature + the A/B reproduction. Design options: **A** generic go2rtc
+shared-source fix (verdict: fork-scale, high regression risk) vs **B** split (backchannel=0 always-on
+downlink `fifth-video` for viewers + on-demand backchannel=1 `fifth-source` for talk + app-level first-wins
+serialization; verdict: low-risk, recommended). **Not implemented** because it is a go2rtc/HA-topology
+change out of the camera-firmware scope, the architecture is deferred pending the user's decision, and it
+does not block the firmware candidate (no interaction/regression with the camera-side work). Future
+acceptance: many concurrent viewers keep Video+Audio; Two-Way Audio reliable regardless of viewer count; a
+2nd talk is deterministically refused (first-wins) without breaking the active talker/RTSP/video/audio,
+without leaving StateConn, and without restart/save/reboot. Full record:
+`review/GO2RTC-TWO-WAY-AUDIO-FUTURE-WORK.md`.
+
+### 16.6 Other explicitly deferred future work (NOT fixed in this candidate)
+- The old camera-side "adopt-most-recent-session" `currentSessionId` idea - deliberately NOT implemented (would break the correct first-wins single-talker semantics).
+- Mic-START unbounded `has_started.acquire()` (`main.cpp:687`) - a pre-existing 0018 init-time hole (a `/dev/dsp` wedge during `IMPAudio::createNew` on first boot/clean-restart can hang the supervisor before any `wedged` latch exists). Fix = mirror the 0020 bounded AO start; not folded in to keep this pass minimal.
+- Backchannel exception-path `thread_exited` (`BackchannelWorker.cpp` catch) - a cleanly-terminated-by-exception BC thread is treated as wedged (2000 ms timeout + permanent `wedged` latch). LOW, degraded-recovery only.
+- `mic_format` UI-vs-persisted split (§16.4) - reconcile later (persist on codec change, or a "not saved" indicator); do not disturb the current OPUS state.
+- R3 `count_d()` D-count non-specificity (cannot distinguish the mmap_sem cascade from a sustained storage-I/O stall) - LOW/acknowledged: the durable store is power-fail-safe jffs2, so SysRq-b == a power cut this always-on camera already tolerates; and there is no continuous SD-recording writer in the change set.
+These are recorded as future work and are **not** described as fixed.
+
+### 16.7 Status
+Corrected candidate committed **`b5562e517`**, pushed to `origin/pt2-firmware` (correction commit touches
+exactly 3 files: the 0020 patch, `motion`, `S32prudyntwd`). Preserves R1/R2/R3/P2/P4/S32prudyntwd; no
+go2rtc/HA-topology/codec/`currentSessionId` change; no unrelated refactor. Three adversarial reviews (2
+NO-GO->fixed, 1 independent GO). **NOT built, NOT flashed** - build is the user's GitHub Actions
+`pt2-build-artifact` dispatch; flashing stays user-performed. Reports: `review/FINAL-CANDIDATE-REPORT.md`,
+`FINAL-REVIEW-REPORT.md`, `POST-FLASH-VALIDATION-PLAN.md`, `GO2RTC-TWO-WAY-AUDIO-FUTURE-WORK.md`.
