@@ -229,9 +229,11 @@ tc qdisc del dev enp3s0 root
 
 ---
 
-## Appendix: go2rtc config
+## Appendix: go2rtc config (no change required)
 
-During diagnosis we set `go2rtc.yaml` to **UDP-only** to confirm the test really used UDP:
+The fix is entirely the CAKE shaping above - **go2rtc needs no configuration change**. The default go2rtc config works fine over the paced UDP path (validated remotely after a reboot).
+
+During diagnosis we *temporarily* forced **UDP-only** in `go2rtc.yaml`, purely to prove the traffic really rode UDP (and not a silent MSE/TCP fallback):
 
 ```yaml
 webrtc:
@@ -242,4 +244,4 @@ webrtc:
     networks: [udp4]
 ```
 
-For the recommended final config (good for both local and remote) it is better to remove the single-IP restriction and keep UDP host on all interfaces, without TCP/srflx: `ice_servers: []` + `filters: { networks: [udp4] }`. Backup of the original config: `go2rtc.yaml.bak.caketest`.
+That was a diagnostic scaffold only and has since been reverted to default. Optional (not needed for the fix): if you ever want to trim ICE negotiation down to just UDP host candidates (no STUN/srflx, no TCP), you can set `ice_servers: []` + `filters: { networks: [udp4] }`.
